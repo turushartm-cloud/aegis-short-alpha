@@ -31,7 +31,7 @@ services:
       - key: SHORT_SL_BUFFER
         value: "2.5"
       - key: SHORT_LEVERAGE
-        value: "5-50"
+        value: "5-30"
       - key: SCAN_INTERVAL
         value: "180"
       - key: MAX_PAIRS
