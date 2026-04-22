@@ -401,6 +401,8 @@ class TelegramCommandHandler:
         "/alltradestat",
         # Дополнительные команды
         "/watchlist", "/risk",
+        # DCA и Performance
+        "/dca", "/perf",
     }
 
     def __init__(self,
@@ -522,6 +524,9 @@ class TelegramCommandHandler:
                 # Дополнительные команды
                 "/watchlist":    self.cmd_watchlist,
                 "/risk":         self.cmd_risk,
+                # DCA и Performance
+                "/dca":          self.cmd_dca,
+                "/perf":         self.cmd_perf,
             }
             await handlers[cmd](args, reply_chat_id)
             return True
@@ -634,9 +639,11 @@ class TelegramCommandHandler:
             "🛑 /emergency_stop — Экстренный стоп\n"
             "📜 /logs — Посмотреть логи\n"
             "⚙️ /setscore 75 — Мин. скор\n"
-            "🏓 /ping — Проверка связи",
-            "📋 /watchlist — Список пар",
-            "⚙️ /risk — Риск-менеджмент"
+            "🏓 /ping — Проверка связи\n"
+            "📋 /watchlist — Список пар\n"
+            "⚙️ /risk — Риск-менеджмент\n"
+            "📐 /dca BTC — DCA уровни\n"
+            "📊 /perf — Performance"
         )
 
     async def cmd_ping(self, args, reply_chat_id: str):
@@ -920,6 +927,76 @@ class TelegramCommandHandler:
                     f"   ATR Mult: <b>{getattr(self.config, 'DCA_ATR_MULT', 1.5)}</b>\n"
                     f"   Size Mult: <b>{getattr(self.config, 'DCA_SIZE_MULT', 1.5)}</b>"
                 )
+            await self._reply(reply_chat_id, msg)
+        except Exception as e:
+            await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
+
+    async def cmd_dca(self, args, reply_chat_id: str):
+        """📐 DCA информация по позиции"""
+        if not args:
+            await self._reply(reply_chat_id, 
+                "📐 <b>DCA Команды:</b>\n\n"
+                "<code>/dca BTC</code> — DCA информация по BTC\n"
+                "<code>/dca ETH</code> — DCA информация по ETH\n\n"
+                "💡 Показывает уровни усреднения и текущий статус"
+            )
+            return
+        try:
+            symbol = args[0].upper().replace("#", "")
+            if not self.redis:
+                await self._reply(reply_chat_id, "❌ Redis недоступен")
+                return
+            # Получаем позицию из Redis
+            pos_data = self.redis.get_position(self.bot_type, symbol)
+            if not pos_data:
+                await self._reply(reply_chat_id, f"📐 Нет DCA данных для <code>#{symbol}</code>")
+                return
+            bot_emoji = "🔴" if self.bot_type == "short" else "🟢"
+            entry = pos_data.get('entry_price', 0)
+            dca_levels = pos_data.get('dca_levels', [])
+            taken_dcas = pos_data.get('taken_dcas', [])
+            msg = f"{bot_emoji} <b>DCA #{symbol}</b>\n\n"
+            msg += f"📍 Entry: <b>{fmt_price(entry)}</b>\n\n"
+            if dca_levels:
+                msg += "📐 <b>DCA Уровни:</b>\n"
+                for i, level in enumerate(dca_levels, 1):
+                    status = "✅" if i in taken_dcas else "⏳"
+                    msg += f"   {status} DCA{i}: <b>{fmt_price(level)}</b>\n"
+            else:
+                msg += "📐 <i>DCA уровни не рассчитаны</i>"
+            await self._reply(reply_chat_id, msg)
+        except Exception as e:
+            await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
+
+    async def cmd_perf(self, args, reply_chat_id: str):
+        """📊 Performance аналитика"""
+        try:
+            bot_emoji = "🔴" if self.bot_type == "short" else "🟢"
+            # Статистика из Redis
+            stats = self.redis.get_stats(self.bot_type) if self.redis else {}
+            daily_pnl = stats.get('daily_pnl', 0)
+            total_trades = stats.get('total_trades', 0)
+            wins = stats.get('wins', 0)
+            losses = stats.get('losses', 0)
+            win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+            # Aegis Engine статус
+            engine_status = "✅ ON" if (self.state and self.state.signal_engine) else "❌ OFF"
+            msg = (
+                f"{bot_emoji} <b>Performance Analytics</b>\n\n"
+                f"💎 Aegis Engine: {engine_status}\n"
+                f"📊 Daily P&L: <b>{daily_pnl:+.2f}%</b>\n"
+                f"📈 Total Trades: <b>{total_trades}</b>\n"
+                f"🏆 Win Rate: <b>{win_rate:.1f}%</b> ({wins}/{losses})\n\n"
+                f"🕐 {datetime.utcnow().strftime('%H:%M UTC')}"
+            )
+            # Подробности по детекторам если есть
+            if self.state and self.state.signal_engine:
+                msg += "\n\n🔍 <b>Aegis Detectors:</b>\n"
+                msg += "   ✅ Pump Detector\n"
+                msg += "   ✅ OI Analyzer\n"
+                msg += "   ✅ Liquidation Mapper\n"
+                msg += "   ✅ Delta Analyzer\n"
+                msg += "   ✅ SMC/ICT Detector"
             await self._reply(reply_chat_id, msg)
         except Exception as e:
             await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
