@@ -945,16 +945,23 @@ class TelegramCommandHandler:
             symbol = args[0].upper().replace("#", "")
             bot_emoji = "🔴" if self.bot_type == "short" else "🟢"
             
-            # Получаем позицию из Redis или state
+            # Получаем позицию из AutoTrader (главный источник)
             pos_data = None
-            if self.redis:
+            if self.state and self.state.auto_trader:
+                # Ищем позицию в auto_trader по символу
+                for pos in getattr(self.state.auto_trader, 'positions', []):
+                    pos_symbol = pos.get('symbol', '')
+                    if pos_symbol == symbol or pos_symbol == f"{symbol}-USDT" or pos_symbol.replace('-USDT', '') == symbol:
+                        pos_data = pos
+                        break
+            
+            # Если нет в AutoTrader, пробуем Redis
+            if not pos_data and self.redis:
                 pos_data = self.redis.get_position(self.bot_type, symbol)
             
-            # Если нет в Redis, проверяем активные сигналы
+            # Пробуем с суффиксом -USDT
             if not pos_data and self.redis:
-                signals = self.redis.get_signals(self.bot_type, symbol, 1)
-                if signals:
-                    pos_data = signals[0]
+                pos_data = self.redis.get_position(self.bot_type, f"{symbol}-USDT")
             
             if not pos_data:
                 # Показываем DCA настройки из конфига
