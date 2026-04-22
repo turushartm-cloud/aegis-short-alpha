@@ -1,19 +1,19 @@
 """
-🔴 AEGIS SHORT ALPHA v1.0 — Institutional Short Trading Bot
+🟢 AEGIS LONG ALPHA v1.0 — Institutional Long Trading Bot
 FastAPI Application
 
-УЛУЧШЕНИЯ vs short-bot v2.3:
-  ✅ AegisSignalEngine — взвешенный 5-компонентный скоринг
-  ✅ PumpDetector — Z-Score + VWAP exhaustion
-  ✅ OIAnalyzer — полный OI + Funding анализ
-  ✅ LiquidationMapper — кластеры ликвидаций
-  ✅ DeltaAnalyzer — order flow CVD
-  ✅ SmartDCAEngine — ATR-based dynamic grid
-  ✅ AegisRiskManager — Kelly Criterion + Circuit Breakers
-  ✅ PerformanceTracker — real-time P&L analytics
-  ✅ Paid tier: 150 пар, 180s scan, 15 позиций
-  ✅ Redis batch оптимизация
-  ✅ Новые Telegram команды: /risk, /dca, /perf, /components
+УЛУЧШЕНИЯ vs long-bot v2.3:
+  ✅ DumpExhaustionDetector — Z-Score < -2.5σ (oversold climax)
+  ✅ WyckoffAccumulationDetector — Spring/SOS/LPS
+  ✅ BSLScanner — Buy Side Liquidity магниты выше
+  ✅ OIAnalyzerLong — Negative Funding + Short Squeeze
+  ✅ AegisLongSignalEngine — 5-компонентный скорер
+  ✅ SmartDCALongEngine — DCA НИЖЕ входа (ATR-based)
+  ✅ AegisRiskManager — Kelly + Circuit Breakers
+  ✅ PerformanceTracker — daily P&L report
+  ✅ BTC Positive Correlation Filter
+  ✅ ETH/BTC Ratio signal
+  ✅ Paid tier: 150 пар, 240s scan, 15 позиций
 """
 
 import os
@@ -22,7 +22,6 @@ import sys
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
-from decimal import Decimal
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -30,7 +29,7 @@ import uvicorn
 
 
 # ============================================================================
-# PATH SETUP — shared modules
+# PATH SETUP
 # ============================================================================
 
 def _find_shared() -> str:
@@ -55,27 +54,26 @@ for _p in [_SHARED, os.path.dirname(_SHARED), _SRC]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-print(f"📁 shared: {_SHARED} | src: {_SRC}")
+print(f"📁 shared: {_SHARED}")
 
-# ── Shared modules (existing) ──
+# ── Shared modules ──
 from upstash.redis_client import get_redis_client
 from utils.binance_client import get_binance_client
-from core.scorer import get_short_scorer
-from core.pattern_detector import ShortPatternDetector
+from core.scorer import get_long_scorer
+from core.pattern_detector import LongPatternDetector
 from core.position_tracker import PositionTracker
-from core.short_filter import get_short_filter, get_short_tp_config
 from core.realtime_scorer import get_realtime_scorer
 from bot.telegram import TelegramBot, TelegramCommandHandler
 
-# ── Aegis modules (NEW) ──
-from aegis.signal_engine import AegisSignalEngine, SignalStrength
-from aegis.smart_dca import SmartDCAEngine, GridConfig, GridType
+# ── Aegis Long modules ──
+from aegis.signal_engine_long import AegisLongSignalEngine, SignalStrengthLong
+from aegis.smart_dca_long import SmartDCALongEngine, GridConfigLong, GridTypeLong
 from aegis.risk_manager import AegisRiskManager, RiskLimits
 from aegis.performance_tracker import PerformanceTracker, TradeRecord
-from detectors.pump_detector import PumpDetector, ZScoreConfig
-from detectors.oi_analyzer import OIAnalyzer, FundingConfig
-from detectors.liquidation_mapper import LiquidationMapper
-from detectors.delta_analyzer import DeltaAnalyzer
+from detectors.dump_detector import DumpExhaustionDetector, DumpDetectorConfig
+from detectors.wyckoff_detector import WyckoffAccumulationDetector
+from detectors.bsl_scanner import BSLScanner
+from detectors.oi_analyzer_long import OIAnalyzerLong, FundingConfigLong
 
 
 # ============================================================================
@@ -83,57 +81,59 @@ from detectors.delta_analyzer import DeltaAnalyzer
 # ============================================================================
 
 class Config:
-    """Aegis Configuration — Paid Minimal Tier"""
-    BOT_NAME    = "Aegis-Short-Alpha"
+    BOT_NAME    = "Aegis-Long-Alpha"
     BOT_VERSION = "1.0.0"
-    BOT_TYPE    = "short"
+    BOT_TYPE    = "long"
 
-    # ── Paid tier limits (vs free 50/300/10) ──
+    # Paid tier
     MAX_PAIRS     = int(os.getenv("MAX_PAIRS", "150"))
-    SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "180"))
+    SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "240"))    # Long = медленнее
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "15"))
 
-    MIN_SCORE     = int(os.getenv("MIN_SHORT_SCORE", "60"))
-    SL_BUFFER     = float(os.getenv("SHORT_SL_BUFFER", "2.5"))
-    LEVERAGE      = os.getenv("SHORT_LEVERAGE", "5-30")
+    MIN_SCORE     = int(os.getenv("MIN_LONG_SCORE", "58"))     # Чуть мягче Short (60)
+    SL_BUFFER     = float(os.getenv("LONG_SL_BUFFER", "3.0")) # Long = больше SL
+    LEVERAGE      = os.getenv("LONG_LEVERAGE", "5-20")
 
-    # TP Config
-    TP_LEVELS  = [2.5, 4.0, 6.5, 9.0, 12.0, 17.0]
-    TP_WEIGHTS = [30,  25,  20,  13,   8,     4]
+    # LONG TP: меньше фиксируем рано (ждём движения)
+    TP_LEVELS  = [3.0, 5.0, 8.0, 12.0, 18.0, 25.0]
+    TP_WEIGHTS = [20,  20,  25,  20,   10,    5]
 
     # Risk management
-    RISK_PER_TRADE      = float(os.getenv("RISK_PER_TRADE", "0.001"))    # 0.1%
-    MAX_POSITION_PCT    = float(os.getenv("MAX_POSITION_PCT", "0.15"))   # 15%
-    MAX_EXPOSURE_PCT    = float(os.getenv("MAX_EXPOSURE_PCT", "0.60"))   # 60%
-    DAILY_DD_LIMIT      = float(os.getenv("DAILY_DRAWDOWN_LIMIT", "5.0"))
-    MAX_CONSEC_LOSS     = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
-    KELLY_FRACTION      = float(os.getenv("KELLY_FRACTION", "0.25"))
+    RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE", "0.001"))
+    MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.15"))
+    MAX_EXPOSURE_PCT = float(os.getenv("MAX_EXPOSURE_PCT", "0.60"))
+    DAILY_DD_LIMIT   = float(os.getenv("DAILY_DRAWDOWN_LIMIT", "5.0"))
+    MAX_CONSEC_LOSS  = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
+    KELLY_FRACTION   = float(os.getenv("KELLY_FRACTION", "0.25"))
 
     # Smart DCA
-    DCA_LEVELS      = int(os.getenv("DCA_LEVELS", "4"))
-    DCA_ATR_MULT    = float(os.getenv("DCA_ATR_MULT", "1.5"))
-    DCA_SIZE_MULT   = float(os.getenv("DCA_SIZE_MULT", "1.5"))
+    DCA_LEVELS   = int(os.getenv("DCA_LEVELS", "4"))
+    DCA_ATR_MULT = float(os.getenv("DCA_ATR_MULT", "1.5"))
+    DCA_SIZE_MULT = float(os.getenv("DCA_SIZE_MULT", "1.5"))
 
     # Feature flags
-    ENABLE_PUMP_DETECTOR     = os.getenv("ENABLE_PUMP_DETECTOR", "true").lower() == "true"
-    ENABLE_OI_ANALYZER       = os.getenv("ENABLE_OI_ANALYZER", "true").lower() == "true"
-    ENABLE_LIQ_MAPPER        = os.getenv("ENABLE_LIQ_MAPPER", "true").lower() == "true"
-    ENABLE_DELTA             = os.getenv("ENABLE_DELTA", "true").lower() == "true"
-    ENABLE_SMC               = os.getenv("USE_SMC", "true").lower() == "true"
-    ENABLE_AEGIS_ENGINE      = os.getenv("ENABLE_AEGIS_ENGINE", "true").lower() == "true"
-    ENABLE_SMART_DCA         = os.getenv("ENABLE_SMART_DCA", "true").lower() == "true"
+    ENABLE_DUMP_DETECTOR   = os.getenv("ENABLE_DUMP_DETECTOR", "true").lower() == "true"
+    ENABLE_WYCKOFF         = os.getenv("ENABLE_WYCKOFF", "true").lower() == "true"
+    ENABLE_BSL_SCANNER     = os.getenv("ENABLE_BSL_SCANNER", "true").lower() == "true"
+    ENABLE_OI_ANALYZER     = os.getenv("ENABLE_OI_ANALYZER", "true").lower() == "true"
+    ENABLE_AEGIS_ENGINE    = os.getenv("ENABLE_AEGIS_ENGINE", "true").lower() == "true"
+    ENABLE_SMART_DCA       = os.getenv("ENABLE_SMART_DCA", "true").lower() == "true"
+    ENABLE_SMC             = os.getenv("USE_SMC", "true").lower() == "true"
+    ENABLE_BTC_FILTER      = os.getenv("ENABLE_BTC_CORRELATION", "true").lower() == "true"
 
     # Auto trading
-    AUTO_TRADING    = os.getenv("AUTO_TRADING_ENABLED", "false").lower() == "true"
-    BINGX_DEMO      = os.getenv("BINGX_DEMO_MODE", "true").lower() == "true"
+    AUTO_TRADING = os.getenv("AUTO_TRADING_ENABLED", "false").lower() == "true"
+    BINGX_DEMO   = os.getenv("BINGX_DEMO_MODE", "true").lower() == "true"
 
     # Watchlist
     MIN_VOLUME_USDT = int(os.getenv("MIN_VOLUME_USDT", "300000"))
     MAX_WATCHLIST   = int(os.getenv("MAX_WATCHLIST", "150"))
 
-    # Signals
-    SIGNAL_TTL_HOURS = 24
-    TRAIL_ACTIVATION = float(os.getenv("SHORT_TRAIL_ACTIVATION", "0.010"))
+    SIGNAL_TTL_HOURS  = 24
+    TRAIL_ACTIVATION  = float(os.getenv("LONG_TRAIL_ACTIVATION", "0.015"))  # +1.5%
+
+    # BTC correlation thresholds (Long = позитивная корреляция)
+    BTC_BLOCK_THRESHOLD  = float(os.getenv("BTC_BLOCK_THRESHOLD", "-3.0"))  # Блок LONG при BTC -3%/h
 
 
 # ============================================================================
@@ -142,7 +142,6 @@ class Config:
 
 class BotState:
     def __init__(self):
-        # Existing
         self.is_running       = False
         self.is_paused        = False
         self.last_scan        = None
@@ -158,24 +157,19 @@ class BotState:
         self.start_time       = None
         self._min_score       = Config.MIN_SCORE
 
-        # Existing detectors (shared/core)
+        # Existing detectors
         self.scorer           = None
         self.pattern_detector = None
 
-        # ── Aegis modules (NEW) ──
-        self.signal_engine:       Optional[AegisSignalEngine]    = None
-        self.dca_engine:          Optional[SmartDCAEngine]        = None
-        self.risk_manager:        Optional[AegisRiskManager]      = None
-        self.performance_tracker: Optional[PerformanceTracker]    = None
-
-        # Detectors
-        self.pump_detector:   Optional[PumpDetector]       = None
-        self.oi_analyzer:     Optional[OIAnalyzer]         = None
-        self.liq_mapper:      Optional[LiquidationMapper]  = None
-        self.delta_analyzer:  Optional[DeltaAnalyzer]      = None
-
-        # Metrics
-        self.coinglass        = None
+        # Aegis Long modules
+        self.signal_engine:       Optional[AegisLongSignalEngine]  = None
+        self.dca_engine:          Optional[SmartDCALongEngine]      = None
+        self.risk_manager:        Optional[AegisRiskManager]        = None
+        self.performance_tracker: Optional[PerformanceTracker]      = None
+        self.dump_detector:       Optional[DumpExhaustionDetector]  = None
+        self.wyckoff_detector:    Optional[WyckoffAccumulationDetector] = None
+        self.bsl_scanner:         Optional[BSLScanner]              = None
+        self.oi_analyzer:         Optional[OIAnalyzerLong]          = None
 
 
 state = BotState()
@@ -194,10 +188,11 @@ async def _build_combined_watchlist(binance_client, min_vol: float, max_count: i
     except Exception as e:
         print(f"⚠️ _init_source: {e}")
 
+    EXCLUDE = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S")
+
     try:
         result = await binance_client._bybit("/v5/market/tickers", {"category": "linear"})
         if result and result.get("list"):
-            EXCLUDE = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S")
             for t in result.get("list", []):
                 sym = t.get("symbol", "")
                 if not sym.endswith("USDT"): continue
@@ -206,12 +201,11 @@ async def _build_combined_watchlist(binance_client, min_vol: float, max_count: i
                     bybit_syms.add(sym)
         print(f"✅ Bybit: {len(bybit_syms)} symbols")
     except Exception as e:
-        print(f"⚠️ Bybit watchlist: {e}")
+        print(f"⚠️ Bybit: {e}")
 
     try:
         tickers = await binance_client._binance("/fapi/v1/ticker/24hr")
         if tickers:
-            EXCLUDE = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S")
             for t in tickers:
                 sym = t.get("symbol", "")
                 if not sym.endswith("USDT"): continue
@@ -220,16 +214,15 @@ async def _build_combined_watchlist(binance_client, min_vol: float, max_count: i
                     binance_syms.add(sym)
         print(f"✅ Binance: {len(binance_syms)} symbols")
     except Exception as e:
-        print(f"⚠️ Binance watchlist: {e}")
+        print(f"⚠️ Binance: {e}")
 
     if not bybit_syms and not binance_syms:
-        print("⚠️ Fallback watchlist")
         return FALLBACK_WATCHLIST[:max_count]
 
     both    = list(bybit_syms & binance_syms)
     only_one = [s for s in (bybit_syms | binance_syms) if s not in set(both)]
     result  = (both + only_one)[:max_count]
-    print(f"📊 Watchlist: {len(result)} (both={len(both)})")
+    print(f"📊 Watchlist: {len(result)} symbols")
     return result
 
 
@@ -242,54 +235,59 @@ async def lifespan(app: FastAPI):
     print(f"🚀 Starting {Config.BOT_NAME} v{Config.BOT_VERSION}...")
     state.start_time = datetime.utcnow()
 
-    # ── Redis ──
     state.redis   = get_redis_client()
     redis_ok      = state.redis.health_check()
     print(f"{'✅' if redis_ok else '❌'} Redis")
 
-    # ── Market data ──
     state.binance = get_binance_client()
     await state.binance._init_source()
 
-    # ── Existing scorer + patterns ──
-    state.scorer           = get_short_scorer(Config.MIN_SCORE)
-    state.pattern_detector = ShortPatternDetector()
+    state.scorer           = get_long_scorer(Config.MIN_SCORE)
+    state.pattern_detector = LongPatternDetector()
 
-    # ── Aegis Detectors ──
-    print("🔧 Initializing Aegis detectors...")
+    # ── Aegis Long Detectors ──
+    print("🔧 Initializing Aegis Long detectors...")
 
-    state.pump_detector = PumpDetector(ZScoreConfig(
-        threshold=2.5, volume_spike=2.5, rsi_overbought=73, lookback=20
-    )) if Config.ENABLE_PUMP_DETECTOR else None
+    state.dump_detector = DumpExhaustionDetector(DumpDetectorConfig(
+        threshold=2.5, volume_spike=2.0, rsi_oversold=28, lookback=20
+    )) if Config.ENABLE_DUMP_DETECTOR else None
 
-    state.oi_analyzer = OIAnalyzer(
-        FundingConfig(lookback_hours=24, oi_change_threshold=10.0,
-                      funding_threshold=0.03, funding_spike=0.10),
-        binance_client=state.binance
+    state.wyckoff_detector = WyckoffAccumulationDetector(
+        lookback=50
+    ) if Config.ENABLE_WYCKOFF else None
+
+    state.bsl_scanner = BSLScanner(
+        lookback=50, equal_high_tolerance=0.003
+    ) if Config.ENABLE_BSL_SCANNER else None
+
+    state.oi_analyzer = OIAnalyzerLong(
+        FundingConfigLong(
+            lookback_hours=24,
+            funding_threshold=-0.03,
+            funding_spike=-0.08,
+            funding_extreme=-0.15,
+        ),
+        binance_client=state.binance,
     ) if Config.ENABLE_OI_ANALYZER else None
 
-    state.liq_mapper     = LiquidationMapper() if Config.ENABLE_LIQ_MAPPER else None
-    state.delta_analyzer = DeltaAnalyzer()     if Config.ENABLE_DELTA else None
-
-    # ── Aegis Signal Engine ──
-    state.signal_engine = AegisSignalEngine(
-        pump_detector=state.pump_detector,
+    state.signal_engine = AegisLongSignalEngine(
+        dump_detector=state.dump_detector,
         oi_analyzer=state.oi_analyzer,
-        liq_mapper=state.liq_mapper,
-        delta_analyzer=state.delta_analyzer,
+        bsl_scanner=state.bsl_scanner,
+        wyckoff_detector=state.wyckoff_detector,
+        delta_analyzer=None,
         min_score=Config.MIN_SCORE,
     ) if Config.ENABLE_AEGIS_ENGINE else None
 
-    # ── Smart DCA ──
-    state.dca_engine = SmartDCAEngine(GridConfig(
-        grid_type=GridType.ATR_BASED,
+    state.dca_engine = SmartDCALongEngine(GridConfigLong(
+        grid_type=GridTypeLong.ATR_BASED,
         dca_levels=Config.DCA_LEVELS,
         atr_multiplier=Config.DCA_ATR_MULT,
         size_multiplier=Config.DCA_SIZE_MULT,
         max_exposure_pct=Config.MAX_EXPOSURE_PCT,
+        trail_activation_pct=1.5,
     )) if Config.ENABLE_SMART_DCA else None
 
-    # ── Risk Manager ──
     account_capital = float(os.getenv("ACCOUNT_CAPITAL_USD", "1000"))
     state.risk_manager = AegisRiskManager(
         limits=RiskLimits(
@@ -301,19 +299,17 @@ async def lifespan(app: FastAPI):
         ),
         capital=account_capital,
     )
-
-    # ── Performance Tracker ──
     state.performance_tracker = PerformanceTracker(redis_client=state.redis)
 
-    print(f"✅ Aegis Engine: {'ON' if state.signal_engine else 'OFF'} | "
-          f"DCA: {'ON' if state.dca_engine else 'OFF'} | "
-          f"Risk: ✅ | Perf: ✅")
+    print(f"✅ Aegis Long Engine: {'ON' if state.signal_engine else 'OFF'} | "
+          f"Wyckoff: {'ON' if state.wyckoff_detector else 'OFF'} | "
+          f"BSL: {'ON' if state.bsl_scanner else 'OFF'}")
 
     # ── Telegram ──
     state.telegram = TelegramBot(
-        bot_token=os.getenv("SHORT_TELEGRAM_BOT_TOKEN") or os.getenv("TG_BOT_TOKEN"),
-        chat_id=os.getenv("SHORT_TELEGRAM_CHAT_ID")    or os.getenv("TG_CHAT_ID"),
-        topic_id=os.getenv("SHORT_TELEGRAM_TOPIC_ID"),
+        bot_token=os.getenv("LONG_TELEGRAM_BOT_TOKEN") or os.getenv("TG_BOT_TOKEN"),
+        chat_id=os.getenv("LONG_TELEGRAM_CHAT_ID")    or os.getenv("TG_CHAT_ID"),
+        topic_id=os.getenv("LONG_TELEGRAM_TOPIC_ID"),
     )
     telegram_ok = await state.telegram.send_test_message()
     print(f"{'✅' if telegram_ok else '❌'} Telegram")
@@ -330,14 +326,10 @@ async def lifespan(app: FastAPI):
         print(f"{'✅' if ok else '⚠️'} Webhook")
 
     # ── BingX AutoTrader ──
-    print(f"🔧 AUTO_TRADING={Config.AUTO_TRADING} | DEMO={Config.BINGX_DEMO}")
     if Config.AUTO_TRADING:
         try:
             from api.bingx_client import BingXClient
-            import sys
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared", "execution"))
-            from auto_trader import AutoTrader, TradeConfig
-
+            from execution.auto_trader import AutoTrader, TradeConfig
             bingx = BingXClient(
                 api_key=os.getenv("BINGX_API_KEY"),
                 api_secret=os.getenv("BINGX_API_SECRET"),
@@ -371,7 +363,6 @@ async def lifespan(app: FastAPI):
     state.is_running = True
     state.last_scan  = datetime.utcnow()
 
-    # ── Position Tracker ──
     state.tracker = PositionTracker(
         bot_type=Config.BOT_TYPE, telegram=state.telegram,
         redis_client=state.redis, binance_client=state.binance,
@@ -381,14 +372,14 @@ async def lifespan(app: FastAPI):
     mode_str = "DEMO" if Config.BINGX_DEMO else "REAL"
     at_str   = f"✅ {mode_str}" if state.auto_trader else "❌ disabled"
     await state.telegram.send_message(
-        f"🔴 <b>{Config.BOT_NAME} v{Config.BOT_VERSION} запущен</b>\n\n"
+        f"🟢 <b>{Config.BOT_NAME} v{Config.BOT_VERSION} запущен</b>\n\n"
         f"📊 Watchlist: {len(state.watchlist)} монет\n"
-        f"🛑 SL: {Config.SL_BUFFER}%  |  Score≥{Config.MIN_SCORE}\n"
+        f"🛑 SL: {Config.SL_BUFFER}% | Score≥{Config.MIN_SCORE} | Scan: {Config.SCAN_INTERVAL}s\n"
         f"🤖 AutoTrader: {at_str}\n"
-        f"⚙️ Risk: {Config.RISK_PER_TRADE*100:.2f}% | Scan: {Config.SCAN_INTERVAL}s\n"
         f"💎 Aegis Engine: {'✅' if state.signal_engine else '❌'}\n"
-        f"📐 Smart DCA: {'✅' if state.dca_engine else '❌'}\n"
-        f"🛡️ Risk Manager: ✅ Kelly={Config.KELLY_FRACTION}x | DD limit={Config.DAILY_DD_LIMIT}%"
+        f"📐 Wyckoff: {'✅' if state.wyckoff_detector else '❌'} | BSL: {'✅' if state.bsl_scanner else '❌'}\n"
+        f"🛡️ Risk: Kelly×{Config.KELLY_FRACTION} | DD≤{Config.DAILY_DD_LIMIT}% | CB: ✅\n"
+        f"📈 TP: {Config.TP_LEVELS[:4]} | Trail: +{Config.TRAIL_ACTIVATION*100:.1f}%"
     )
 
     asyncio.create_task(background_scanner())
@@ -398,11 +389,9 @@ async def lifespan(app: FastAPI):
     yield
 
     state.is_running = False
-    if state.binance:
-        await state.binance.close()
-    if state.auto_trader:
-        await state.auto_trader.bingx.close()
-    print("👋 Aegis stopped")
+    if state.binance: await state.binance.close()
+    if state.auto_trader: await state.auto_trader.bingx.close()
+    print("👋 Aegis Long stopped")
 
 
 app = FastAPI(lifespan=lifespan, title=f"{Config.BOT_NAME} v{Config.BOT_VERSION}")
@@ -424,24 +413,23 @@ def _is_fresh(existing: List[Dict]) -> bool:
         return True
 
 
-def _ohlcv(candles) -> List[List[float]]:
+def _ohlcv(candles) -> List:
     return [[c.open, c.high, c.low, c.close, c.volume] for c in candles]
 
 
-async def _count_real_positions() -> int:
+async def _count_long_positions() -> int:
     if state.auto_trader:
         try:
             pos = await state.auto_trader.bingx.get_positions()
-            short_pos = [p for p in pos if (
-                getattr(p, "position_side", "").upper() == "SHORT" or
-                getattr(p, "side", "").upper() == "SHORT"
+            long_pos = [p for p in pos if (
+                getattr(p, "position_side", "").upper() == "LONG" or
+                getattr(p, "side", "").upper() == "LONG"
             )]
-            return len(short_pos)
+            return len(long_pos)
         except Exception as e:
-            print(f"[SHORT] count_positions error: {e}")
-    # Fallback
+            print(f"[LONG] count error: {e}")
     try:
-        cutoff = datetime.utcnow() - timedelta(hours=Config.SIGNAL_TTL_HOURS)
+        cutoff     = datetime.utcnow() - timedelta(hours=Config.SIGNAL_TTL_HOURS)
         all_active = state.redis.get_active_signals(Config.BOT_TYPE)
         return sum(1 for s in all_active
                    if datetime.fromisoformat(s.get("timestamp", "2000-01-01")) > cutoff)
@@ -449,19 +437,48 @@ async def _count_real_positions() -> int:
         return 0
 
 
+async def _get_btc_change() -> Optional[float]:
+    """BTC 1h изменение — ключевой фильтр для Long"""
+    try:
+        btc = await state.binance.get_complete_market_data("BTCUSDT")
+        return getattr(btc, "price_change_1h", 0) if btc else None
+    except Exception:
+        return None
+
+
+async def _get_eth_btc_ratio() -> float:
+    """ETH/BTC ratio — индикатор альт-сезона"""
+    try:
+        eth = await state.binance.get_complete_market_data("ETHUSDT")
+        btc = await state.binance.get_complete_market_data("BTCUSDT")
+        if eth and btc and btc.price > 0:
+            return eth.price / btc.price
+        return 0.0
+    except Exception:
+        return 0.0
+
+
 async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None) -> Optional[Dict]:
     """
-    Aegis scan_symbol v1.0:
-    - Параллельный расчёт через AegisSignalEngine
-    - Существующие фильтры (ShortFilter, RealtimeScorer) сохранены
-    - Smart DCA grid рассчитывается для каждого сигнала
+    Aegis Long scan_symbol v1.0:
+    - SL НИЖЕ входа (Long)
+    - TP ВЫШЕ входа
+    - DumpExhaustion + Wyckoff + BSL + OI Negative Funding + SMC Bullish
+    - BTC positive correlation filter
     """
     try:
         md = await state.binance.get_complete_market_data(symbol)
         if not md:
             return None
 
-        # Загружаем OHLCV параллельно
+        # ── BTC фильтр для LONG (критичный) ─────────────────────────
+        btc_1h = cached_btc_1h
+        if btc_1h is not None and Config.ENABLE_BTC_FILTER:
+            if btc_1h <= Config.BTC_BLOCK_THRESHOLD:
+                # BTC падает > 3%/час — блокируем все Long
+                return None
+
+        # ── Загружаем OHLCV параллельно ──────────────────────────────
         ohlcv_15m, ohlcv_30m, ohlcv_4h = await asyncio.gather(
             state.binance.get_klines(symbol, "15m", 100),
             state.binance.get_klines(symbol, "30m", 50),
@@ -473,7 +490,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None) -> Opt
         if isinstance(ohlcv_30m, Exception): ohlcv_30m = []
         if isinstance(ohlcv_4h, Exception):  ohlcv_4h  = []
 
-        # ── Существующий базовый scorer (keep backward compat) ──
+        # ── Базовый scorer (backward compat) ─────────────────────────
         hourly_deltas = await state.binance.get_hourly_volume_profile(symbol, 7)
         price_trend   = state.pattern_detector._get_price_trend(ohlcv_15m)
         patterns      = state.pattern_detector.detect_all(ohlcv_15m, hourly_deltas, md)
@@ -505,69 +522,57 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None) -> Opt
         price      = md.price
         base_score = base_result.total_score
 
-        # ── SHORT-специфичные фильтры (сохраняем) ──
-        sf   = get_short_filter()
-        filt = sf.check(
-            market_data=md, ohlcv_15m=ohlcv_15m,
-            hourly_deltas=hourly_deltas,
-            btc_price_1h_change=cached_btc_1h,
-        )
-        if filt.blocked:
-            return None
-
-        base_score += filt.score_delta
-
-        # ── RealtimeScorer (сохраняем) ──
-        rt = get_realtime_scorer()
+        # ── RealtimeScorer ────────────────────────────────────────────
+        rt        = get_realtime_scorer()
         rt_result = await rt.score(
-            direction="short", market_data=md,
+            direction="long", market_data=md,
             base_score=base_score, hourly_deltas=hourly_deltas,
         )
         if rt_result.early_only:
             return None
         base_score = rt_result.final_score
 
-        # ── SL / TP предварительные ──
-        stop_loss   = price * (1 + Config.SL_BUFFER / 100)
+        # ── SL НИЖЕ входа (Long) ──────────────────────────────────────
+        stop_loss   = price * (1 - Config.SL_BUFFER / 100)
         entry_price = price
 
-        # SMC refinement
+        # SMC Bullish refinement
         smc_data = {}
         if Config.ENABLE_SMC:
             try:
                 from core.smc_ict_detector import get_smc_result
-                smc = get_smc_result(_ohlcv(ohlcv_15m), "short",
+                smc = get_smc_result(_ohlcv(ohlcv_15m), "long",
                                      base_sl_pct=Config.SL_BUFFER, base_entry=price)
                 if smc.score_bonus > 0:
                     base_score += smc.score_bonus
-                if smc.refined_sl and smc.refined_sl > price:
+                if smc.refined_sl and smc.refined_sl < price:
                     stop_loss = smc.refined_sl
                 if smc.ob_entry:
                     entry_price = smc.ob_entry
-                smc_data = {"has_ob": smc.has_ob, "has_fvg": smc.has_fvg,
-                            "bonus": smc.score_bonus}
+                smc_data = {"has_ob": smc.has_ob, "has_fvg": smc.has_fvg, "bonus": smc.score_bonus}
             except Exception as e:
                 print(f"SMC error {symbol}: {e}")
 
-        sl_pct = round((stop_loss - price) / price * 100, 2)
+        sl_pct = round((price - stop_loss) / price * 100, 2)
         if sl_pct < Config.SL_BUFFER:
-            stop_loss = price * (1 + Config.SL_BUFFER / 100)
+            stop_loss = price * (1 - Config.SL_BUFFER / 100)
             sl_pct    = Config.SL_BUFFER
 
-        # Dynamic TP
-        btc_trend = ("down" if (cached_btc_1h or 0) < -0.5 else
-                     "up"   if (cached_btc_1h or 0) > 0.5 else "sideways")
-        tp_levels, tp_weights = get_short_tp_config(
-            funding_rate=md.funding_rate,
-            pattern_name=patterns[0].name if patterns else None,
-            btc_trend=btc_trend,
-        )
-        take_profits = [
-            (round(price * (1 - tp / 100), 8), tp_weights[i] if i < len(tp_weights) else 15)
-            for i, tp in enumerate(tp_levels)
-        ]
+        # ── Dynamic TP (выше входа для Long) ─────────────────────────
+        take_profits = []
+        if state.dca_engine:
+            atr_val = state.dca_engine.calculate_atr(ohlcv_15m)
+            tps     = state.dca_engine.calculate_tp_levels(
+                entry_price=entry_price, sl_price=stop_loss,
+                num_tps=4, funding_rate=md.funding_rate, atr=atr_val,
+            )
+            take_profits = tps
+        else:
+            for i, tp_pct in enumerate(Config.TP_LEVELS[:4]):
+                tp_price = price * (1 + tp_pct / 100)
+                take_profits.append((round(tp_price, 8), Config.TP_WEIGHTS[i]))
 
-        # ── AEGIS ENGINE: взвешенный финальный score ──
+        # ── AEGIS LONG ENGINE ─────────────────────────────────────────
         aegis_signal = None
         aegis_components = {}
         if state.signal_engine and Config.ENABLE_AEGIS_ENGINE:
@@ -583,16 +588,13 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None) -> Opt
                     base_score=base_score,
                 )
                 if aegis_signal:
-                    final_score     = aegis_signal.total_score
-                    aegis_components = {
-                        k: round(v.raw_score, 1)
-                        for k, v in aegis_signal.components.items()
-                    }
+                    final_score      = aegis_signal.total_score
+                    aegis_components = {k: round(v.raw_score, 1)
+                                        for k, v in aegis_signal.components.items()}
                 else:
-                    # Aegis отклонил — не генерируем
                     return None
             except Exception as e:
-                print(f"AegisEngine error {symbol}: {e}")
+                print(f"AegisLong error {symbol}: {e}")
                 final_score = base_score
         else:
             final_score = base_score
@@ -600,51 +602,41 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None) -> Opt
         if final_score < Config.MIN_SCORE:
             return None
 
-        # ── Smart DCA Grid ──
+        # ── Smart DCA Grid (ниже входа для Long) ─────────────────────
         dca_grid_info = {}
         if state.dca_engine and Config.ENABLE_SMART_DCA:
             try:
                 atr_val = state.dca_engine.calculate_atr(ohlcv_15m)
                 grid    = state.dca_engine.calculate_grid(
-                    symbol=symbol,
-                    entry_price=entry_price,
+                    symbol=symbol, entry_price=entry_price,
                     capital=state.risk_manager.capital,
                     initial_risk_pct=Config.RISK_PER_TRADE,
-                    atr=atr_val,
-                    sl_price=stop_loss,
+                    atr=atr_val, sl_price=stop_loss,
                 )
                 dca_grid_info = {
-                    "levels":        [(lvl.price, lvl.size_usd, lvl.distance_pct)
-                                      for lvl in grid.levels],
-                    "weighted_avg":  grid.weighted_avg,
+                    "levels": [(l.price, l.size_usd, l.distance_pct) for l in grid.levels],
+                    "weighted_avg": grid.weighted_avg,
                     "total_exposure": grid.total_exposure,
-                    "atr":           round(atr_val, 8),
+                    "atr": round(atr_val, 8),
                 }
             except Exception as e:
                 print(f"DCA grid error {symbol}: {e}")
 
-        # ── Risk Manager: позиционирование ──
+        # ── Risk sizing ───────────────────────────────────────────────
         risk_result = None
         if state.risk_manager:
             try:
-                open_usd = state.risk_manager.capital * 0.2  # Approximation
                 risk_result = state.risk_manager.calculate_position_size(
-                    win_rate=0.62,
-                    avg_win_pct=5.0,
-                    avg_loss_pct=Config.SL_BUFFER,
-                    signal_score=final_score,
-                    sl_pct=sl_pct,
-                    current_exposure_usd=open_usd,
+                    signal_score=final_score, sl_pct=sl_pct,
                 )
-            except Exception as e:
-                print(f"Risk calc error {symbol}: {e}")
+            except Exception:
+                pass
 
-        # ── Performance tracking ──
+        # ── Performance tracking ──────────────────────────────────────
         if state.performance_tracker:
-            strength_str = aegis_signal.strength.value if aegis_signal else "N/A"
-            state.performance_tracker.record_signal(symbol, final_score, strength_str)
+            strength = aegis_signal.strength.value if aegis_signal else "N/A"
+            state.performance_tracker.record_signal(symbol, final_score, strength, "long")
 
-        # ── Reasons assembly ──
         reasons = list(base_result.reasons)
         reasons.extend(rt_result.factors)
         if aegis_signal:
@@ -652,7 +644,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None) -> Opt
 
         return {
             "symbol":       symbol,
-            "direction":    "short",
+            "direction":    "long",
             "score":        round(final_score, 1),
             "grade":        aegis_signal.grade if aegis_signal else base_result.grade,
             "strength":     aegis_signal.strength.value if aegis_signal else "N/A",
@@ -674,14 +666,12 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None) -> Opt
             "aegis_components": aegis_components,
             "dca_grid":     dca_grid_info,
             "risk": {
-                "size_usd":    risk_result.size_usd    if risk_result else None,
-                "size_pct":    risk_result.size_pct    if risk_result else None,
-                "kelly_pct":   risk_result.kelly_pct   if risk_result else None,
-                "risk_usd":    risk_result.risk_usd    if risk_result else None,
+                "size_usd": risk_result.size_usd if risk_result else None,
+                "kelly_pct": risk_result.kelly_pct if risk_result else None,
             },
-            "smc":       smc_data,
-            "reasons":   reasons[:14],
-            # Compatibility fields
+            "smc": smc_data,
+            "reasons": reasons[:14],
+            # Compatibility
             "rsi_1h":           round(md.rsi_1h or 0, 1),
             "funding_rate":     round(md.funding_rate, 4),
             "oi_change":        round(md.oi_change_4d, 2),
@@ -706,41 +696,36 @@ async def scan_market():
     print(f"\n🔍 {Config.BOT_NAME} scan at {datetime.utcnow().strftime('%H:%M:%S UTC')}")
     print(f"📊 {len(state.watchlist)} symbols | Score≥{Config.MIN_SCORE}")
 
-    # Circuit breaker check
+    # Circuit breaker
     if state.risk_manager:
         blocked, reason = state.risk_manager.check_circuit_breakers()
         if blocked:
-            print(f"⛔ Circuit Breaker: {reason}")
+            print(f"⛔ CB: {reason}")
             await state.telegram.send_message(
-                f"⛔ <b>CIRCUIT BREAKER АКТИВИРОВАН</b>\n\n{reason}\n\n"
-                f"Используйте /reset для сброса"
+                f"⛔ <b>CIRCUIT BREAKER</b>\n{reason}\n\nИспользуйте /reset"
             )
             return
 
-    # BTC cache
-    _btc_cache_1h: Optional[float] = None
-    try:
-        _btc_md = await state.binance.get_complete_market_data("BTCUSDT")
-        if _btc_md:
-            _btc_cache_1h = _btc_md.price_change_1h
-    except Exception:
-        pass
+    # BTC data (главный фильтр для Long)
+    _btc_cache_1h: Optional[float] = await _get_btc_change()
 
-    # BTC correlation score adj
+    # BTC correlation score adjustment (Long — ПОЗИТИВНАЯ корреляция)
     btc_adj = 0
+    btc_label = "BTC N/A"
     if _btc_cache_1h is not None:
-        if _btc_cache_1h < -2.0:   btc_adj = +3
-        elif _btc_cache_1h < -0.5: btc_adj = +1
-        elif _btc_cache_1h > 2.0:  btc_adj = -3
-        elif _btc_cache_1h > 0.5:  btc_adj = -1
+        if _btc_cache_1h > 2.0:   btc_adj = +5;  btc_label = f"BTC +{_btc_cache_1h:.1f}% 🚀"
+        elif _btc_cache_1h > 0.5: btc_adj = +2;  btc_label = f"BTC +{_btc_cache_1h:.1f}% ↗"
+        elif _btc_cache_1h < -2.0: btc_adj = -5; btc_label = f"BTC {_btc_cache_1h:.1f}% 🔴"
+        elif _btc_cache_1h < -0.5: btc_adj = -2; btc_label = f"BTC {_btc_cache_1h:.1f}% ↘"
+        else: btc_label = f"BTC {_btc_cache_1h:.1f}% ↔"
+    print(f"📡 {btc_label} (score adj {btc_adj:+d})")
 
-    active_count  = await _count_real_positions()
+    active_count  = await _count_long_positions()
     exchange_full = active_count >= Config.MAX_POSITIONS
     if exchange_full:
-        print(f"📊 Exchange: {active_count}/{Config.MAX_POSITIONS} SHORT slots — TG-only mode")
+        print(f"📊 Exchange: {active_count}/{Config.MAX_POSITIONS} LONG slots — TG-only mode")
 
-    new_signals   = 0
-    tg_only_count = 0
+    new_signals = tg_only_count = 0
 
     for symbol in state.watchlist:
         try:
@@ -758,7 +743,7 @@ async def scan_market():
 
             # Telegram сигнал
             tg_msg_id = await state.telegram.send_signal(
-                direction="short", symbol=signal["symbol"],
+                direction="long", symbol=signal["symbol"],
                 score=signal["score"], price=signal["price"],
                 pattern=signal.get("strength", signal.get("best_pattern") or "N/A"),
                 indicators=signal["indicators"],
@@ -769,21 +754,19 @@ async def scan_market():
             )
             signal["tg_msg_id"] = tg_msg_id
 
-            # Дополняем сигнал Aegis-информацией
+            # Aegis компоненты в TG
             if signal.get("aegis_components"):
                 comp_str = " | ".join(
-                    f"{k[:4]}: {v:.0f}"
-                    for k, v in signal["aegis_components"].items()
+                    f"{k[:4]}: {v:.0f}" for k, v in signal["aegis_components"].items()
                 )
                 await state.telegram.send_message(
                     f"📊 <b>Aegis Components</b> — {signal['symbol']}\n"
                     f"<code>{comp_str}</code>\n"
-                    f"Grade: {signal.get('grade','N/A')} | Strength: {signal.get('strength','N/A')}"
+                    f"Grade: {signal.get('grade','?')} | {signal.get('strength','?')}"
                 )
 
             state.redis.save_signal(Config.BOT_TYPE, symbol, signal)
 
-            # Биржевое исполнение
             if not exchange_full and Config.AUTO_TRADING and not state.is_paused:
                 if state.auto_trader:
                     try:
@@ -804,13 +787,11 @@ async def scan_market():
     state.daily_signals += new_signals + tg_only_count
     state.last_scan      = datetime.utcnow()
     state.active_signals = len(state.redis.get_active_signals(Config.BOT_TYPE))
-
     state.redis.update_bot_state(Config.BOT_TYPE, {
-        "status":         "paused" if state.is_paused else "running",
-        "last_scan":      state.last_scan.isoformat(),
-        "daily_signals":  state.daily_signals,
-        "active_signals": state.active_signals,
-        "version":        Config.BOT_VERSION,
+        "status":        "paused" if state.is_paused else "running",
+        "last_scan":     state.last_scan.isoformat(),
+        "daily_signals": state.daily_signals,
+        "version":       Config.BOT_VERSION,
     })
     print(f"✅ Scan done. New: {new_signals} | TG-only: {tg_only_count} | "
           f"Exchange: {active_count}/{Config.MAX_POSITIONS}")
@@ -827,19 +808,17 @@ async def background_scanner():
 
 
 async def _daily_report_task():
-    """Ежедневный отчёт в 09:00 UTC"""
     while state.is_running:
-        now = datetime.utcnow()
-        # Следующий 09:00 UTC
+        now  = datetime.utcnow()
         next_report = now.replace(hour=9, minute=0, second=0, microsecond=0)
         if now >= next_report:
             next_report += timedelta(days=1)
         await asyncio.sleep((next_report - now).total_seconds())
-
         if state.performance_tracker and state.is_running:
             try:
-                report = state.performance_tracker.daily_report()
-                await state.telegram.send_message(report)
+                await state.telegram.send_message(
+                    state.performance_tracker.daily_report()
+                )
             except Exception as e:
                 print(f"Daily report error: {e}")
 
@@ -854,6 +833,7 @@ async def health():
         "status": "ok", "bot": Config.BOT_NAME, "version": Config.BOT_VERSION,
         "watchlist": len(state.watchlist), "active": state.active_signals,
         "aegis_engine": state.signal_engine is not None,
+        "wyckoff": state.wyckoff_detector is not None,
     })
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -865,37 +845,28 @@ async def root():
 
 @app.get("/status")
 async def status():
-    cb_status = {}
-    if state.risk_manager:
-        cb_status = state.risk_manager.get_portfolio_heat(0)
+    cb = state.risk_manager.get_portfolio_heat(0) if state.risk_manager else {}
     return {
-        "bot":         Config.BOT_NAME,
-        "version":     Config.BOT_VERSION,
-        "is_running":  state.is_running,
-        "is_paused":   state.is_paused,
+        "bot": Config.BOT_NAME, "version": Config.BOT_VERSION,
+        "is_running": state.is_running, "is_paused": state.is_paused,
         "watchlist_count": len(state.watchlist),
         "active_signals":  state.active_signals,
         "last_scan":       state.last_scan.isoformat() if state.last_scan else None,
-        "risk_manager":    cb_status,
+        "risk_manager":    cb,
         "config": {
-            "min_score":    Config.MIN_SCORE,
-            "sl_buffer":    Config.SL_BUFFER,
-            "scan_interval": Config.SCAN_INTERVAL,
-            "max_pairs":    Config.MAX_PAIRS,
-            "dca_levels":   Config.DCA_LEVELS,
+            "min_score": Config.MIN_SCORE, "sl_buffer": Config.SL_BUFFER,
+            "scan_interval": Config.SCAN_INTERVAL, "max_pairs": Config.MAX_PAIRS,
+            "btc_block_at": Config.BTC_BLOCK_THRESHOLD,
             "auto_trading": Config.AUTO_TRADING,
-            "aegis_engine": Config.ENABLE_AEGIS_ENGINE,
         },
     }
 
 @app.post("/api/scan")
-async def trigger_scan(background_tasks: BackgroundTasks):
-    if not state.is_running:
-        raise HTTPException(503, "Bot not running")
-    if state.is_paused:
-        raise HTTPException(503, "Bot is paused")
-    background_tasks.add_task(scan_market)
-    return {"message": "Scan triggered", "timestamp": datetime.utcnow().isoformat()}
+async def trigger_scan(bg: BackgroundTasks):
+    if not state.is_running: raise HTTPException(503, "Not running")
+    if state.is_paused:      raise HTTPException(503, "Paused")
+    bg.add_task(scan_market)
+    return {"message": "Scan triggered"}
 
 @app.get("/api/signals")
 async def get_signals():
@@ -904,9 +875,7 @@ async def get_signals():
 
 @app.get("/api/performance")
 async def get_performance():
-    if state.performance_tracker:
-        return state.performance_tracker.get_stats(7)
-    return {"error": "PerformanceTracker not initialized"}
+    return state.performance_tracker.get_stats(7) if state.performance_tracker else {}
 
 @app.get("/api/risk")
 async def get_risk():
@@ -916,37 +885,29 @@ async def get_risk():
             "stats":  state.risk_manager.get_win_stats(),
             "heat":   state.risk_manager.get_portfolio_heat(0),
         }
-    return {"error": "RiskManager not initialized"}
+    return {"error": "Not initialized"}
 
 @app.get("/api/dca/{symbol}")
 async def get_dca_grid(symbol: str):
-    """Показывает DCA сетку для символа"""
     if not state.dca_engine:
-        return {"error": "DCA engine disabled"}
-    try:
-        grid = state.dca_engine.calculate_grid(
-            symbol=symbol.upper() + "USDT" if not symbol.upper().endswith("USDT") else symbol.upper(),
-            entry_price=1.0,   # Placeholder (нужна реальная цена)
-            capital=state.risk_manager.capital if state.risk_manager else 1000,
-            initial_risk_pct=Config.RISK_PER_TRADE,
-        )
-        return {
-            "symbol":         grid.symbol,
-            "entry_price":    grid.entry_price,
-            "levels":         [(l.price, l.size_usd, l.distance_pct) for l in grid.levels],
-            "total_exposure": grid.total_exposure,
-            "weighted_avg":   grid.weighted_avg,
-        }
-    except Exception as e:
-        return {"error": str(e)}
+        return {"error": "DCA disabled"}
+    grid = state.dca_engine.calculate_grid(
+        symbol=symbol.upper(), entry_price=1.0,
+        capital=state.risk_manager.capital if state.risk_manager else 1000,
+        initial_risk_pct=Config.RISK_PER_TRADE,
+    )
+    return {
+        "symbol": grid.symbol, "entry": grid.entry_price,
+        "levels": [(l.price, l.size_usd, l.distance_pct) for l in grid.levels],
+        "weighted_avg": grid.weighted_avg, "total_usd": grid.total_exposure,
+    }
 
 @app.get("/api/positions")
 async def get_positions():
     if state.auto_trader:
         pos = await state.auto_trader.bingx.get_positions()
         return {"count": len(pos), "positions": [
-            {"symbol": p.symbol, "side": p.side, "size": p.size,
-             "entry": p.entry_price, "upnl": p.unrealized_pnl}
+            {"symbol": p.symbol, "side": p.side, "upnl": p.unrealized_pnl}
             for p in pos
         ]}
     return {"count": 0, "positions": []}
@@ -955,8 +916,8 @@ async def get_positions():
 async def reset_cb():
     if state.risk_manager:
         state.risk_manager.reset_circuit_breaker(force=True)
-        return {"message": "Circuit breaker reset"}
-    return {"error": "RiskManager not initialized"}
+        return {"message": "Reset OK"}
+    return {"error": "Not initialized"}
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
@@ -966,28 +927,24 @@ async def telegram_webhook(request: Request):
             await state.cmd_handler.handle_update(update)
         return {"ok": True}
     except Exception as e:
-        print(f"Webhook error: {e}")
-        return {"ok": False}
-
-@app.get("/webhook/info")
-async def webhook_info():
-    if state.telegram:
-        return {"webhook": await state.telegram.get_webhook_info()}
-    return {"error": "Not initialized"}
+        print(f"Webhook error: {e}"); return {"ok": False}
 
 @app.get("/webhook/setup")
 @app.get("/webhook/reset")
 async def setup_webhook():
     render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-    if not render_url:
-        return {"error": "RENDER_EXTERNAL_URL not set"}
+    if not render_url: return {"error": "RENDER_EXTERNAL_URL not set"}
     wh_url = f"{render_url}/webhook"
     await state.telegram.delete_webhook()
     await asyncio.sleep(1)
     ok = await state.telegram.setup_webhook(wh_url)
     return {"ok": ok, "url": wh_url}
 
+@app.get("/webhook/info")
+async def webhook_info():
+    return {"webhook": await state.telegram.get_webhook_info()} if state.telegram else {}
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0",
-                port=int(os.getenv("PORT", 8000)), reload=False)
+                port=int(os.getenv("PORT", 8001)), reload=False)

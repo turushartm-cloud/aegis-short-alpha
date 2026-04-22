@@ -1,0 +1,1 @@
+"""Aegis Long Alpha — Detectors"""
