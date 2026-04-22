@@ -77,7 +77,7 @@ services:
       - key: USE_SMC
         value: "true"
       - key: AUTO_TRADING_ENABLED
-        value: "false"
+        value: "true"
       - key: SHORT_TRAIL_ACTIVATION
         value: "0.010"
       - key: COINGLASS_API_KEY
