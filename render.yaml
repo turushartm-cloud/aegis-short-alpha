@@ -31,13 +31,13 @@ services:
       - key: SHORT_SL_BUFFER
         value: "2.5"
       - key: SHORT_LEVERAGE
-        value: "5-30"
+        value: "5-50"
       - key: SCAN_INTERVAL
         value: "180"
       - key: MAX_PAIRS
-        value: "150"
+        value: "500"
       - key: MAX_WATCHLIST
-        value: "150"
+        value: "500"
       - key: MAX_POSITIONS
         value: "15"
       - key: MIN_VOLUME_USDT
