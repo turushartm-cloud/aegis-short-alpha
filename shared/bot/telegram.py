@@ -399,6 +399,8 @@ class TelegramCommandHandler:
         # Новые отчёты
         "/daily_rep", "/weekly_rep", "/monthly_rep", "/leaderswr",
         "/alltradestat",
+        # Дополнительные команды
+        "/watchlist", "/risk",
     }
 
     def __init__(self,
@@ -517,6 +519,9 @@ class TelegramCommandHandler:
                 "/leaderswr":    self.cmd_leaders_wr,
                 # 🆕 Полная аналитика
                 "/alltradestat": self.cmd_alltradestat,
+                # Дополнительные команды
+                "/watchlist":    self.cmd_watchlist,
+                "/risk":         self.cmd_risk,
             }
             await handlers[cmd](args, reply_chat_id)
             return True
@@ -629,7 +634,9 @@ class TelegramCommandHandler:
             "🛑 /emergency_stop — Экстренный стоп\n"
             "📜 /logs — Посмотреть логи\n"
             "⚙️ /setscore 75 — Мин. скор\n"
-            "🏓 /ping — Проверка связи"
+            "🏓 /ping — Проверка связи",
+            "📋 /watchlist — Список пар",
+            "⚙️ /risk — Риск-менеджмент"
         )
 
     async def cmd_ping(self, args, reply_chat_id: str):
@@ -858,6 +865,61 @@ class TelegramCommandHandler:
                 )
             pnl_sign = "+" if total_upnl >= 0 else ""
             msg += f"💵 Итого uPNL: <b>{pnl_sign}${total_upnl:.2f}</b>"
+            await self._reply(reply_chat_id, msg)
+        except Exception as e:
+            await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
+
+    async def cmd_watchlist(self, args, reply_chat_id: str):
+        """📋 Список отслеживаемых пар"""
+        if not self.state or not self.state.watchlist:
+            await self._reply(reply_chat_id, "📋 Watchlist пуст")
+            return
+        try:
+            wl = self.state.watchlist
+            bot_emoji = "🔴" if self.bot_type == "short" else "🟢"
+            # Показываем первые 20 пар + общее количество
+            preview = wl[:20]
+            remaining = len(wl) - 20 if len(wl) > 20 else 0
+            msg = f"{bot_emoji} <b>Watchlist ({len(wl)} пар):</b>\n\n"
+            msg += ", ".join([f"<code>{s}</code>" for s in preview])
+            if remaining > 0:
+                msg += f"\n\n<i>...и ещё {remaining} пар</i>"
+            await self._reply(reply_chat_id, msg)
+        except Exception as e:
+            await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
+
+    async def cmd_risk(self, args, reply_chat_id: str):
+        """⚙️ Риск-менеджмент"""
+        try:
+            if not self.config:
+                await self._reply(reply_chat_id, "❌ Конфиг не загружен")
+                return
+            bot_emoji = "🔴" if self.bot_type == "short" else "🟢"
+            mode = "DEMO" if getattr(self.config, 'BINGX_DEMO', True) else "REAL"
+            at = getattr(self.config, 'AUTO_TRADING', False)
+            at_str = "✅ ON" if at else "❌ OFF"
+            msg = (
+                f"{bot_emoji} <b>Риск-менеджмент [{mode}]</b>\n\n"
+                f"🤖 AutoTrading: {at_str}\n"
+                f"💰 Risk/Trade: <b>{getattr(self.config, 'RISK_PER_TRADE', 0.001) * 100:.2f}%</b>\n"
+                f"📊 Max Positions: <b>{getattr(self.config, 'MAX_POSITIONS', 15)}</b>\n"
+                f"🎯 Min Score: <b>{getattr(self.config, 'MIN_SCORE', 60)}%</b>\n"
+                f"🛑 SL Buffer: <b>{getattr(self.config, 'SL_BUFFER', 2.5)}%</b>\n"
+                f"⚡ Leverage: <b>{getattr(self.config, 'LEVERAGE', '5-30')}</b>\n"
+                f"📉 Daily DD Limit: <b>{getattr(self.config, 'DAILY_DD_LIMIT', 5.0)}%</b>\n"
+                f"🔁 Max Consec Losses: <b>{getattr(self.config, 'MAX_CONSEC_LOSS', 4)}</b>\n"
+                f"💵 Max Position %: <b>{getattr(self.config, 'MAX_POSITION_PCT', 0.15) * 100:.0f}%</b>\n"
+                f"🏦 Max Exposure %: <b>{getattr(self.config, 'MAX_EXPOSURE_PCT', 0.60) * 100:.0f}%</b>\n"
+                f"🧮 Kelly Fraction: <b>{getattr(self.config, 'KELLY_FRACTION', 0.25)}</b>\n"
+            )
+            # DCA настройки
+            if getattr(self.config, 'ENABLE_SMART_DCA', False):
+                msg += (
+                    f"\n📐 <b>Smart DCA:</b>\n"
+                    f"   Levels: <b>{getattr(self.config, 'DCA_LEVELS', 4)}</b>\n"
+                    f"   ATR Mult: <b>{getattr(self.config, 'DCA_ATR_MULT', 1.5)}</b>\n"
+                    f"   Size Mult: <b>{getattr(self.config, 'DCA_SIZE_MULT', 1.5)}</b>"
+                )
             await self._reply(reply_chat_id, msg)
         except Exception as e:
             await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
