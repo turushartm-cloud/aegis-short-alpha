@@ -334,7 +334,9 @@ async def lifespan(app: FastAPI):
     if Config.AUTO_TRADING:
         try:
             from api.bingx_client import BingXClient
-            from execution.auto_trader import AutoTrader, TradeConfig
+            import sys
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared", "execution"))
+            from auto_trader import AutoTrader, TradeConfig
 
             bingx = BingXClient(
                 api_key=os.getenv("BINGX_API_KEY"),
