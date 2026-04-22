@@ -1,0 +1,113 @@
+services:
+  - type: web
+    name: aegis-short-alpha
+    runtime: python
+    plan: starter          # Paid minimal ($7/mo) — no sleep, stable uptime
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn src.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.8"
+
+      # ── Redis ──────────────────────────────────────────────────────
+      - key: REDIS_URL
+        sync: false                        # Upstash: rediss://default:xxx@xxx.upstash.io:6379
+
+      # ── BingX API ─────────────────────────────────────────────────
+      - key: BINGX_API_KEY
+        sync: false
+      - key: BINGX_API_SECRET
+        sync: false
+      - key: BINGX_DEMO_MODE
+        value: "true"                      # → "false" для live
+
+      # ── Telegram ──────────────────────────────────────────────────
+      - key: SHORT_TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SHORT_TELEGRAM_CHAT_ID
+        sync: false
+      - key: SHORT_TELEGRAM_TOPIC_ID
+        sync: false                        # Опционально: топик в группе
+
+      # ── Render External URL (для webhook) ─────────────────────────
+      - key: RENDER_EXTERNAL_URL
+        sync: false                        # https://aegis-short-alpha.onrender.com
+
+      # ── Signal & Score ────────────────────────────────────────────
+      - key: MIN_SHORT_SCORE
+        value: "60"
+      - key: SHORT_SL_BUFFER
+        value: "2.5"
+      - key: SHORT_LEVERAGE
+        value: "5-30"
+
+      # ── Scan & Watchlist ──────────────────────────────────────────
+      - key: SCAN_INTERVAL
+        value: "180"                       # 3 мин (paid: нет ограничений)
+      - key: MAX_PAIRS
+        value: "150"                       # Paid: 150 пар
+      - key: MAX_WATCHLIST
+        value: "150"
+      - key: MAX_POSITIONS
+        value: "15"
+      - key: MIN_VOLUME_USDT
+        value: "300000"
+
+      # ── Risk Management ───────────────────────────────────────────
+      - key: RISK_PER_TRADE
+        value: "0.001"                     # 0.1% капитала
+      - key: MAX_POSITION_PCT
+        value: "0.15"                      # 15% на позицию
+      - key: MAX_EXPOSURE_PCT
+        value: "0.60"                      # 60% суммарно
+      - key: DAILY_DRAWDOWN_LIMIT
+        value: "5.0"                       # 5% дневная просадка = стоп
+      - key: MAX_CONSECUTIVE_LOSSES
+        value: "4"
+      - key: KELLY_FRACTION
+        value: "0.25"                      # Quarter-Kelly
+      - key: ACCOUNT_CAPITAL_USD
+        value: "1000"                      # Установить реальный размер счёта
+
+      # ── Smart DCA ─────────────────────────────────────────────────
+      - key: DCA_LEVELS
+        value: "4"
+      - key: DCA_ATR_MULT
+        value: "1.5"
+      - key: DCA_SIZE_MULT
+        value: "1.5"
+
+      # ── Feature Flags ─────────────────────────────────────────────
+      - key: ENABLE_AEGIS_ENGINE
+        value: "true"
+      - key: ENABLE_PUMP_DETECTOR
+        value: "true"
+      - key: ENABLE_OI_ANALYZER
+        value: "true"
+      - key: ENABLE_LIQ_MAPPER
+        value: "true"
+      - key: ENABLE_DELTA
+        value: "true"
+      - key: ENABLE_SMART_DCA
+        value: "true"
+      - key: USE_SMC
+        value: "true"
+
+      # ── Auto Trading ──────────────────────────────────────────────
+      - key: AUTO_TRADING_ENABLED
+        value: "false"                     # → "true" после тестирования
+      - key: SHORT_TRAIL_ACTIVATION
+        value: "0.010"
+
+      # ── Optional: Coinglass (paid API) ────────────────────────────
+      - key: COINGLASS_API_KEY
+        sync: false                        # Оставить пустым если нет
+
+      # ── Proxy (если Bybit блокирует Render IP) ────────────────────
+      - key: PROXY_LIST
+        sync: false                        # http://user:pass@ip:port
+      - key: USE_BINANCE
+        value: "false"                     # true только если PROXY_LIST задан
