@@ -943,27 +943,63 @@ class TelegramCommandHandler:
             return
         try:
             symbol = args[0].upper().replace("#", "")
-            if not self.redis:
-                await self._reply(reply_chat_id, "❌ Redis недоступен")
-                return
-            # Получаем позицию из Redis
-            pos_data = self.redis.get_position(self.bot_type, symbol)
-            if not pos_data:
-                await self._reply(reply_chat_id, f"📐 Нет DCA данных для <code>#{symbol}</code>")
-                return
             bot_emoji = "🔴" if self.bot_type == "short" else "🟢"
+            
+            # Получаем позицию из Redis или state
+            pos_data = None
+            if self.redis:
+                pos_data = self.redis.get_position(self.bot_type, symbol)
+            
+            # Если нет в Redis, проверяем активные сигналы
+            if not pos_data and self.redis:
+                signals = self.redis.get_signals(self.bot_type, symbol, 1)
+                if signals:
+                    pos_data = signals[0]
+            
+            if not pos_data:
+                # Показываем DCA настройки из конфига
+                dca_levels = getattr(self.config, 'DCA_LEVELS', 4)
+                dca_atr = getattr(self.config, 'DCA_ATR_MULT', 1.5)
+                dca_size = getattr(self.config, 'DCA_SIZE_MULT', 1.5)
+                msg = (
+                    f"{bot_emoji} <b>DCA #{symbol}</b>\n\n"
+                    f"📐 <b>Нет активной позиции</b>\n\n"
+                    f"📊 <b>DCA Настройки:</b>\n"
+                    f"   Levels: <b>{dca_levels}</b>\n"
+                    f"   ATR Mult: <b>{dca_atr}</b>\n"
+                    f"   Size Mult: <b>{dca_size}</b>\n\n"
+                    f"� Позиция будет открыта при следующем сигнале"
+                )
+                await self._reply(reply_chat_id, msg)
+                return
+            
             entry = pos_data.get('entry_price', 0)
             dca_levels = pos_data.get('dca_levels', [])
-            taken_dcas = pos_data.get('taken_dcas', [])
+            taken_tps = pos_data.get('taken_tps', [])
+            size = pos_data.get('size', 0)
+            leverage = pos_data.get('leverage', 1)
+            
             msg = f"{bot_emoji} <b>DCA #{symbol}</b>\n\n"
-            msg += f"📍 Entry: <b>{fmt_price(entry)}</b>\n\n"
-            if dca_levels:
+            msg += f"📍 Entry: <b>{fmt_price(entry)}</b>\n"
+            msg += f"📊 Size: <b>{size}</b> | {leverage}x\n\n"
+            
+            if dca_levels and isinstance(dca_levels, list):
                 msg += "📐 <b>DCA Уровни:</b>\n"
-                for i, level in enumerate(dca_levels, 1):
-                    status = "✅" if i in taken_dcas else "⏳"
+                for i, level in enumerate(dca_levels[:6], 1):
+                    status = "✅" if i in taken_tps else "⏳"
                     msg += f"   {status} DCA{i}: <b>{fmt_price(level)}</b>\n"
             else:
-                msg += "📐 <i>DCA уровни не рассчитаны</i>"
+                # Генерируем типичные уровни
+                if entry > 0:
+                    dca_pcts = [2.5, 5.0, 7.5, 10.0]
+                    msg += "📐 <b>Типичные DCA уровни:</b>\n"
+                    for i, pct in enumerate(dca_pcts, 1):
+                        if self.bot_type == "short":
+                            level = entry * (1 + pct/100)
+                        else:
+                            level = entry * (1 - pct/100)
+                        msg += f"   ⏳ DCA{i}: <b>{fmt_price(level)}</b> ({pct}%)\n"
+            
             await self._reply(reply_chat_id, msg)
         except Exception as e:
             await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
@@ -972,31 +1008,50 @@ class TelegramCommandHandler:
         """📊 Performance аналитика"""
         try:
             bot_emoji = "🔴" if self.bot_type == "short" else "🟢"
-            # Статистика из Redis
-            stats = self.redis.get_stats(self.bot_type) if self.redis else {}
-            daily_pnl = stats.get('daily_pnl', 0)
-            total_trades = stats.get('total_trades', 0)
-            wins = stats.get('wins', 0)
-            losses = stats.get('losses', 0)
-            win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+            from datetime import date
+            today = date.today().isoformat()
+            
+            # Статистика из Redis (используем правильный метод)
+            daily_stats = self.redis.get_daily_stats(self.bot_type, today) if self.redis else {}
+            daily_pnl = daily_stats.get('pnl_pct', 0) if daily_stats else 0
+            daily_trades = daily_stats.get('trades', 0) if daily_stats else 0
+            
+            # Получаем статистику за 7 дней
+            week_stats = self.redis.get_stats_range(self.bot_type, 7) if self.redis else []
+            total_pnl = sum(s.get('pnl_pct', 0) for s in week_stats)
+            total_trades = sum(s.get('trades', 0) for s in week_stats)
+            
+            # Считаем wins/losses из week_stats если есть
+            wins = sum(s.get('wins', 0) for s in week_stats)
+            losses = sum(s.get('losses', 0) for s in week_stats)
+            win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+            
             # Aegis Engine статус
             engine_status = "✅ ON" if (self.state and self.state.signal_engine) else "❌ OFF"
+            dca_status = "✅ ON" if (self.state and getattr(self.state, 'dca_engine', None)) else "❌ OFF"
+            
             msg = (
                 f"{bot_emoji} <b>Performance Analytics</b>\n\n"
                 f"💎 Aegis Engine: {engine_status}\n"
-                f"📊 Daily P&L: <b>{daily_pnl:+.2f}%</b>\n"
-                f"📈 Total Trades: <b>{total_trades}</b>\n"
-                f"🏆 Win Rate: <b>{win_rate:.1f}%</b> ({wins}/{losses})\n\n"
+                f"� Smart DCA: {dca_status}\n\n"
+                f"📊 <b>Сегодня:</b>\n"
+                f"   P&L: <b>{daily_pnl:+.2f}%</b>\n"
+                f"   Сделок: <b>{daily_trades}</b>\n\n"
+                f"📈 <b>7 дней:</b>\n"
+                f"   P&L: <b>{total_pnl:+.2f}%</b>\n"
+                f"   Сделок: <b>{total_trades}</b>\n"
+                f"   Win Rate: <b>{win_rate:.1f}%</b> ({wins}W/{losses}L)\n\n"
                 f"🕐 {datetime.utcnow().strftime('%H:%M UTC')}"
             )
-            # Подробности по детекторам если есть
-            if self.state and self.state.signal_engine:
-                msg += "\n\n🔍 <b>Aegis Detectors:</b>\n"
-                msg += "   ✅ Pump Detector\n"
-                msg += "   ✅ OI Analyzer\n"
-                msg += "   ✅ Liquidation Mapper\n"
-                msg += "   ✅ Delta Analyzer\n"
-                msg += "   ✅ SMC/ICT Detector"
+            
+            # Подробности по детекторам
+            msg += "\n\n🔍 <b>Aegis Detectors:</b>\n"
+            msg += "   ✅ Pump Detector\n"
+            msg += "   ✅ OI Analyzer\n"
+            msg += "   ✅ Liquidation Mapper\n"
+            msg += "   ✅ Delta Analyzer\n"
+            msg += "   ✅ SMC/ICT Detector"
+            
             await self._reply(reply_chat_id, msg)
         except Exception as e:
             await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
