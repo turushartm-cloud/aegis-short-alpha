@@ -22,8 +22,8 @@ class PositionStatus(Enum):
     TP2_HIT = "tp2_hit"
     TP3_HIT = "tp3_hit"
     TP4_HIT = "tp4_hit"
-    TP4_HIT = "tp5_hit"
-    TP4_HIT = "tp6_hit"
+    TP5_HIT = "tp5_hit"
+    TP6_HIT = "tp6_hit"
     SL_HIT = "sl_hit"
     CLOSED = "closed"
 
