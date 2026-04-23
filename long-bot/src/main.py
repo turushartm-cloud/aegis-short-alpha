@@ -349,7 +349,9 @@ async def lifespan(app: FastAPI):
             else:
                 print("❌ BingX connection failed")
         except Exception as e:
+            import traceback
             print(f"❌ AutoTrader init: {e}")
+            print(f"📋 Full traceback:\n{traceback.format_exc()}")
 
     # ── Watchlist ──
     try:
