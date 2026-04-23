@@ -10,7 +10,7 @@ Enhanced Trade Manager
 import json
 import os
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple, Dict
+from typing import List, Dict, Optional, Tuple, Dict, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
 
