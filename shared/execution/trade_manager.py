@@ -42,47 +42,37 @@ class TakeProfitLevel:
 @dataclass
 class TradePosition:
     """Позиция с полной информацией"""
-    # Основное
+    # ═══════════════════════════════════════════════════════════════════════
+    # ОБЯЗАТЕЛЬНЫЕ ПОЛЯ (без default) - должны быть первыми!
+    # ═══════════════════════════════════════════════════════════════════════
     trade_id: str
     symbol: str
     direction: str  # "SHORT" или "LONG"
     entry_price: float
     total_qty: float
     remaining_qty: float
-    
-    # 🆕 Liquidation zones (магниты)
-    liquidation_data: Optional[Dict] = None  # Данные о магнитах ликвидации
-    
-    # 🆕 BE и Trailing Stop статусы
-    be_activated: bool = False  # Переведено в BE после TP1
-    trail_active: bool = False  # Trailing stop активирован
-    trail_sl_price: Optional[float] = None  # Цена trailing stop
-    tp1_hit: bool = False  # TP1 сработал
-    tp3_hit: bool = False  # TP3 сработал
-    
-    # Уровни
     stop_loss: float
     take_profits: List[TakeProfitLevel]
-    
-    # Риск-менеджмент
     leverage: int
     initial_margin: float
     max_loss: float
-    
-    # Статус
     status: PositionStatus
     opened_at: str
-    closed_at: Optional[str] = None
-    final_pnl: Optional[float] = None
     
-    # Trail Stop
+    # ═══════════════════════════════════════════════════════════════════════
+    # ОПЦИОНАЛЬНЫЕ ПОЛЯ (со default) - все в конце!
+    # ═══════════════════════════════════════════════════════════════════════
+    liquidation_data: Optional[Dict] = None
+    be_activated: bool = False
     trail_active: bool = False
     trail_sl_price: Optional[float] = None
+    tp1_hit: bool = False
+    tp3_hit: bool = False
+    closed_at: Optional[str] = None
+    final_pnl: Optional[float] = None
     highest_tp_hit: int = 0
-    
-    # Scale In
     scale_ins: List[Dict] = None
-    avg_entry_price: float = None
+    avg_entry_price: Optional[float] = None
     
     def __post_init__(self):
         if self.avg_entry_price is None:
