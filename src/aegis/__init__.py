@@ -1,5 +1,12 @@
-"""Aegis Long Alpha — Core Package"""
-from .signal_engine_long import AegisLongSignalEngine, SignalStrengthLong, AegisLongSignal
-from .smart_dca_long import SmartDCALongEngine, GridConfigLong, GridTypeLong
+"""Aegis Short Alpha — Core Package"""
+from .signal_engine import AegisSignalEngine, SignalStrength, AegisSignal
+from .smart_dca import SmartDCAEngine, GridConfig, GridType
 from .risk_manager import AegisRiskManager, RiskLimits
 from .performance_tracker import PerformanceTracker, TradeRecord
+
+__all__ = [
+    "AegisSignalEngine", "SignalStrength", "AegisSignal",
+    "SmartDCAEngine", "GridConfig", "GridType",
+    "AegisRiskManager", "RiskLimits",
+    "PerformanceTracker", "TradeRecord",
+]

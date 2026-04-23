@@ -1,62 +1,47 @@
 services:
   - type: web
-    name: aegis-long-alpha
+    name: aegis-short-alpha
     runtime: python
-    plan: starter          # Paid minimal ($7/mo) — no sleep, stable uptime
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn src.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeploy: true
-
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.8"
-
-      # ── Redis ─────────────────────────────────────────────────────
       - key: REDIS_URL
-        sync: false                    # Upstash: rediss://...
-
-      # ── BingX API ─────────────────────────────────────────────────
+        sync: false
       - key: BINGX_API_KEY
         sync: false
       - key: BINGX_API_SECRET
         sync: false
       - key: BINGX_DEMO_MODE
         value: "true"
-
-      # ── Telegram ──────────────────────────────────────────────────
-      - key: LONG_TELEGRAM_BOT_TOKEN
+      - key: SHORT_TELEGRAM_BOT_TOKEN
         sync: false
-      - key: LONG_TELEGRAM_CHAT_ID
+      - key: SHORT_TELEGRAM_CHAT_ID
         sync: false
-      - key: LONG_TELEGRAM_TOPIC_ID
+      - key: SHORT_TELEGRAM_TOPIC_ID
         sync: false
-
-      # ── Render ────────────────────────────────────────────────────
       - key: RENDER_EXTERNAL_URL
-        sync: false                    # https://aegis-long-alpha.onrender.com
-
-      # ── Signal & Score ────────────────────────────────────────────
-      - key: MIN_LONG_SCORE
-        value: "58"                    # Мягче Short (60) — Long более трендовый
-      - key: LONG_SL_BUFFER
-        value: "3.0"                   # Long: больше SL (фэйк-пробои частые)
-      - key: LONG_LEVERAGE
-        value: "5-20"                  # Long: меньше плечо чем Short
-
-      # ── Scan & Watchlist ──────────────────────────────────────────
+        sync: false
+      - key: MIN_SHORT_SCORE
+        value: "60"
+      - key: SHORT_SL_BUFFER
+        value: "2.5"
+      - key: SHORT_LEVERAGE
+        value: "5-30"
       - key: SCAN_INTERVAL
-        value: "240"                   # Long: 4 мин (медленнее формируются)
+        value: "180"
       - key: MAX_PAIRS
-        value: "150"
+        value: "500"
       - key: MAX_WATCHLIST
-        value: "150"
+        value: "500"
       - key: MAX_POSITIONS
         value: "15"
       - key: MIN_VOLUME_USDT
         value: "300000"
-
-      # ── Risk Management ───────────────────────────────────────────
       - key: RISK_PER_TRADE
         value: "0.001"
       - key: MAX_POSITION_PCT
@@ -71,44 +56,30 @@ services:
         value: "0.25"
       - key: ACCOUNT_CAPITAL_USD
         value: "1000"
-
-      # ── Smart DCA ─────────────────────────────────────────────────
       - key: DCA_LEVELS
         value: "4"
       - key: DCA_ATR_MULT
         value: "1.5"
       - key: DCA_SIZE_MULT
         value: "1.5"
-
-      # ── Feature Flags ─────────────────────────────────────────────
       - key: ENABLE_AEGIS_ENGINE
         value: "true"
-      - key: ENABLE_DUMP_DETECTOR
-        value: "true"
-      - key: ENABLE_WYCKOFF
-        value: "true"
-      - key: ENABLE_BSL_SCANNER
+      - key: ENABLE_PUMP_DETECTOR
         value: "true"
       - key: ENABLE_OI_ANALYZER
+        value: "true"
+      - key: ENABLE_LIQ_MAPPER
+        value: "true"
+      - key: ENABLE_DELTA
         value: "true"
       - key: ENABLE_SMART_DCA
         value: "true"
       - key: USE_SMC
         value: "true"
-      - key: ENABLE_BTC_CORRELATION
-        value: "true"
-
-      # ── BTC Filter ────────────────────────────────────────────────
-      - key: BTC_BLOCK_THRESHOLD
-        value: "-3.0"                  # Блок LONG при BTC -3%/ч
-
-      # ── Auto Trading ──────────────────────────────────────────────
       - key: AUTO_TRADING_ENABLED
-        value: "false"
-      - key: LONG_TRAIL_ACTIVATION
-        value: "0.015"                 # +1.5% (vs Short: +1.0%)
-
-      # ── Optional ──────────────────────────────────────────────────
+        value: "true"
+      - key: SHORT_TRAIL_ACTIVATION
+        value: "0.010"
       - key: COINGLASS_API_KEY
         sync: false
       - key: PROXY_LIST

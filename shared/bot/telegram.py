@@ -399,6 +399,10 @@ class TelegramCommandHandler:
         # Новые отчёты
         "/daily_rep", "/weekly_rep", "/monthly_rep", "/leaderswr",
         "/alltradestat",
+        # Дополнительные команды
+        "/watchlist", "/risk",
+        # DCA и Performance
+        "/dca", "/perf",
     }
 
     def __init__(self,
@@ -517,6 +521,12 @@ class TelegramCommandHandler:
                 "/leaderswr":    self.cmd_leaders_wr,
                 # 🆕 Полная аналитика
                 "/alltradestat": self.cmd_alltradestat,
+                # Дополнительные команды
+                "/watchlist":    self.cmd_watchlist,
+                "/risk":         self.cmd_risk,
+                # DCA и Performance
+                "/dca":          self.cmd_dca,
+                "/perf":         self.cmd_perf,
             }
             await handlers[cmd](args, reply_chat_id)
             return True
@@ -629,7 +639,11 @@ class TelegramCommandHandler:
             "🛑 /emergency_stop — Экстренный стоп\n"
             "📜 /logs — Посмотреть логи\n"
             "⚙️ /setscore 75 — Мин. скор\n"
-            "🏓 /ping — Проверка связи"
+            "🏓 /ping — Проверка связи\n"
+            "📋 /watchlist — Список пар\n"
+            "⚙️ /risk — Риск-менеджмент\n"
+            "📐 /dca BTC — DCA уровни\n"
+            "📊 /perf — Performance"
         )
 
     async def cmd_ping(self, args, reply_chat_id: str):
@@ -858,6 +872,193 @@ class TelegramCommandHandler:
                 )
             pnl_sign = "+" if total_upnl >= 0 else ""
             msg += f"💵 Итого uPNL: <b>{pnl_sign}${total_upnl:.2f}</b>"
+            await self._reply(reply_chat_id, msg)
+        except Exception as e:
+            await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
+
+    async def cmd_watchlist(self, args, reply_chat_id: str):
+        """📋 Список отслеживаемых пар"""
+        if not self.state or not self.state.watchlist:
+            await self._reply(reply_chat_id, "📋 Watchlist пуст")
+            return
+        try:
+            wl = self.state.watchlist
+            bot_emoji = "🔴" if self.bot_type == "short" else "🟢"
+            # Показываем первые 20 пар + общее количество
+            preview = wl[:20]
+            remaining = len(wl) - 20 if len(wl) > 20 else 0
+            msg = f"{bot_emoji} <b>Watchlist ({len(wl)} пар):</b>\n\n"
+            msg += ", ".join([f"<code>{s}</code>" for s in preview])
+            if remaining > 0:
+                msg += f"\n\n<i>...и ещё {remaining} пар</i>"
+            await self._reply(reply_chat_id, msg)
+        except Exception as e:
+            await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
+
+    async def cmd_risk(self, args, reply_chat_id: str):
+        """⚙️ Риск-менеджмент"""
+        try:
+            if not self.config:
+                await self._reply(reply_chat_id, "❌ Конфиг не загружен")
+                return
+            bot_emoji = "🔴" if self.bot_type == "short" else "🟢"
+            mode = "DEMO" if getattr(self.config, 'BINGX_DEMO', True) else "REAL"
+            at = getattr(self.config, 'AUTO_TRADING', False)
+            at_str = "✅ ON" if at else "❌ OFF"
+            msg = (
+                f"{bot_emoji} <b>Риск-менеджмент [{mode}]</b>\n\n"
+                f"🤖 AutoTrading: {at_str}\n"
+                f"💰 Risk/Trade: <b>{getattr(self.config, 'RISK_PER_TRADE', 0.001) * 100:.2f}%</b>\n"
+                f"📊 Max Positions: <b>{getattr(self.config, 'MAX_POSITIONS', 15)}</b>\n"
+                f"🎯 Min Score: <b>{getattr(self.config, 'MIN_SCORE', 60)}%</b>\n"
+                f"🛑 SL Buffer: <b>{getattr(self.config, 'SL_BUFFER', 2.5)}%</b>\n"
+                f"⚡ Leverage: <b>{getattr(self.config, 'LEVERAGE', '5-30')}</b>\n"
+                f"📉 Daily DD Limit: <b>{getattr(self.config, 'DAILY_DD_LIMIT', 5.0)}%</b>\n"
+                f"🔁 Max Consec Losses: <b>{getattr(self.config, 'MAX_CONSEC_LOSS', 4)}</b>\n"
+                f"💵 Max Position %: <b>{getattr(self.config, 'MAX_POSITION_PCT', 0.15) * 100:.0f}%</b>\n"
+                f"🏦 Max Exposure %: <b>{getattr(self.config, 'MAX_EXPOSURE_PCT', 0.60) * 100:.0f}%</b>\n"
+                f"🧮 Kelly Fraction: <b>{getattr(self.config, 'KELLY_FRACTION', 0.25)}</b>\n"
+            )
+            # DCA настройки
+            if getattr(self.config, 'ENABLE_SMART_DCA', False):
+                msg += (
+                    f"\n📐 <b>Smart DCA:</b>\n"
+                    f"   Levels: <b>{getattr(self.config, 'DCA_LEVELS', 4)}</b>\n"
+                    f"   ATR Mult: <b>{getattr(self.config, 'DCA_ATR_MULT', 1.5)}</b>\n"
+                    f"   Size Mult: <b>{getattr(self.config, 'DCA_SIZE_MULT', 1.5)}</b>"
+                )
+            await self._reply(reply_chat_id, msg)
+        except Exception as e:
+            await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
+
+    async def cmd_dca(self, args, reply_chat_id: str):
+        """📐 DCA информация по позиции"""
+        if not args:
+            await self._reply(reply_chat_id, 
+                "📐 <b>DCA Команды:</b>\n\n"
+                "<code>/dca BTC</code> — DCA информация по BTC\n"
+                "<code>/dca ETH</code> — DCA информация по ETH\n\n"
+                "💡 Показывает уровни усреднения и текущий статус"
+            )
+            return
+        try:
+            symbol = args[0].upper().replace("#", "")
+            bot_emoji = "🔴" if self.bot_type == "short" else "🟢"
+            
+            # Получаем позицию из AutoTrader (главный источник)
+            pos_data = None
+            if self.state and self.state.auto_trader:
+                # Ищем позицию в auto_trader по символу
+                for pos in getattr(self.state.auto_trader, 'positions', []):
+                    pos_symbol = pos.get('symbol', '')
+                    if pos_symbol == symbol or pos_symbol == f"{symbol}-USDT" or pos_symbol.replace('-USDT', '') == symbol:
+                        pos_data = pos
+                        break
+            
+            # Если нет в AutoTrader, пробуем Redis
+            if not pos_data and self.redis:
+                pos_data = self.redis.get_position(self.bot_type, symbol)
+            
+            # Пробуем с суффиксом -USDT
+            if not pos_data and self.redis:
+                pos_data = self.redis.get_position(self.bot_type, f"{symbol}-USDT")
+            
+            if not pos_data:
+                # Показываем DCA настройки из конфига
+                dca_levels = getattr(self.config, 'DCA_LEVELS', 4)
+                dca_atr = getattr(self.config, 'DCA_ATR_MULT', 1.5)
+                dca_size = getattr(self.config, 'DCA_SIZE_MULT', 1.5)
+                msg = (
+                    f"{bot_emoji} <b>DCA #{symbol}</b>\n\n"
+                    f"📐 <b>Нет активной позиции</b>\n\n"
+                    f"📊 <b>DCA Настройки:</b>\n"
+                    f"   Levels: <b>{dca_levels}</b>\n"
+                    f"   ATR Mult: <b>{dca_atr}</b>\n"
+                    f"   Size Mult: <b>{dca_size}</b>\n\n"
+                    f"� Позиция будет открыта при следующем сигнале"
+                )
+                await self._reply(reply_chat_id, msg)
+                return
+            
+            entry = pos_data.get('entry_price', 0)
+            dca_levels = pos_data.get('dca_levels', [])
+            taken_tps = pos_data.get('taken_tps', [])
+            size = pos_data.get('size', 0)
+            leverage = pos_data.get('leverage', 1)
+            
+            msg = f"{bot_emoji} <b>DCA #{symbol}</b>\n\n"
+            msg += f"📍 Entry: <b>{fmt_price(entry)}</b>\n"
+            msg += f"📊 Size: <b>{size}</b> | {leverage}x\n\n"
+            
+            if dca_levels and isinstance(dca_levels, list):
+                msg += "📐 <b>DCA Уровни:</b>\n"
+                for i, level in enumerate(dca_levels[:6], 1):
+                    status = "✅" if i in taken_tps else "⏳"
+                    msg += f"   {status} DCA{i}: <b>{fmt_price(level)}</b>\n"
+            else:
+                # Генерируем типичные уровни
+                if entry > 0:
+                    dca_pcts = [2.5, 5.0, 7.5, 10.0]
+                    msg += "📐 <b>Типичные DCA уровни:</b>\n"
+                    for i, pct in enumerate(dca_pcts, 1):
+                        if self.bot_type == "short":
+                            level = entry * (1 + pct/100)
+                        else:
+                            level = entry * (1 - pct/100)
+                        msg += f"   ⏳ DCA{i}: <b>{fmt_price(level)}</b> ({pct}%)\n"
+            
+            await self._reply(reply_chat_id, msg)
+        except Exception as e:
+            await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
+
+    async def cmd_perf(self, args, reply_chat_id: str):
+        """📊 Performance аналитика"""
+        try:
+            bot_emoji = "🔴" if self.bot_type == "short" else "🟢"
+            from datetime import date
+            today = date.today().isoformat()
+            
+            # Статистика из Redis (используем правильный метод)
+            daily_stats = self.redis.get_daily_stats(self.bot_type, today) if self.redis else {}
+            daily_pnl = daily_stats.get('pnl_pct', 0) if daily_stats else 0
+            daily_trades = daily_stats.get('trades', 0) if daily_stats else 0
+            
+            # Получаем статистику за 7 дней
+            week_stats = self.redis.get_stats_range(self.bot_type, 7) if self.redis else []
+            total_pnl = sum(s.get('pnl_pct', 0) for s in week_stats)
+            total_trades = sum(s.get('trades', 0) for s in week_stats)
+            
+            # Считаем wins/losses из week_stats если есть
+            wins = sum(s.get('wins', 0) for s in week_stats)
+            losses = sum(s.get('losses', 0) for s in week_stats)
+            win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+            
+            # Aegis Engine статус
+            engine_status = "✅ ON" if (self.state and self.state.signal_engine) else "❌ OFF"
+            dca_status = "✅ ON" if (self.state and getattr(self.state, 'dca_engine', None)) else "❌ OFF"
+            
+            msg = (
+                f"{bot_emoji} <b>Performance Analytics</b>\n\n"
+                f"💎 Aegis Engine: {engine_status}\n"
+                f"� Smart DCA: {dca_status}\n\n"
+                f"📊 <b>Сегодня:</b>\n"
+                f"   P&L: <b>{daily_pnl:+.2f}%</b>\n"
+                f"   Сделок: <b>{daily_trades}</b>\n\n"
+                f"📈 <b>7 дней:</b>\n"
+                f"   P&L: <b>{total_pnl:+.2f}%</b>\n"
+                f"   Сделок: <b>{total_trades}</b>\n"
+                f"   Win Rate: <b>{win_rate:.1f}%</b> ({wins}W/{losses}L)\n\n"
+                f"🕐 {datetime.utcnow().strftime('%H:%M UTC')}"
+            )
+            
+            # Подробности по детекторам
+            msg += "\n\n🔍 <b>Aegis Detectors:</b>\n"
+            msg += "   ✅ Pump Detector\n"
+            msg += "   ✅ OI Analyzer\n"
+            msg += "   ✅ Liquidation Mapper\n"
+            msg += "   ✅ Delta Analyzer\n"
+            msg += "   ✅ SMC/ICT Detector"
+            
             await self._reply(reply_chat_id, msg)
         except Exception as e:
             await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
