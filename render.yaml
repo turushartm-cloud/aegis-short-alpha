@@ -1,17 +1,25 @@
+# Aegis Dual Bot System - Render Blueprint
+# Два бота (SHORT + LONG) в одном репозитории
+
 services:
+  # ═══════════════════════════════════════════════════════════════════════
+  # 🔴 AEGIS SHORT ALPHA - Short Trading Bot
+  # ═══════════════════════════════════════════════════════════════════════
   - type: web
     name: aegis-short-alpha
     runtime: python
     plan: starter
+    region: oregon
+    rootDir: short-bot
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn src.main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /health
-    autoDeploy: true
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.8"
+      - key: PYTHONPATH
+        value: ../shared:./src
+      - key: BOT_TYPE
+        value: "short"
       - key: REDIS_URL
-        sync: false
+        sync: false  # Задать вручную в dashboard
       - key: BINGX_API_KEY
         sync: false
       - key: BINGX_API_SECRET
@@ -22,40 +30,34 @@ services:
         sync: false
       - key: SHORT_TELEGRAM_CHAT_ID
         sync: false
-      - key: SHORT_TELEGRAM_TOPIC_ID
-        sync: false
       - key: RENDER_EXTERNAL_URL
-        sync: false
-      - key: MIN_SHORT_SCORE
-        value: "60"
-      - key: SHORT_SL_BUFFER
-        value: "2.5"
-      - key: SHORT_LEVERAGE
-        value: "5-30"
-      - key: SCAN_INTERVAL
-        value: "180"
+        fromService:
+          name: aegis-short-alpha
+          type: web
+          property: url
+      # Config
       - key: MAX_PAIRS
         value: "500"
       - key: MAX_WATCHLIST
         value: "500"
+      - key: MIN_SHORT_SCORE
+        value: "60"
+      - key: SCAN_INTERVAL
+        value: "180"
       - key: MAX_POSITIONS
         value: "15"
-      - key: MIN_VOLUME_USDT
-        value: "300000"
+      - key: SHORT_SL_BUFFER
+        value: "2.5"
+      - key: SHORT_LEVERAGE
+        value: "5-30"
       - key: RISK_PER_TRADE
         value: "0.001"
       - key: MAX_POSITION_PCT
         value: "0.15"
-      - key: MAX_EXPOSURE_PCT
-        value: "0.60"
       - key: DAILY_DRAWDOWN_LIMIT
         value: "5.0"
-      - key: MAX_CONSECUTIVE_LOSSES
-        value: "4"
       - key: KELLY_FRACTION
         value: "0.25"
-      - key: ACCOUNT_CAPITAL_USD
-        value: "1000"
       - key: DCA_LEVELS
         value: "4"
       - key: DCA_ATR_MULT
@@ -77,12 +79,91 @@ services:
       - key: USE_SMC
         value: "true"
       - key: AUTO_TRADING_ENABLED
+        value: "false"
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 🟢 AEGIS LONG ALPHA - Long Trading Bot
+  # ═══════════════════════════════════════════════════════════════════════
+  - type: web
+    name: aegis-long-alpha
+    runtime: python
+    plan: starter
+    region: oregon
+    rootDir: long-bot
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn src.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHONPATH
+        value: ../shared:./src
+      - key: BOT_TYPE
+        value: "long"
+      - key: REDIS_URL
+        sync: false  # Тот же Redis что и у SHORT
+      - key: BINGX_API_KEY
+        sync: false
+      - key: BINGX_API_SECRET
+        sync: false
+      - key: BINGX_DEMO_MODE
         value: "true"
-      - key: SHORT_TRAIL_ACTIVATION
-        value: "0.010"
-      - key: COINGLASS_API_KEY
+      - key: LONG_TELEGRAM_BOT_TOKEN
         sync: false
-      - key: PROXY_LIST
+      - key: LONG_TELEGRAM_CHAT_ID
         sync: false
-      - key: USE_BINANCE
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          name: aegis-long-alpha
+          type: web
+          property: url
+      # Config (LONG-specific)
+      - key: MAX_PAIRS
+        value: "500"
+      - key: MAX_WATCHLIST
+        value: "500"
+      - key: MIN_LONG_SCORE
+        value: "70"
+      - key: SCAN_INTERVAL
+        value: "240"
+      - key: MAX_POSITIONS
+        value: "15"
+      - key: LONG_SL_BUFFER
+        value: "3.0"
+      - key: LONG_LEVERAGE
+        value: "5-20"
+      - key: RISK_PER_TRADE
+        value: "0.001"
+      - key: MAX_POSITION_PCT
+        value: "0.15"
+      - key: DAILY_DRAWDOWN_LIMIT
+        value: "5.0"
+      - key: KELLY_FRACTION
+        value: "0.25"
+      - key: DCA_LEVELS
+        value: "4"
+      - key: DCA_ATR_MULT
+        value: "1.5"
+      - key: DCA_SIZE_MULT
+        value: "1.5"
+      - key: ENABLE_AEGIS_ENGINE
+        value: "true"
+      - key: ENABLE_DUMP_DETECTOR
+        value: "true"
+      - key: ENABLE_WYCKOFF
+        value: "true"
+      - key: ENABLE_BSL_SCANNER
+        value: "true"
+      - key: ENABLE_OI_ANALYZER
+        value: "true"
+      - key: ENABLE_LIQ_MAPPER
+        value: "true"
+      - key: ENABLE_DELTA
+        value: "true"
+      - key: ENABLE_SMART_DCA
+        value: "true"
+      - key: USE_SMC
+        value: "true"
+      - key: ENABLE_BTC_FILTER
+        value: "true"
+      - key: BTC_BLOCK_THRESHOLD
+        value: "-3.0"
+      - key: AUTO_TRADING_ENABLED
         value: "false"
