@@ -194,9 +194,9 @@ class SmartDCALongEngine:
         tps = []
         # Long TP weights: меньше на TP1-2 (ждём большего движения вверх)
         weights_map = {
-            4: [20, 25, 30, 25],
-            5: [15, 20, 25, 25, 15],
-            6: [12, 18, 22, 22, 16, 10],
+            4: [15, 20, 20, 15],
+            5: [15, 20, 20, 15, 15],
+            6: [15, 20, 20, 15, 15, 15],
         }
         weights = weights_map.get(num_tps, [20] * num_tps)
 
@@ -214,7 +214,7 @@ class SmartDCALongEngine:
         activation_pct: float = 1.5,   # Long: +1.5% (vs Short: +1.0%)
     ) -> dict:
         activation_price = entry_price * (1 + activation_pct / 100)
-        trail_distance   = max(atr * 0.6, entry_price * 0.006)
+        trail_distance   = max(atr * 0.6, entry_price * 0.018)  # мин 1.8% для Long
 
         return {
             "activation_price": round(activation_price, 8),
