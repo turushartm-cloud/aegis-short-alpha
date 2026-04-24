@@ -84,7 +84,7 @@ class AegisLongSignalEngine:
     }
 
     MIN_COMPONENTS_VALID = 2
-    MIN_COMPONENT_SCORE  = 30.0
+    MIN_COMPONENT_SCORE  = 15.0  # Ниже порог = больше сигналов
 
     def __init__(
         self,
