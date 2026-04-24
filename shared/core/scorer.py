@@ -117,8 +117,13 @@ SHORT_PATTERN_STRENGTHS = {
 
 class BaseScorer:
     COMPONENT_WEIGHTS = {
-        "rsi": 20, "funding": 15, "long_short_ratio": 15,
-        "open_interest": 15, "delta": 20, "pattern": 30
+        "rsi": 12,          # ⬇️ Уменьшили — запоздалый индикатор
+        "funding": 15,
+        "long_short_ratio": 15,
+        "open_interest": 15,
+        "delta": 20,
+        "pattern": 35,      # ⬆️ Увеличили — структура важнее
+        "structure": 18,    # 🆕 Консолидация/поддержка/сопротивление
     }
 
     def __init__(self, min_score: int = 65, direction: Direction = Direction.SHORT):
@@ -341,7 +346,7 @@ class ShortScorer(BaseScorer):
 
 class LongScorer(BaseScorer):
 
-    def __init__(self, min_score: int = 65):
+    def __init__(self, min_score: int = 55):  # Ниже порог для лонгов
         super().__init__(min_score, Direction.LONG)
 
     def calculate_rsi_component(self, rsi_1h: float) -> ScoreComponent:
@@ -350,10 +355,12 @@ class LongScorer(BaseScorer):
         elif rsi_1h <= 30: score, desc = 15, f"RSI {rsi_1h:.1f} — Перепроданность"
         elif rsi_1h <= 35: score, desc = 12, f"RSI {rsi_1h:.1f} — Начало перепроданности"
         elif rsi_1h <= 40: score, desc = 10, f"RSI {rsi_1h:.1f} — Близко к перепроданности"
-        elif rsi_1h <= 45: score, desc = 7,  f"RSI {rsi_1h:.1f} — Нейтрально-bearish"
-        elif rsi_1h <= 55: score, desc = 5,  f"RSI {rsi_1h:.1f} — Нейтральная зона"
-        elif rsi_1h > 70:  score, desc = 0,  f"RSI {rsi_1h:.1f} — Перекупленность (плохо для лонга)"
-        else:              score, desc = 2,  f"RSI {rsi_1h:.1f} — Умеренно бычий"
+        elif rsi_1h <= 45: score, desc = 8,  f"RSI {rsi_1h:.1f} — Нейтрально-bearish"
+        elif rsi_1h <= 55: score, desc = 6,  f"RSI {rsi_1h:.1f} — Нейтральная зона (ок для моментума)"
+        elif rsi_1h <= 60: score, desc = 4,  f"RSI {rsi_1h:.1f} — Умеренный моментум"
+        elif rsi_1h <= 65: score, desc = 2,  f"RSI {rsi_1h:.1f} — Начало перекупленности"
+        elif rsi_1h > 75:  score, desc = 0,  f"RSI {rsi_1h:.1f} — Перекупленность (плохо для лонга)"
+        else:              score, desc = 1,  f"RSI {rsi_1h:.1f} — Высокий"
         return ScoreComponent("RSI", score, 20, desc, rsi_1h)
 
     def calculate_funding_component(self, current_funding: float,
@@ -421,9 +428,16 @@ class LongScorer(BaseScorer):
         base = LONG_PATTERN_STRENGTHS.get(best.name, best.strength)
         bonus = (3 if len(patterns) >= 2 else 0) + (5 if len(patterns) >= 3 else 0)
         fresh = 2 if best.candles_ago == 0 else (1 if best.candles_ago == 1 else 0)
-        total = min(base + bonus + fresh, 30)
+        
+        # 🆕 Momentum bonus for breakout patterns
+        momentum_bonus = 0
+        if best.name in ("BREAKOUT_LONG", "MOMENTUM_LONG", "LIQUIDITY_SWEEP_LONG"):
+            momentum_bonus = 5  # Extra bonus for momentum entries
+        
+        total = min(base + bonus + fresh + momentum_bonus, 30)
         names = [p.name for p in patterns]
         desc = f"{best.name} (base={base})"
+        if momentum_bonus: desc += f" +momentum{int(momentum_bonus)}"
         if len(patterns) > 1: desc += f" +{len(patterns)-1} паттернов"
         return ScoreComponent("Patterns", total, 30, desc), names
 
