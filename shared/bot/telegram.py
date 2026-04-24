@@ -297,7 +297,7 @@ class TelegramBot:
             tp_price  = float(tp_item[0]) if isinstance(tp_item, (list, tuple)) else float(tp_item.get("price", 0))
             tp_weight = tp_item[1] if isinstance(tp_item, (list, tuple)) else tp_item.get("weight", 0)
             pct = abs(self._calc_pct(entry, tp_price))
-            tp_lines += f"   TP{i}: <b>{fmt_price(tp_price)}</b>  (-{pct:.1f}%)  [{tp_weight}%]\n"
+            tp_lines += f"   TP{i}: <b>{fmt_price(tp_price)}</b>  (+{pct:.1f}%)  [{tp_weight}%]\n"
 
         ind_lines = "\n".join(f"   {k}: <b>{v}</b>" for k, v in indicators.items())
 
