@@ -65,6 +65,7 @@ from core.pattern_detector import ShortPatternDetector
 from core.position_tracker import PositionTracker
 from core.short_filter import get_short_filter, get_short_tp_config
 from core.realtime_scorer import get_realtime_scorer
+from core.consolidation_detector import ConsolidationDetector, filter_mid_range
 from bot.telegram import TelegramBot, TelegramCommandHandler
 
 # ── Aegis modules (NEW) ──
@@ -161,6 +162,7 @@ class BotState:
         # Existing detectors (shared/core)
         self.scorer           = None
         self.pattern_detector = None
+        self.consolidation_detector: Optional[ConsolidationDetector] = None  # 🆕
 
         # ── Aegis modules (NEW) ──
         self.signal_engine:       Optional[AegisSignalEngine]    = None
@@ -254,6 +256,11 @@ async def lifespan(app: FastAPI):
     # ── Existing scorer + patterns ──
     state.scorer           = get_short_scorer(Config.MIN_SCORE)
     state.pattern_detector = ShortPatternDetector()
+    
+    # 🆕 Consolidation Detector — блокировка входов в середине диапазона
+    state.consolidation_detector = ConsolidationDetector(
+        lookback=20, max_range_pct=5.0, min_candles=10
+    )
 
     # ── Aegis Detectors ──
     print("🔧 Initializing Aegis detectors...")
@@ -512,6 +519,27 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
 
         price      = md.price
         base_score = base_result.total_score
+        
+        # 🆕 Консолидация фильтр — блокировка входов в середине диапазона
+        if state.consolidation_detector and ohlcv_15m:
+            cons = state.consolidation_detector.detect(ohlcv_15m, price)
+            allow, reason = filter_mid_range(cons, price, "short", verbose=False)
+            
+            if cons.is_consolidating and not allow:
+                if verbose:
+                    print(f"{log_prefix} ❌ [CONSOLIDATION] {reason}")
+                return None
+            
+            if cons.has_upthrust and cons.is_consolidating:
+                base_score += 12  # Бонус за Upthrust
+                if verbose:
+                    print(f"{log_prefix} ✅ [UPTHRUST] +12 — ложный пробой вверх")
+            
+            if cons.has_breakout_down and cons.is_consolidating:
+                base_score += 8  # Бонус за пробой вниз
+                if verbose:
+                    print(f"{log_prefix} ✅ [BREAKOUT] +8 — пробой консолидации")
+        
         if verbose:
             print(f"{log_prefix} 📊 [BASE_SCORER] score={base_score:.1f} | reasons: {list(base_result.reasons)[:3]}")
 
