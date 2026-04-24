@@ -33,7 +33,7 @@ class TakeProfitLevel:
     """Уровень Take Profit"""
     level: int  # 1-6
     price: float
-    size_pct: float  # % позиции для закрытия (30%, 30%, 10%, 10%, 10%, 10%)
+    size_pct: float  # % позиции для закрытия (15%, 20%, 20%, 15%, 15%, 15%)
     hit: bool = False
     hit_time: Optional[str] = None
     pnl: float = 0.0
@@ -433,8 +433,8 @@ class TradeManager:
             pos.trail_active = True
             pos.tp3_hit = True
             
-            # Начальный trail на 2% от текущей цены
-            trail_distance = 0.02
+            # Начальный trail на 1.5% от текущей цены (консервативный)
+            trail_distance = 0.015
             if pos.direction == "LONG":
                 pos.trail_sl_price = current_price * (1 - trail_distance)
             else:
