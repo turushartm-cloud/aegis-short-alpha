@@ -255,9 +255,9 @@ class SmartDCAEngine:
 
         # Веса TP (убывающие — больше на первых)
         weights_map = {
-            4: [35, 30, 20, 15],
-            5: [30, 25, 20, 15, 10],
-            6: [25, 25, 20, 15, 10, 5],
+            4: [15, 20, 20, 15],
+            5: [15, 20, 20, 15, 15],
+            6: [15, 20, 20, 15, 15, 15],
         }
         weights = weights_map.get(num_tps, [25] * num_tps)
 
@@ -277,7 +277,7 @@ class SmartDCAEngine:
     ) -> dict:
         """Конфигурация трейлинг-стопа для SHORT"""
         activation_price = entry_price * (1 - activation_pct / 100)
-        trail_distance   = max(atr * 0.5, entry_price * 0.005)  # мин 0.5%
+        trail_distance   = max(atr * 0.5, entry_price * 0.012)  # мин 1.2%
 
         return {
             "activation_price": round(activation_price, 8),
