@@ -99,7 +99,7 @@ class Config:
 
     # TP Config
     TP_LEVELS  = [2.5, 4.0, 6.5, 9.0, 12.0, 17.0]
-    TP_WEIGHTS = [30,  25,  20,  13,   8,     4]
+    TP_WEIGHTS = [15,  20,  20,  15,  15,    15]
 
     # Risk management
     RISK_PER_TRADE      = float(os.getenv("RISK_PER_TRADE", "0.001"))    # 0.1%
