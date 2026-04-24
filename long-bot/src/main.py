@@ -96,7 +96,7 @@ class Config:
 
     # LONG TP: меньше фиксируем рано (ждём движения)
     TP_LEVELS  = [3.0, 5.0, 8.0, 12.0, 18.0, 25.0]
-    TP_WEIGHTS = [20,  20,  25,  20,   10,    5]
+    TP_WEIGHTS = [15,  20,  20,  15,   15,   15]
 
     # Risk management
     RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE", "0.001"))
