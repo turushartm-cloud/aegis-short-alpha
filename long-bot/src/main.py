@@ -91,7 +91,7 @@ class Config:
     SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "240"))    # Long = медленнее
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "15"))
 
-    MIN_SCORE     = int(os.getenv("MIN_LONG_SCORE", "58"))     # Чуть мягче Short (60)
+    MIN_SCORE     = int(os.getenv("MIN_LONG_SCORE", "50"))   # Было 58 — fallback даёт ~42-52 без реальных детекторов
     SL_BUFFER     = float(os.getenv("LONG_SL_BUFFER", "3.0")) # Long = больше SL
     LEVERAGE      = os.getenv("LONG_LEVERAGE", "5-20")
 
@@ -513,7 +513,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         if isinstance(ohlcv_30m, Exception): ohlcv_30m = []
         if isinstance(ohlcv_4h, Exception):  ohlcv_4h  = []
 
-        # П10: Multi-Timeframe RSI bonus (LONG: oversold = бонус)
+        # П10: Multi-Timeframe RSI bonus (LONG: oversold = бонус, momentum = нейтральный)
         _mtf_bonus = 0
         try:
             def _calc_rsi_l(candles, period=14):
@@ -534,6 +534,10 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             rsi_30m = _calc_rsi_l(ohlcv_30m) if ohlcv_30m else None
             rsi_4h  = _calc_rsi_l(ohlcv_4h)  if ohlcv_4h  else None
             rsi_1h  = md.rsi_1h or 50
+            _price_1h_chg = getattr(md, "price_change_1h", 0) or 0
+            _price_4h_chg = getattr(md, "price_change_4h", 0) or 0
+            _is_momentum_up = _price_1h_chg > 3.0 or _price_4h_chg > 8.0
+
             if rsi_4h and rsi_30m:
                 if rsi_4h < 30 and rsi_1h < 35 and rsi_30m < 35:
                     _mtf_bonus = 15
@@ -541,9 +545,13 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 elif rsi_4h < 35 and rsi_1h < 40:
                     _mtf_bonus = 8
                     if verbose: print(f"{log_prefix} 📉 [MTF] RSI 4H={rsi_4h} 1H={rsi_1h:.0f} — перепродан +8 LONG")
+                elif rsi_4h > 70 and rsi_1h > 70 and _is_momentum_up:
+                    # MOMENTUM LONG: RSI высокий, но цена реально растёт — не штрафуем
+                    _mtf_bonus = 5
+                    if verbose: print(f"{log_prefix} 🚀 [MTF] RSI {rsi_1h:.0f} высокий но MOMENTUM +{_price_1h_chg:.1f}%/1H — нейтральный +5")
                 elif rsi_4h > 70 and rsi_1h > 70:
-                    _mtf_bonus = -8  # Против лонга — перегрет
-                    if verbose: print(f"{log_prefix} ⚠️ [MTF] RSI 4H={rsi_4h} перегрет — минус для лонга {_mtf_bonus}")
+                    _mtf_bonus = -5  # Перегрет без ценового подтверждения — лёгкий штраф
+                    if verbose: print(f"{log_prefix} ⚠️ [MTF] RSI 4H={rsi_4h} перегрет без тренда {_mtf_bonus}")
         except Exception as _mtf_e:
             if verbose: print(f"{log_prefix} ⚠️ [MTF] error: {_mtf_e}")
 
@@ -572,6 +580,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             patterns=patterns,
             volume_spike_ratio=getattr(md, "volume_spike_ratio", 1.0),
             atr_14_pct=getattr(md, "atr_14_pct", 0.5),
+            price_change_1h=getattr(md, "price_change_1h", 0.0),
         )
         if not base_result.is_valid:
             if verbose:

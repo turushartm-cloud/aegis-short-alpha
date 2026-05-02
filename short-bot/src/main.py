@@ -94,7 +94,7 @@ class Config:
     SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "180"))
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "15"))
 
-    MIN_SCORE     = int(os.getenv("MIN_SHORT_SCORE", "60"))
+    MIN_SCORE     = int(os.getenv("MIN_SHORT_SCORE", "54"))  # Было 60 — fallback даёт ~45-55 без реальных детекторов
     SL_BUFFER     = float(os.getenv("SHORT_SL_BUFFER", "2.5"))
     LEVERAGE      = os.getenv("SHORT_LEVERAGE", "5-30")
 
@@ -521,6 +521,9 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             rsi_30m = _calc_rsi(ohlcv_30m) if ohlcv_30m else None
             rsi_4h  = _calc_rsi(ohlcv_4h)  if ohlcv_4h  else None
             rsi_1h  = md.rsi_1h or 50
+            _p1h = getattr(md, "price_change_1h", 0) or 0
+            _p4h = getattr(md, "price_change_4h", 0) or 0
+            _is_downtrend = _p1h < -3.0 or _p4h < -8.0  # Явный даунтренд по цене
 
             # Шорт: все таймфреймы перегреты → сильный сигнал
             if rsi_4h and rsi_30m:
@@ -530,9 +533,13 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 elif rsi_4h > 65 and rsi_1h > 60:
                     _mtf_bonus = 8
                     if verbose: print(f"{log_prefix} 📈 [MTF] RSI 4H={rsi_4h} 1H={rsi_1h:.0f} — перегрев +8")
+                elif rsi_4h < 40 and rsi_1h < 45 and _is_downtrend:
+                    # MOMENTUM SHORT: RSI низкий, цена падает → trend continuation SHORT
+                    _mtf_bonus = 5
+                    if verbose: print(f"{log_prefix} 📉 [MTF] RSI {rsi_1h:.0f} низкий но DOWNTREND {_p1h:.1f}%/1H — SHORT продолжение +5")
                 elif rsi_4h < 40 and rsi_1h < 45:
-                    _mtf_bonus = -10  # Против шорта — рынок падает, уже перепродан
-                    if verbose: print(f"{log_prefix} ⚠️ [MTF] RSI 4H={rsi_4h} перепродан — минус для шорта {_mtf_bonus}")
+                    _mtf_bonus = -5  # Перепродан без ценового подтверждения — лёгкий штраф
+                    if verbose: print(f"{log_prefix} ⚠️ [MTF] RSI 4H={rsi_4h} перепродан без тренда {_mtf_bonus}")
             elif rsi_4h:
                 if rsi_4h > 70: _mtf_bonus = 8
                 elif rsi_4h > 65: _mtf_bonus = 4

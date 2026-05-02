@@ -105,7 +105,7 @@ class AegisSignalEngine:
         liq_mapper=None,
         smc_detector=None,
         delta_analyzer=None,
-        min_score: float = 60.0,
+        min_score: float = 54.0,  # Было 60
     ):
         self.pump_detector  = pump_detector
         self.oi_analyzer    = oi_analyzer
