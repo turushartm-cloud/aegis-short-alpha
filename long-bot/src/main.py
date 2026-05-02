@@ -244,7 +244,9 @@ async def lifespan(app: FastAPI):
     state.binance = get_binance_client()
     await state.binance._init_source()
 
-    state.scorer           = get_long_scorer(Config.MIN_SCORE)
+    # П2 FIX: BASE_SCORER получает мягкий порог — строгий порог только у AEGIS
+    _long_base_min = int(os.getenv("MIN_LONG_BASE_SCORE", "45"))
+    state.scorer           = get_long_scorer(_long_base_min)
     state.pattern_detector = LongPatternDetector()
     
     # 🆕 Consolidation Detector — блокировка входов в середине диапазона

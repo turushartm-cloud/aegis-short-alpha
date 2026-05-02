@@ -329,7 +329,12 @@ class AegisLongSignalEngine:
         final_score  = total_weighted if total_weight > 0 else 0.0
 
         if base_score > 0:
-            final_score = final_score * 0.70 + base_score * 0.30
+            # LONG: AEGIS не должен тянуть вниз хороший base_score
+            aegis_only = final_score
+            if base_score >= 60:
+                final_score = base_score + min(aegis_only * 0.15, 15)
+            else:
+                final_score = aegis_only * 0.50 + base_score * 0.50
 
         if final_score < self.min_score or valid_components < self.MIN_COMPONENTS_VALID:
             return None

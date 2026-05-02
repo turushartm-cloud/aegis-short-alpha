@@ -44,7 +44,9 @@ services:
       - key: MAX_WATCHLIST
         value: "500"
       - key: MIN_SHORT_SCORE
-        value: "65"          # П6: было 60 → 65
+        value: "65"          # AEGIS final threshold
+      - key: MIN_SHORT_BASE_SCORE
+        value: "50"          # BASE_SCORER порог (мягче — AEGIS потом доуточняет)
       - key: SCAN_INTERVAL
         value: "120"          # П8: было 180 → 120s
       - key: MAX_POSITIONS
@@ -126,7 +128,9 @@ services:
       - key: MAX_WATCHLIST
         value: "500"
       - key: MIN_LONG_SCORE
-        value: "70"           # П6: было 58 → 70
+        value: "70"           # AEGIS final threshold
+      - key: MIN_LONG_BASE_SCORE
+        value: "45"           # BASE_SCORER порог (мягче — ищет перепроданность)
       - key: SCAN_INTERVAL
         value: "180"          # Long чуть медленнее short
       - key: MAX_POSITIONS

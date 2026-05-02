@@ -438,10 +438,17 @@ class AegisSignalEngine:
         # Нормируем обратно к 0-100 (так как raw_score уже 0-100)
         final_score = total_weighted  # Это уже 0-100 (веса суммируются в 1.0)
 
-        # Интеграция с base_score из исходного scorer (бонус при совпадении)
+        # Интеграция с base_score из исходного scorer
+        # Логика: AEGIS не должен тянуть вниз уже высокий base_score
+        # Используем: max(base_score, aegis_weighted) с небольшим бонусом от AEGIS
         if base_score > 0:
-            # Blended: 70% Aegis + 30% существующий scorer
-            final_score = final_score * 0.70 + base_score * 0.30
+            aegis_only = final_score  # AEGIS weighted score (0-100)
+            if base_score >= 65:
+                # base уже хороший — AEGIS даёт бонус до +15, не режет
+                final_score = base_score + min(aegis_only * 0.15, 15)
+            else:
+                # base слабый — честный блендинг 50/50
+                final_score = aegis_only * 0.50 + base_score * 0.50
 
         # Проверка минимального порога и минимума компонентов
         if final_score < self.min_score:
