@@ -72,7 +72,8 @@ class BingXClient:
         self.api_key    = api_key    or os.getenv("BINGX_API_KEY", "")
         self.api_secret = api_secret or os.getenv("BINGX_API_SECRET", "")
         force_real = os.getenv("BINGX_FORCE_REAL", "false").lower() == "true"
-        self.demo  = (not force_real) or demo
+        # FIX: правильная логика — force_real перебивает demo param
+        self.demo = False if force_real else demo
         if not self.demo:
             print("🚨 WARNING: REAL MODE!")
         if not self.api_key or not self.api_secret:
