@@ -95,7 +95,7 @@ class AegisSignalEngine:
     }
 
     # Минимальные компоненты для валидного сигнала
-    MIN_COMPONENTS_VALID = 2        # ≥2 детектора должны дать score>30
+    MIN_COMPONENTS_VALID = 1        # ≥1 детектора должны дать score>30
     MIN_COMPONENT_SCORE  = 30.0
 
     def __init__(
@@ -445,14 +445,18 @@ class AegisSignalEngine:
 
         # Проверка минимального порога и минимума компонентов
         if final_score < self.min_score:
+            comp_str = " | ".join(f"{k}={v.raw_score:.0f}" for k,v in components.items())
+            logger.info(f"[AEGIS REJECT] {symbol}: score={final_score:.1f} < min={self.min_score} | {comp_str}")
             return None
 
         if valid_components < self.MIN_COMPONENTS_VALID:
-            logger.debug(f"{symbol}: only {valid_components} valid components — skip")
+            comp_str = " | ".join(f"{k}={v.raw_score:.0f}" for k,v in components.items())
+            logger.info(f"[AEGIS REJECT] {symbol}: valid_components={valid_components} < {self.MIN_COMPONENTS_VALID} | {comp_str}")
             return None
 
         strength = self._score_to_strength(final_score)
         if strength == SignalStrength.NOISE:
+            logger.info(f"[AEGIS REJECT] {symbol}: score={final_score:.1f} → NOISE strength")
             return None
 
         from datetime import datetime

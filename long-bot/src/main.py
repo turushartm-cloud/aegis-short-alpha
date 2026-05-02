@@ -431,9 +431,11 @@ async def _count_long_positions() -> int:
         try:
             pos = await state.auto_trader.bingx.get_positions()
             long_pos = [p for p in pos if (
-                getattr(p, "position_side", "").upper() == "LONG" or
-                getattr(p, "side", "").upper() == "LONG"
-            )]
+                getattr(p, "position_side", "").upper() == "LONG"
+                or getattr(p, "positionSide", "").upper() == "LONG"
+                or getattr(p, "side", "").upper() == "LONG"
+                or getattr(p, "direction", "").upper() == "BUY"
+            ) and getattr(p, "size", 0) != 0]
             return len(long_pos)
         except Exception as e:
             print(f"[LONG] count error: {e}")
@@ -508,6 +510,40 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             return None
         if isinstance(ohlcv_30m, Exception): ohlcv_30m = []
         if isinstance(ohlcv_4h, Exception):  ohlcv_4h  = []
+
+        # П10: Multi-Timeframe RSI bonus (LONG: oversold = бонус)
+        _mtf_bonus = 0
+        try:
+            def _calc_rsi_l(candles, period=14):
+                if not candles or len(candles) < period + 1: return None
+                closes = [c.close for c in candles]
+                gains, losses = [], []
+                for i in range(1, len(closes)):
+                    d = closes[i] - closes[i-1]
+                    gains.append(max(d, 0)); losses.append(max(-d, 0))
+                avg_g = sum(gains[:period]) / period
+                avg_l = sum(losses[:period]) / period
+                for i in range(period, len(gains)):
+                    avg_g = (avg_g*(period-1)+gains[i])/period
+                    avg_l = (avg_l*(period-1)+losses[i])/period
+                rs = avg_g / avg_l if avg_l > 0 else 100
+                return round(100 - 100/(1+rs), 1)
+
+            rsi_30m = _calc_rsi_l(ohlcv_30m) if ohlcv_30m else None
+            rsi_4h  = _calc_rsi_l(ohlcv_4h)  if ohlcv_4h  else None
+            rsi_1h  = md.rsi_1h or 50
+            if rsi_4h and rsi_30m:
+                if rsi_4h < 30 and rsi_1h < 35 and rsi_30m < 35:
+                    _mtf_bonus = 15
+                    if verbose: print(f"{log_prefix} 📉 [MTF] RSI 4H={rsi_4h} 1H={rsi_1h:.0f} 30M={rsi_30m} — всё перепродано +15 LONG")
+                elif rsi_4h < 35 and rsi_1h < 40:
+                    _mtf_bonus = 8
+                    if verbose: print(f"{log_prefix} 📉 [MTF] RSI 4H={rsi_4h} 1H={rsi_1h:.0f} — перепродан +8 LONG")
+                elif rsi_4h > 70 and rsi_1h > 70:
+                    _mtf_bonus = -8  # Против лонга — перегрет
+                    if verbose: print(f"{log_prefix} ⚠️ [MTF] RSI 4H={rsi_4h} перегрет — минус для лонга {_mtf_bonus}")
+        except Exception as _mtf_e:
+            if verbose: print(f"{log_prefix} ⚠️ [MTF] error: {_mtf_e}")
 
         # ── Базовый scorer (backward compat) ─────────────────────────
         hourly_deltas = await state.binance.get_hourly_volume_profile(symbol, 7)
