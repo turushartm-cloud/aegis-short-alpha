@@ -921,10 +921,12 @@ async def _daily_report_task():
             next_report += timedelta(days=1)
         await asyncio.sleep((next_report - now).total_seconds())
 
-        if state.performance_tracker and state.is_running:
+        if state.is_running and state.telegram:
             try:
-                report = state.performance_tracker.daily_report()
-                await state.telegram.send_message(report)
+                # Используем Redis-историю (те же данные что и /daily_rep)
+                # PerformanceTracker хранит данные только в RAM и обнуляется при рестарте
+                await state.telegram.cmd_daily_report("", state.telegram.chat_id)
+                print("✅ Daily report sent (Redis-based)")
             except Exception as e:
                 print(f"Daily report error: {e}")
 
