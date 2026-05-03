@@ -89,9 +89,9 @@ class Config:
     # Paid tier
     MAX_PAIRS     = int(os.getenv("MAX_PAIRS", "150"))
     SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "240"))    # Long = медленнее
-    MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "15"))
+    MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "12"))
 
-    MIN_SCORE     = int(os.getenv("MIN_LONG_SCORE", "50"))   # Было 58 — fallback даёт ~42-52 без реальных детекторов
+    MIN_SCORE     = int(os.getenv("MIN_LONG_SCORE", "60"))   # Было 58 — fallback даёт ~42-52 без реальных детекторов
     SL_BUFFER     = float(os.getenv("LONG_SL_BUFFER", "3.0")) # Long = больше SL
     LEVERAGE      = os.getenv("LONG_LEVERAGE", "5-20")
 
@@ -100,11 +100,11 @@ class Config:
     TP_WEIGHTS = [15,  20,  20,  15,   15,   15]
 
     # Risk management
-    RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE", "0.001"))
+    RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE", "0.0004"))
     MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.15"))
     MAX_EXPOSURE_PCT = float(os.getenv("MAX_EXPOSURE_PCT", "0.60"))
-    DAILY_DD_LIMIT   = float(os.getenv("DAILY_DRAWDOWN_LIMIT", "5.0"))
-    MAX_CONSEC_LOSS  = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
+    DAILY_DD_LIMIT   = float(os.getenv("DAILY_DRAWDOWN_LIMIT", "3.0"))
+    MAX_CONSEC_LOSS  = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
     KELLY_FRACTION   = float(os.getenv("KELLY_FRACTION", "0.25"))
 
     # Smart DCA
@@ -131,6 +131,7 @@ class Config:
     MIN_VOLUME_USDT = int(os.getenv("MIN_VOLUME_USDT", "300000"))
     MAX_WATCHLIST   = int(os.getenv("MAX_WATCHLIST", "150"))
 
+    MAX_DAILY_TRADES  = int(os.getenv("MAX_DAILY_TRADES_LONG", "10"))  # v3.0
     SIGNAL_TTL_HOURS  = 24
     TRAIL_ACTIVATION  = float(os.getenv("LONG_TRAIL_ACTIVATION", "0.015"))  # +1.5%
 
@@ -243,7 +244,10 @@ async def lifespan(app: FastAPI):
     print(f"{'✅' if redis_ok else '❌'} Redis")
 
     state.binance = get_binance_client()
-    await state.binance._init_source()
+    try:
+        await state.binance._init_source()
+    except Exception as e:
+        print(f"⚠️ Binance init failed (continuing with Bybit fallback): {e}")
 
     # П2 FIX: BASE_SCORER получает мягкий порог — строгий порог только у AEGIS
     _long_base_min = int(os.getenv("MIN_LONG_BASE_SCORE", "45"))
@@ -351,6 +355,8 @@ async def lifespan(app: FastAPI):
                     max_positions=Config.MAX_POSITIONS,
                     risk_per_trade=Config.RISK_PER_TRADE,
                     min_score_for_trade=Config.MIN_SCORE,
+                    max_daily_risk=Config.DAILY_DD_LIMIT,
+                    max_daily_trades=Config.MAX_DAILY_TRADES,
                 )
                 state.auto_trader = AutoTrader(
                     bingx_client=bingx, config=trade_cfg, telegram=state.telegram

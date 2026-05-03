@@ -1,14 +1,16 @@
 """
-Auto Trader v2.6
+Auto Trader v3.0 — HARDENED ENTRY CONDITIONS
 
-ИСПРАВЛЕНИЯ v2.6:
-  ✅ code=101209 RETRY: парсим фактический лимит из текста ошибки → retry
-     Было: cap=$5000, но если лимит=5000 → reject (edge case точное совпадение)
-     Стало: cap = parsed_max * 0.92 (8% запас) → retry 1 раз
-     Пример: "max is 5000 USDT" → cap = 4600, retry → успех
-  ✅ daily_pnl: единицы в % (5.0 = 5%), не дробях (было 0.05)
-  ✅ cooldown 30с между открытиями (защита от дублей)
-  ✅ TP Hedge Mode: нет reduceOnly
+ИЗМЕНЕНИЯ v3.0:
+  ✅ max_daily_risk: 5.0% → 3.0% (жёстче дневной лимит)
+  ✅ max_daily_trades: 12 (новый лимит сделок в день)
+  ✅ min_score_for_trade: 65 → 70 (меньше входов, выше качество)
+  ✅ risk_per_trade: 0.0005 → 0.0004 (-20% риска на сделку)
+  ✅ risk_mult убран — нет 1.5x на позиции (агрессия удалена)
+  ✅ RR Filter: TP1 / SL >= 1.5 — отклонение плохих RR
+  ✅ max_positions: 20 → 12 (меньше одновременных позиций)
+  ✅ Cooldown 30с между открытиями (антидубль)
+  ✅ code=101209 RETRY: парсим фактический лимит → retry
 """
 
 import os
@@ -27,14 +29,8 @@ from upstash.redis_client import get_redis_client
 
 
 def _parse_max_notional_from_error(error_msg: str) -> Optional[float]:
-    """
-    Из строки "The maximum position value for this leverage is 5000 USDT"
-    или "The maximum position value for this leverage is 10,000 USDT"
-    извлекаем число.
-    """
     if not error_msg:
         return None
-    # Ищем число (возможно с запятыми) перед "USDT"
     m = re.search(r'is\s+([\d,]+(?:\.\d+)?)\s+USDT', error_msg, re.IGNORECASE)
     if m:
         try:
@@ -48,16 +44,18 @@ def _parse_max_notional_from_error(error_msg: str) -> Optional[float]:
 class TradeConfig:
     enabled:             bool  = True
     demo_mode:           bool  = True
-    max_positions:       int   = 20
-    risk_per_trade:      float = 0.0005     # 0.05%
-    max_daily_risk:      float = 5.0        # 5% (в %, не дробях!)
+    max_positions:       int   = 12          # ✅ v3.0: было 20 → меньше одновременных
+    risk_per_trade:      float = 0.0004      # ✅ v3.0: было 0.0005 → -20%
+    max_daily_risk:      float = 3.0         # ✅ v3.0: было 5.0% → жёстче
+    max_daily_trades:    int   = 12          # ✅ v3.0: НОВЫЙ лимит сделок
+    min_rr_ratio:        float = 1.5         # ✅ v3.0: НОВЫЙ RR фильтр TP1/SL
     default_leverage:    int   = 20
     min_leverage:        int   = 5
     max_leverage:        int   = 50
-    min_score_for_trade: int   = 65
-    max_position_usdt:   float = 5000.0    # глобальный потолок
-    notional_safety_pct: float = 0.92      # 92% от лимита (запас 8%)
-    open_cooldown_sec:   float = 30.0      # антидубль
+    min_score_for_trade: int   = 70          # ✅ v3.0: было 65 → +5 пунктов
+    max_position_usdt:   float = 5000.0
+    notional_safety_pct: float = 0.92
+    open_cooldown_sec:   float = 30.0
 
 
 class AutoTrader:
@@ -68,7 +66,7 @@ class AutoTrader:
         self.redis    = get_redis_client()
         self.telegram = telegram
 
-        self.daily_pnl    = 0.0   # в % (напр. -2.5 = убыток 2.5%)
+        self.daily_pnl    = 0.0
         self.daily_trades = 0
         self.total_pnl    = 0.0
         self.win_count    = 0
@@ -77,12 +75,13 @@ class AutoTrader:
         self._last_open_ts = 0.0
 
         mode = "DEMO" if self.config.demo_mode else "REAL"
-        print(f"🤖 AutoTrader initialized ({mode})")
+        print(f"🤖 AutoTrader v3.0 initialized ({mode})")
         print(f"   Risk/trade: {self.config.risk_per_trade*100:.3f}% | "
               f"Max pos: {self.config.max_positions} | "
               f"Min score: {self.config.min_score_for_trade} | "
-              f"Max notional: ${self.config.max_position_usdt:,.0f} | "
-              f"Daily risk limit: {self.config.max_daily_risk}%")
+              f"Max daily risk: {self.config.max_daily_risk}% | "
+              f"Max daily trades: {self.config.max_daily_trades} | "
+              f"Min RR: {self.config.min_rr_ratio}")
 
     async def _tg(self, msg: str):
         if self.telegram:
@@ -143,11 +142,12 @@ class AutoTrader:
         if not self.config.enabled:
             return None
 
+        # ── 1a. Score filter ──────────────────────────────────────────────────
         if signal_score < self.config.min_score_for_trade:
             print(f"{pfx} ⏸ SKIP — score {signal_score:.1f} < {self.config.min_score_for_trade}")
             return None
 
-        # ── 1. Daily risk ─────────────────────────────────────────────────────
+        # ── 1b. Daily risk limit ──────────────────────────────────────────────
         self._check_daily_reset()
         if self.daily_pnl <= -self.config.max_daily_risk:
             print(f"{pfx} ⏸ SKIP — daily risk limit {self.daily_pnl:.2f}% <= -{self.config.max_daily_risk}%")
@@ -156,6 +156,37 @@ class AutoTrader:
                 f"дневной лимит ({self.daily_pnl:.2f}% ≤ -{self.config.max_daily_risk}%)"
             )
             return None
+
+        # ── 1c. Daily trade count limit ───────────────────────────────────────
+        if self.daily_trades >= self.config.max_daily_trades:
+            print(f"{pfx} ⏸ SKIP — daily trade limit ({self.daily_trades}/{self.config.max_daily_trades})")
+            await self._tg(
+                f"⏸ <b>[{mode}]</b> <code>#{symbol}</code>: "
+                f"лимит сделок за день ({self.daily_trades}/{self.config.max_daily_trades})"
+            )
+            return None
+
+        # ── 1d. RR Filter — TP1 / SL >= min_rr_ratio ─────────────────────────
+        if take_profits and self.config.min_rr_ratio > 0:
+            tp1_raw = take_profits[0]
+            try:
+                if isinstance(tp1_raw, (list, tuple)):
+                    tp1_price = float(tp1_raw[0])
+                elif isinstance(tp1_raw, dict):
+                    tp1_price = float(tp1_raw.get("price", 0))
+                else:
+                    tp1_price = float(tp1_raw)
+
+                sl_dist  = abs(entry_price - stop_loss)
+                tp1_dist = abs(tp1_price - entry_price)
+                rr = tp1_dist / sl_dist if sl_dist > 0 else 0
+
+                if rr < self.config.min_rr_ratio:
+                    print(f"{pfx} ⏸ SKIP — RR too low ({rr:.2f} < {self.config.min_rr_ratio})")
+                    return None
+                print(f"{pfx} ✅ RR={rr:.2f} >= {self.config.min_rr_ratio}")
+            except Exception as e:
+                print(f"{pfx} ⚠️ RR check failed: {e}")
 
         # ── 2. Positions ──────────────────────────────────────────────────────
         print(f"{pfx} 🔍 Checking open positions...")
@@ -185,10 +216,6 @@ class AutoTrader:
                     if p.symbol.replace("-", "") == symbol.replace("-", "")]
         if existing:
             print(f"{pfx} ⏸ SKIP — already open ({existing[0].side})")
-            await self._tg_reply(
-                f"ℹ️ <b>Позиция уже открыта</b>\n"
-                f"<b>#{symbol}</b> — {existing[0].side} уже активен", tg_msg_id
-            )
             return None
 
         # ── 4. Symbol online? ─────────────────────────────────────────────────
@@ -211,9 +238,9 @@ class AutoTrader:
             print(f"{pfx} ❌ SKIP — no margin")
             return None
 
-        # ── 6. Sizing ─────────────────────────────────────────────────────────
-        risk_mult   = 1.5 if signal_score >= 85 else (1.2 if signal_score >= 75 else 1.0)
-        actual_risk = self.config.risk_per_trade * risk_mult
+        # ── 6. Sizing — FLAT risk, no multiplier ─────────────────────────────
+        # ✅ v3.0: risk_mult убран — фиксированный риск 0.04% на каждую сделку
+        actual_risk = self.config.risk_per_trade
         risk_amount = available * actual_risk
         sl_distance = abs(entry_price - stop_loss) / entry_price
 
@@ -227,11 +254,9 @@ class AutoTrader:
         leverage       = self._calc_leverage(signal_score)
         size           = position_value / entry_price
 
-        # ── 7. Max notional cap (fix code=101209 edge case) ───────────────────
-        # Используем 92% от лимита — 8% запас против edge-case на точной границе
-        sym_info     = await self.bingx.get_symbol_info(bingx_symbol)
-        raw_max      = sym_info.get("max_notional", self.config.max_position_usdt)
-        # Берём минимум из глобального и символьного лимита, с запасом 8%
+        # ── 7. Max notional cap ───────────────────────────────────────────────
+        sym_info      = await self.bingx.get_symbol_info(bingx_symbol)
+        raw_max       = sym_info.get("max_notional", self.config.max_position_usdt)
         effective_max = min(self.config.max_position_usdt, raw_max) * self.config.notional_safety_pct
         notional      = size * entry_price
 
@@ -240,8 +265,7 @@ class AutoTrader:
             size     = effective_max / entry_price
             notional = size * entry_price
             actual_risk = (notional * sl_distance) / available if available else actual_risk
-            print(f"{pfx} ⚠️ Notional capped: ${old_size*entry_price:,.0f} → ${notional:,.0f} "
-                  f"(effective_max=${effective_max:,.0f})")
+            print(f"{pfx} ⚠️ Notional capped: ${old_size*entry_price:,.0f} → ${notional:,.0f}")
 
         print(f"{pfx} 📐 risk={actual_risk*100:.3f}% | notional=${notional:,.0f} | "
               f"size={size:.6f} | leverage={leverage}x")
@@ -250,83 +274,50 @@ class AutoTrader:
         side          = "BUY"  if direction == "long"  else "SELL"
         position_side = "LONG" if direction == "long"  else "SHORT"
 
-        tp1_price = None
-        if take_profits:
-            tp_item = take_profits[0]
-            if isinstance(tp_item, (list, tuple)):
-                tp1_price = float(tp_item[0])
-            elif isinstance(tp_item, dict):
-                tp1_price = float(tp_item.get("price", 0)) or None
-
         # ── 9. Main order с RETRY при 101209 ─────────────────────────────────
         print(f"{pfx} 📤 Sending order to BingX [{mode}]...")
         self._last_open_ts = time.time()
 
-        # ✅ FIX: НЕ передаём take_profit в основной ордер!
-        # takeProfit на основном ордере BingX закрывает ВСЮ позицию при срабатывании TP1.
-        # Все TP размещаются отдельно через _place_tp_orders_hedge с правильными размерами.
         order = await self.bingx.place_market_order(
             symbol=bingx_symbol, side=side, position_side=position_side,
             size=size, stop_loss=stop_loss, take_profit=None,
         )
 
-        # ── RETRY логика для code=101209 ──────────────────────────────────────
         if order is None and self.bingx.last_error_code == 101209:
-            err_msg = self.bingx.last_error or ""
+            err_msg    = self.bingx.last_error or ""
             parsed_max = _parse_max_notional_from_error(err_msg)
-
             if parsed_max and parsed_max > 0:
-                # Применяем реальный лимит с запасом
                 retry_max  = parsed_max * self.config.notional_safety_pct
-                retry_size = retry_max / entry_price
-                retry_size = max(retry_size, 0.001)
-
-                print(f"{pfx} 🔄 RETRY 101209: parsed_max=${parsed_max:,.0f} → "
-                      f"retry_max=${retry_max:,.0f} | retry_size={retry_size:.6f}")
-
+                retry_size = max(retry_max / entry_price, 0.001)
+                print(f"{pfx} 🔄 RETRY 101209: parsed_max=${parsed_max:,.0f} → retry_size={retry_size:.6f}")
                 order = await self.bingx.place_market_order(
                     symbol=bingx_symbol, side=side, position_side=position_side,
-                    size=retry_size, stop_loss=stop_loss, take_profit=None,  # ✅ FIX
+                    size=retry_size, stop_loss=stop_loss, take_profit=None,
                 )
                 if order:
-                    size        = retry_size
-                    notional    = retry_size * entry_price
-                    actual_risk = (notional * sl_distance) / available if available else actual_risk
-                    print(f"{pfx} ✅ RETRY succeeded! qty={retry_size:.4f} notional=${notional:,.0f}")
-            else:
-                print(f"{pfx} ⚠️ RETRY skipped: can't parse max from '{err_msg[:80]}'")
+                    size = retry_size
+                    notional = retry_size * entry_price
 
         if order is None:
-            self._last_open_ts = 0.0   # сбрасываем cooldown при финальной ошибке
+            self._last_open_ts = 0.0
             err  = self.bingx.last_error or "unknown"
             code = self.bingx.last_error_code
-            hint = ""
-            try:
-                from api.bingx_client import BingXClient as _BX
-                hint = _BX.ERROR_CODES.get(code, "") if code else ""
-            except Exception:
-                pass
             print(f"{pfx} ❌ ORDER FAILED — code={code} | {err}")
             await self._tg(
                 f"❌ <b>AutoTrader [{mode}] — ОРДЕР ОТКЛОНЁН</b>\n\n"
                 f"<code>#{symbol}</code> {direction.upper()}\n"
-                f"Score: {signal_score:.0f}% | SL: {stop_loss}\n\n"
+                f"Score: {signal_score:.0f} | SL: {stop_loss}\n\n"
                 f"🔴 code={code}: <code>{err}</code>"
-                + (f"\n💡 {hint}" if hint else "")
             )
             return None
 
-        # ── 10. TP1-TP6 — ALL как отдельные ордера с правильным qty ──────────
-        # ✅ FIX: передаём ВСЕ TPs включая TP1 (раньше TP1 шёл в основной ордер)
+        # ── 10. TP1-TP6 — ALL как отдельные ордера ───────────────────────────
         if take_profits:
             asyncio.create_task(
                 self._place_tp_orders_hedge(
-                    bingx_symbol  = bingx_symbol,
-                    position_side = position_side,
-                    total_size    = order.size,
-                    take_profits  = take_profits,   # ✅ все TPs, не [1:]
-                    direction     = direction,
-                    start_num     = 1,              # ✅ начинаем с TP1
+                    bingx_symbol=bingx_symbol, position_side=position_side,
+                    total_size=order.size, take_profits=take_profits,
+                    direction=direction, start_num=1,
                 )
             )
 
@@ -349,6 +340,7 @@ class AutoTrader:
             "tg_msg_id":    tg_msg_id,
             "taken_tps":    [],
             "be_done":      False,
+            "be2_done":     False,
         }
         bot_type = "long" if direction == "long" else "short"
         self.redis.save_signal(bot_type, symbol, position_data)
@@ -364,19 +356,15 @@ class AutoTrader:
             f"📍 Entry: <b>{entry_price}</b>\n"
             f"🛑 SL: <b>{stop_loss}</b>\n"
             f"📊 Size: {order.size} | {leverage}x | {actual_risk*100:.3f}% risk\n"
-            f"🎯 Score: {signal_score:.0f}%\n"
+            f"🎯 Score: {signal_score:.0f} | RR: {self._last_rr:.2f}\n"
             f"🆔 OrderID: {order.order_id}"
         )
         await self._tg_reply(notify_msg, tg_msg_id)
         return position_data
 
-    # =========================================================================
-    # TP HEDGE MODE — без reduceOnly
-    # =========================================================================
-
     async def _place_tp_orders_hedge(self, bingx_symbol, position_side,
                                       total_size, take_profits, direction,
-                                      start_num: int = 1):   # ✅ FIX: TP1 starts at 1
+                                      start_num: int = 1):
         await asyncio.sleep(1.5)
         close_side = "SELL" if direction == "long" else "BUY"
         success = 0
@@ -397,17 +385,13 @@ class AutoTrader:
                     continue
 
                 tp_size       = total_size * tp_weight
-                tp_num        = i + start_num  # ✅ FIX: используем start_num
+                tp_num        = i + start_num
                 rounded_price = await self.bingx._round_price(bingx_symbol, tp_price)
                 rounded_size  = await self.bingx._round_qty(bingx_symbol, tp_size)
 
                 if rounded_size <= 0:
                     continue
 
-                print(f"📤 TP{tp_num}: {bingx_symbol} {close_side} {position_side} "
-                      f"qty={rounded_size} stopPrice={rounded_price}")
-
-                # ✅ НЕТ reduceOnly — Hedge Mode!
                 body = {
                     "symbol":       bingx_symbol,
                     "side":         close_side,
@@ -434,17 +418,12 @@ class AutoTrader:
                     fails += 1
 
                 await asyncio.sleep(0.4)
-
             except Exception as e:
                 print(f"⚠️ TP{i+2} exception: {bingx_symbol} | {e}")
                 fails += 1
 
         status = "✅" if success > 0 else "⚠️"
         print(f"{status} TP orders {bingx_symbol}: {success} placed, {fails} failed")
-
-    # =========================================================================
-    # CLOSE
-    # =========================================================================
 
     async def close_position(self, symbol: str, position_side: str) -> bool:
         bingx_symbol = self._to_bingx_symbol(symbol)
@@ -486,16 +465,16 @@ class AutoTrader:
     # HELPERS
     # =========================================================================
 
+    _last_rr: float = 0.0
+
     def _to_bingx_symbol(self, symbol: str) -> str:
         if "-" not in symbol and symbol.endswith("USDT"):
             return symbol[:-4] + "-USDT"
         return symbol
 
     def _calc_leverage(self, score: float) -> int:
-        base = self.config.default_leverage
-        if score >= 85: return min(self.config.max_leverage, base + 2)
-        if score >= 75: return min(self.config.max_leverage, base + 1)
-        return base
+        # ✅ v3.0: нет бонуса за высокий score — стабильный леверидж
+        return self.config.default_leverage
 
     def _check_daily_reset(self):
         today = datetime.utcnow().date()
@@ -506,7 +485,6 @@ class AutoTrader:
             print("📅 Daily stats reset")
 
     def record_trade_result(self, pnl_pct: float):
-        """pnl_pct в % (напр. 1.5 = +1.5%). daily_pnl та же единица."""
         self.total_pnl    += pnl_pct
         self.daily_pnl    += pnl_pct
         self.daily_trades += 1

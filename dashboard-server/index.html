@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Aegis Dashboard v3</title>
+<style>
+:root{--bg:#0f1117;--bg2:#1a1d27;--bg3:#222535;--border:#2e3248;--border2:#3d4260;--text:#e2e8f0;--text2:#8892a4;--text3:#555f72;--green:#22c55e;--grbg:rgba(34,197,94,.12);--red:#ef4444;--rdbg:rgba(239,68,68,.12);--blue:#3b82f6;--blbg:rgba(59,130,246,.12);--amber:#f59e0b;--ambg:rgba(245,158,11,.12);--r:8px;--r2:12px;--font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh}
+header{background:var(--bg2);border-bottom:1px solid var(--border);padding:12px 20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.logo{font-size:16px;font-weight:600}.logo span{color:var(--blue)}
+.hdr-right{display:flex;gap:10px;align-items:center}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--text3);flex-shrink:0}
+.dot.live{background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.status-text{font-size:12px;color:var(--text2)}
+.last-upd{font-size:11px;color:var(--text3)}
+.main{padding:16px 20px;max-width:1440px;margin:0 auto}
+/* API bar */
+.api-bar{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);padding:12px 14px;margin-bottom:16px}
+.api-bar h3{font-size:11px;font-weight:500;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
+.api-row{display:flex;gap:8px;flex-wrap:wrap}
+.api-row input{flex:1;min-width:200px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);color:var(--text);padding:7px 11px;font-size:13px;outline:none;transition:border-color .2s}
+.api-row input:focus{border-color:var(--blue)}
+.api-row input::placeholder{color:var(--text3)}
+.btn{padding:7px 16px;border-radius:var(--r);border:none;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s}
+.btn-p{background:var(--blue);color:#fff}.btn-p:hover{background:#2563eb}
+.btn-s{background:var(--bg3);color:var(--text2);border:1px solid var(--border)}.btn-s:hover{color:var(--text);border-color:var(--border2)}
+/* Tabs */
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.tab{padding:7px 15px;font-size:13px;font-weight:500;color:var(--text2);cursor:pointer;border-bottom:2px solid transparent;transition:all .15s}
+.tab:hover{color:var(--text)}.tab.active{color:var(--blue);border-bottom-color:var(--blue)}
+/* Metrics */
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:16px}
+.metric{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);padding:12px}
+.metric .lbl{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:5px}
+.metric .val{font-size:20px;font-weight:600}.metric .sub{font-size:11px;color:var(--text3);margin-top:2px}
+/* Colors */
+.g{color:var(--green)}.r{color:var(--red)}.b{color:var(--blue)}.a{color:var(--amber)}.muted{color:var(--text2)}
+/* Bot cards */
+.bot-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+@media(max-width:620px){.bot-grid{grid-template-columns:1fr}}
+.bc{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);padding:14px}
+.bc.long{border-top:3px solid var(--green)}.bc.short{border-top:3px solid var(--red)}
+.bc-hdr{display:flex;align-items:center;gap:7px;margin-bottom:12px}
+.badge{font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px}
+.badge.long{background:var(--grbg);color:var(--green)}
+.badge.short{background:var(--rdbg);color:var(--red)}
+.badge.demo{background:var(--ambg);color:var(--amber)}
+.badge.real{background:var(--blbg);color:var(--blue)}
+.bsr{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border);font-size:13px}
+.bsr:last-of-type{border-bottom:none}.bsr .k{color:var(--text2)}
+.wr-wrap{margin-top:10px}
+.wr-lbl{display:flex;justify-content:space-between;font-size:11px;color:var(--text2);margin-bottom:3px}
+.wr-bar{height:5px;background:var(--bg3);border-radius:3px;overflow:hidden}
+.wr-fill{height:100%;border-radius:3px;transition:width .6s}
+/* Tables */
+.tw{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);overflow:hidden;margin-bottom:16px}
+.th{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border)}
+.tt{font-size:13px;font-weight:500}
+.tact{display:flex;gap:6px;align-items:center}
+select{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);color:var(--text2);padding:4px 9px;font-size:12px;outline:none}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead th{text-align:left;padding:7px 12px;font-size:11px;font-weight:500;color:var(--text2);text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);background:var(--bg3)}
+tbody td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:middle}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:rgba(255,255,255,.02)}
+.tag{font-size:10px;font-weight:600;padding:2px 6px;border-radius:10px;display:inline-block}
+.tag.long{background:var(--grbg);color:var(--green)}
+.tag.short{background:var(--rdbg);color:var(--red)}
+.tag.real{background:var(--blbg);color:var(--blue)}
+.tag.virt{background:var(--ambg);color:var(--amber)}
+.tag.sl{background:var(--rdbg);color:var(--red)}
+.tag.tp{background:var(--grbg);color:var(--green)}
+.pnl{font-weight:600;font-size:12px}
+.pnl.pos{color:var(--green)}.pnl.neg{color:var(--red)}
+.mono{font-family:'SF Mono',monospace;font-size:11px}
+.empty{text-align:center;padding:28px;color:var(--text3);font-size:13px}
+.spin{display:inline-block;width:13px;height:13px;border:2px solid var(--border2);border-top-color:var(--blue);border-radius:50%;animation:sp .7s linear infinite;vertical-align:middle;margin-right:4px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.sec-t{font-size:11px;font-weight:500;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:9px}
+footer{text-align:center;padding:20px;font-size:11px;color:var(--text3);border-top:1px solid var(--border);margin-top:12px}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">Aegis <span>Dashboard</span> v3.0</div>
+  <div class="hdr-right">
+    <div class="dot" id="statusDot"></div>
+    <span class="status-text" id="statusText">Not connected</span>
+    <span class="last-upd" id="lastUpd"></span>
+  </div>
+</header>
+
+<div class="main">
+  <div class="api-bar">
+    <h3>Dashboard API Endpoint</h3>
+    <div class="api-row">
+      <input id="apiUrl" placeholder="Dashboard server URL — e.g. https://aegis-dashboard.onrender.com"/>
+      <button class="btn btn-p" id="connBtn" onclick="connect()">Connect</button>
+      <button class="btn btn-s" onclick="loadDemo()">Demo</button>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" onclick="st('overview',this)">Overview</div>
+    <div class="tab" onclick="st('positions',this)">Real Positions</div>
+    <div class="tab" onclick="st('virtual',this)">Virtual Signals</div>
+    <div class="tab" onclick="st('history',this)">History</div>
+  </div>
+
+  <!-- OVERVIEW -->
+  <div id="tab-overview">
+    <p class="sec-t">Combined performance</p>
+    <div class="metrics">
+      <div class="metric"><div class="lbl">Total P&L</div><div class="val muted" id="cm-pnl">—</div><div class="sub" id="cm-pnl-s"></div></div>
+      <div class="metric"><div class="lbl">Win Rate</div><div class="val muted" id="cm-wr">—</div><div class="sub" id="cm-wr-s"></div></div>
+      <div class="metric"><div class="lbl">Today P&L</div><div class="val muted" id="cm-day">—</div><div class="sub" id="cm-day-s"></div></div>
+      <div class="metric"><div class="lbl">SL Today</div><div class="val muted" id="cm-sl">—</div><div class="sub">stops</div></div>
+      <div class="metric"><div class="lbl">Open / Exchange</div><div class="val b" id="cm-open">—</div><div class="sub">real</div></div>
+      <div class="metric"><div class="lbl">Virtual Tracked</div><div class="val a" id="cm-virt">—</div><div class="sub">bot watching</div></div>
+      <div class="metric"><div class="lbl">Total Trades</div><div class="val muted" id="cm-tot">—</div><div class="sub"></div></div>
+      <div class="metric"><div class="lbl">Wins / Losses</div><div class="val muted" id="cm-wl">—</div></div>
+    </div>
+    <p class="sec-t">Per-bot breakdown</p>
+    <div class="bot-grid">
+      <div class="bc long">
+        <div class="bc-hdr"><div class="dot" id="ldot"></div><span class="badge long">LONG Bot</span><span class="badge demo" id="lmode">—</span></div>
+        <div class="bsr"><span class="k">Total P&L</span><span id="l-pnl" class="muted">—</span></div>
+        <div class="bsr"><span class="k">Today P&L</span><span id="l-day" class="muted">—</span></div>
+        <div class="bsr"><span class="k">Win Rate</span><span id="l-wr" class="muted">—</span></div>
+        <div class="bsr"><span class="k">Wins / Losses</span><span id="l-wl" class="muted">—</span></div>
+        <div class="bsr"><span class="k">Open (exchange)</span><span id="l-open" class="b">—</span></div>
+        <div class="bsr"><span class="k">Virtual signals</span><span id="l-virt" class="a">—</span></div>
+        <div class="bsr"><span class="k">SL today</span><span id="l-sl" class="muted">—</span></div>
+        <div class="bsr"><span class="k">Total trades</span><span id="l-tot" class="muted">—</span></div>
+        <div class="wr-wrap">
+          <div class="wr-lbl"><span>Win Rate</span><span id="l-wp">—</span></div>
+          <div class="wr-bar"><div class="wr-fill" id="l-wb" style="width:0%"></div></div>
+        </div>
+      </div>
+      <div class="bc short">
+        <div class="bc-hdr"><div class="dot" id="sdot"></div><span class="badge short">SHORT Bot</span><span class="badge demo" id="smode">—</span></div>
+        <div class="bsr"><span class="k">Total P&L</span><span id="s-pnl" class="muted">—</span></div>
+        <div class="bsr"><span class="k">Today P&L</span><span id="s-day" class="muted">—</span></div>
+        <div class="bsr"><span class="k">Win Rate</span><span id="s-wr" class="muted">—</span></div>
+        <div class="bsr"><span class="k">Wins / Losses</span><span id="s-wl" class="muted">—</span></div>
+        <div class="bsr"><span class="k">Open (exchange)</span><span id="s-open" class="b">—</span></div>
+        <div class="bsr"><span class="k">Virtual signals</span><span id="s-virt" class="a">—</span></div>
+        <div class="bsr"><span class="k">SL today</span><span id="s-sl" class="muted">—</span></div>
+        <div class="bsr"><span class="k">Total trades</span><span id="s-tot" class="muted">—</span></div>
+        <div class="wr-wrap">
+          <div class="wr-lbl"><span>Win Rate</span><span id="s-wp">—</span></div>
+          <div class="wr-bar"><div class="wr-fill" id="s-wb" style="width:0%"></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- REAL POSITIONS -->
+  <div id="tab-positions" style="display:none">
+    <div class="tw">
+      <div class="th"><span class="tt">Real Open Positions (on exchange)</span><button class="btn btn-s" style="font-size:11px;padding:4px 10px" onclick="refresh()">↻</button></div>
+      <table><thead><tr><th>Symbol</th><th>Bot</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP1</th><th>Score</th><th>BE</th><th>Unrealized</th><th>Opened</th></tr></thead>
+      <tbody id="posBody"><tr><td colspan="10" class="empty">Connect to load positions</td></tr></tbody></table>
+    </div>
+  </div>
+
+  <!-- VIRTUAL -->
+  <div id="tab-virtual" style="display:none">
+    <div class="tw">
+      <div class="th"><span class="tt">Virtual Signals (tracked, not on exchange)</span>
+        <select id="virtF" onchange="renderVirt()"><option value="all">All</option><option value="long">Long</option><option value="short">Short</option></select>
+      </div>
+      <table><thead><tr><th>Symbol</th><th>Bot</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>Score</th><th>Pattern</th><th>Age</th></tr></thead>
+      <tbody id="virtBody"><tr><td colspan="10" class="empty">Connect to load virtual signals</td></tr></tbody></table>
+    </div>
+  </div>
+
+  <!-- HISTORY -->
+  <div id="tab-history" style="display:none">
+    <div class="tw">
+      <div class="th"><span class="tt">Closed Trades (last 40)</span>
+        <div class="tact">
+          <select id="hBot" onchange="renderHist()"><option value="all">All</option><option value="long">Long</option><option value="short">Short</option></select>
+          <select id="hRes" onchange="renderHist()"><option value="all">All</option><option value="sl">SL only</option><option value="tp">TP only</option></select>
+        </div>
+      </div>
+      <table><thead><tr><th>Symbol</th><th>Bot</th><th>Dir</th><th>Entry</th><th>Close</th><th>P&L</th><th>Result</th><th>Score</th><th>BE</th><th>Duration</th><th>Pattern</th></tr></thead>
+      <tbody id="histBody"><tr><td colspan="11" class="empty">Connect or load demo</td></tr></tbody></table>
+    </div>
+  </div>
+</div>
+<footer>Aegis Dashboard v3.0 · Auto-refresh 60s · Data via Redis</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+let D = { long:null, short:null, realPos:[], virtSigs:[], history:[] };
+let _apiUrl = '';
+
+const pStr = v => v==null?'—':(v>0?'+':'')+v.toFixed(2)+'%';
+const pCls = v => v>0?'g':v<0?'r':'muted';
+const wrClr = w => w>=55?'var(--green)':w>=40?'var(--amber)':'var(--red)';
+const fAge = ts => { if(!ts)return'—'; const m=Math.round((Date.now()-new Date(ts))/60000); return m<60?m+'m':Math.floor(m/60)+'h '+(m%60)+'m'; };
+const fDur = m => m==null?'—':m<60?m+'m':Math.floor(m/60)+'h '+(m%60)+'m';
+const fP = v => { if(!v)return'—'; const n=+v; return n<0.001?n.toExponential(3):n.toPrecision(5); };
+const sCls = s => s>=75?'g':s>=60?'a':'muted';
+const tp1 = tps => { if(!tps||!tps.length)return null; const t=tps[0]; return Array.isArray(t)?+t[0]:typeof t==='object'?+t.price:null; };
+const tp2 = tps => { if(!tps||tps.length<2)return null; const t=tps[1]; return Array.isArray(t)?+t[0]:typeof t==='object'?+t.price:null; };
+const beStr = (be,be2) => be2?'<span style="color:var(--green);font-size:10px">LOCK</span>':be?'<span style="color:var(--amber);font-size:10px">BE</span>':'<span style="color:var(--text3);font-size:10px">—</span>';
+
+function st(n,el){['overview','positions','virtual','history'].forEach(t=>$('tab-'+t).style.display=t===n?'':'none');document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');}
+
+function setEl(id,html,cls){const e=$(id);if(!e)return;e.innerHTML=html;if(cls)e.className=cls;}
+
+function renderBot(d,p,dotId,modeId){
+  if(!d)return;
+  const w=d.wins||0,l=d.losses||0,t=w+l,wr=t>0?Math.round(w/t*100):0;
+  const pnl=d.total_pnl||0,day=d.daily_pnl||0,sl=d.sl_today||0;
+  setEl(p+'-pnl',pStr(pnl),pCls(pnl));
+  setEl(p+'-day',pStr(day),pCls(day));
+  setEl(p+'-wr',wr+'%',wr>=55?'g':wr>=40?'a':'r');
+  setEl(p+'-wl',w+' / '+l,'muted');
+  setEl(p+'-open',d.open_exchange||0,'b');
+  setEl(p+'-virt',d.open_virtual||0,'a');
+  setEl(p+'-sl',sl,sl>5?'r':sl>2?'a':'muted');
+  setEl(p+'-tot',d.total_trades||0,'muted');
+  $(dotId).className='dot live';
+  const mEl=$(modeId);if(mEl){mEl.textContent=d.mode||'?';mEl.className='badge '+(d.mode==='REAL'?'real':'demo');}
+  $(p+'-wp').textContent=wr+'%';
+  const bar=$(p+'-wb');if(bar){bar.style.width=wr+'%';bar.style.background=wrClr(wr);}
+}
+
+function renderCombined(){
+  const c=D.combined||{};const lp=D.long||{},sp=D.short||{};
+  const tw=(c.wins||0)+(c.losses||0),wr=tw>0?Math.round((c.wins||0)/tw*100):0;
+  setEl('cm-pnl',pStr(c.total_pnl||0),pCls(c.total_pnl||0));
+  setEl('cm-wr',wr+'%',wr>=55?'g':wr>=40?'a':'r');
+  $('cm-wr-s').textContent=(c.wins||0)+' W / '+(c.losses||0)+' L';
+  setEl('cm-day',pStr(c.daily_pnl||0),pCls(c.daily_pnl||0));
+  $('cm-day-s').textContent=(c.wins_today||0)+' wins today';
+  const sl=c.sl_today||0;setEl('cm-sl',sl,sl>5?'r':sl>2?'a':'muted');
+  setEl('cm-open',c.open_exchange||0,'b');
+  setEl('cm-virt',c.open_virtual||0,'a');
+  setEl('cm-tot',c.total_trades||0,'muted');
+  setEl('cm-wl',(c.wins||0)+' / '+(c.losses||0),((c.wins||0)>(c.losses||0)?'g':(c.wins||0)<(c.losses||0)?'r':'muted'));
+}
+
+function renderPositions(){
+  const tb=$('posBody'),d=D.realPos;
+  if(!d||!d.length){tb.innerHTML='<tr><td colspan="10" class="empty">No real positions</td></tr>';return;}
+  tb.innerHTML=d.map(p=>{
+    const dir=p.direction||'long',t1=tp1(p.take_profits),uP=p.unrealized_pct;
+    return`<tr><td style="font-weight:600">${p.symbol}</td><td><span class="tag ${p.bot}">${(p.bot||'?').toUpperCase()}</span></td><td><span class="tag ${dir}">${dir.toUpperCase()}</span></td><td class="mono">${fP(p.entry_price)}</td><td class="mono" style="color:var(--red)">${fP(p.stop_loss)}</td><td class="mono" style="color:var(--green)">${t1?fP(t1):'—'}</td><td class="${sCls(p.signal_score||0)}">${p.signal_score||p.score||'—'}</td><td>${beStr(p.be_done,p.be2_done)}</td><td>${uP!=null?`<span class="pnl ${uP>=0?'pos':'neg'}">${pStr(uP)}</span>`:'—'}</td><td style="color:var(--text2)">${fAge(p.opened_at||p.timestamp)}</td></tr>`;
+  }).join('');
+}
+
+function renderVirt(){
+  const f=$('virtF').value;
+  let d=D.virtSigs;if(f!=='all')d=d.filter(s=>s.bot===f);
+  const tb=$('virtBody');
+  if(!d||!d.length){tb.innerHTML='<tr><td colspan="10" class="empty">No virtual signals</td></tr>';return;}
+  tb.innerHTML=d.map(s=>{
+    const dir=s.direction||'long',t1=tp1(s.take_profits),t2=tp2(s.take_profits);
+    return`<tr><td style="font-weight:600">${s.symbol}</td><td><span class="tag ${s.bot}">${(s.bot||'?').toUpperCase()}</span></td><td><span class="tag ${dir}">${dir.toUpperCase()}</span></td><td class="mono">${fP(s.entry_price)}</td><td class="mono" style="color:var(--red)">${fP(s.stop_loss)}</td><td class="mono" style="color:var(--green)">${t1?fP(t1):'—'}</td><td class="mono" style="color:var(--blue)">${t2?fP(t2):'—'}</td><td class="${sCls(s.signal_score||0)}">${s.signal_score||s.score||'—'}</td><td style="color:var(--text2);font-size:11px;max-width:80px;overflow:hidden;white-space:nowrap"title="${s.pattern||''}">${s.pattern||'—'}</td><td style="color:var(--text2)">${fAge(s.timestamp)}</td></tr>`;
+  }).join('');
+}
+
+let _allHist=[];
+function renderHist(){
+  const fb=$('hBot').value,fr=$('hRes').value;
+  let d=_allHist;
+  if(fb!=='all')d=d.filter(h=>h.bot===fb);
+  if(fr==='sl')d=d.filter(h=>h.close_type==='sl'||h.tp_level==='SL');
+  if(fr==='tp')d=d.filter(h=>h.close_type==='tp');
+  const tb=$('histBody');
+  if(!d.length){tb.innerHTML='<tr><td colspan="11" class="empty">No history</td></tr>';return;}
+  tb.innerHTML=d.slice(0,40).map(h=>{
+    const isSL=h.close_type==='sl'||h.tp_level==='SL',pnl=h.pnl||0;
+    return`<tr><td style="font-weight:600">${h.symbol}</td><td><span class="tag ${h.bot||h.direction}">${(h.bot||'?').toUpperCase()}</span></td><td><span class="tag ${h.direction||'long'}">${(h.direction||'?').toUpperCase()}</span></td><td class="mono">${fP(h.entry_price)}</td><td class="mono">${fP(h.close_price)}</td><td><span class="pnl ${pnl>=0?'pos':'neg'}">${pStr(pnl)}</span></td><td><span class="tag ${isSL?'sl':'tp'}">${h.tp_level||'?'}</span></td><td class="${sCls(h.score||0)}">${h.score||'—'}</td><td>${beStr(h.be_done,h.be2_done)}</td><td style="color:var(--text2)">${fDur(h.hold_minutes)}</td><td style="color:var(--text2);font-size:11px;max-width:80px;overflow:hidden;white-space:nowrap"title="${h.pattern||''}">${h.pattern||'—'}</td></tr>`;
+  }).join('');
+}
+
+async function fetchAPI(path){
+  const r=await fetch(_apiUrl+path,{headers:{'Accept':'application/json'}});
+  return r.json();
+}
+
+async function connect(){
+  const url=$('apiUrl').value.trim().replace(/\/$/,'');
+  if(!url){loadDemo();return;}
+  _apiUrl=url;
+  const btn=$('connBtn');
+  btn.disabled=true;btn.innerHTML='<span class="spin"></span>Connecting...';
+  $('statusText').textContent='Connecting...';
+  try{
+    const [ov,pos,hist]=await Promise.all([
+      fetchAPI('/api/overview'),
+      fetchAPI('/api/positions'),
+      fetchAPI('/api/history?limit=40'),
+    ]);
+    D.long=ov.long;D.short=ov.short;D.combined=ov.combined;
+    D.realPos=(pos.real||[]);
+    D.virtSigs=(pos.virtual||[]);
+    _allHist=(hist.trades||[]);
+    D.history=_allHist;
+    renderBot(D.long,'l','ldot','lmode');
+    renderBot(D.short,'s','sdot','smode');
+    renderCombined();renderPositions();renderVirt();renderHist();
+    $('statusDot').className='dot live';
+    $('statusText').textContent='Connected (Redis)';
+    $('lastUpd').textContent='· '+new Date().toLocaleTimeString();
+    localStorage.setItem('dashApiUrl',url);
+  }catch(e){
+    $('statusText').textContent='Connection failed';
+    console.error(e);
+  }
+  btn.disabled=false;btn.textContent='Refresh';
+}
+
+async function refresh(){await connect();}
+
+function loadDemo(){
+  const ago=m=>new Date(Date.now()-m*60000).toISOString();
+  D.long={wins:34,losses:18,total_pnl:12.4,daily_pnl:-1.2,sl_today:3,wins_today:2,open_exchange:3,open_virtual:5,mode:'AUTO',total_trades:52};
+  D.short={wins:28,losses:22,total_pnl:-3.1,daily_pnl:-3.1,sl_today:4,wins_today:1,open_exchange:4,open_virtual:7,mode:'AUTO',total_trades:50};
+  D.combined={wins:62,losses:40,total_pnl:9.3,daily_pnl:-4.3,sl_today:7,wins_today:3,open_exchange:7,open_virtual:12,total_trades:102};
+  D.realPos=[
+    {symbol:'NEARUSDT',bot:'long',direction:'long',entry_price:1.2715,stop_loss:1.2715,take_profits:[[1.32,25],[1.38,25]],signal_score:68,unrealized_pct:1.8,be_done:true,be2_done:false,timestamp:ago(47)},
+    {symbol:'OPENUSDT',bot:'long',direction:'long',entry_price:0.221,stop_loss:0.2234,take_profits:[[0.240,25],[0.255,25]],signal_score:72,unrealized_pct:3.1,be_done:true,be2_done:true,timestamp:ago(110)},
+    {symbol:'CGPTUSDT',bot:'short',direction:'short',entry_price:0.0302,stop_loss:0.0302,take_profits:[[0.0275,25],[0.026,25]],signal_score:79,unrealized_pct:2.7,be_done:true,be2_done:false,timestamp:ago(130)},
+    {symbol:'ZENUSDT',bot:'short',direction:'short',entry_price:6.567,stop_loss:6.731,take_profits:[[6.468,15],[6.37,20]],signal_score:90,unrealized_pct:-0.5,be_done:false,be2_done:false,timestamp:ago(5)},
+  ];
+  D.virtSigs=[
+    {symbol:'PARTIUSDT',bot:'short',direction:'short',entry_price:0.0515,stop_loss:0.0492,take_profits:[[0.047,25],[0.043,25]],signal_score:82,pattern:'MEGA_SHORT',timestamp:ago(8)},
+    {symbol:'CHIPUSDT',bot:'long',direction:'long',entry_price:0.00142,stop_loss:0.00128,take_profits:[[0.00165,25]],signal_score:62,pattern:'MTF_OVERSOLD',timestamp:ago(20)},
+  ];
+  _allHist=[
+    {symbol:'TSTBSCUSDT',bot:'short',direction:'short',entry_price:0.0412,close_price:0.0371,pnl:9.9,close_type:'tp',tp_level:'TP3',score:87,hold_minutes:190,pattern:'MEGA_SHORT',be_done:true,be2_done:true},
+    {symbol:'OPENUSDT',bot:'long',direction:'long',entry_price:0.198,close_price:0.192,pnl:-3.0,close_type:'sl',tp_level:'SL',score:68,hold_minutes:35,pattern:'LIQUIDITY_SWEEP_LONG',be_done:false,be2_done:false},
+    {symbol:'BUSDT',bot:'short',direction:'short',entry_price:0.51,close_price:0.515,pnl:-1.0,close_type:'sl',tp_level:'SL',score:84,hold_minutes:12,pattern:'MEGA_SHORT',be_done:false,be2_done:false},
+    {symbol:'4USDT',bot:'short',direction:'short',entry_price:0.01150,close_price:0.01055,pnl:8.3,close_type:'tp',tp_level:'TP2',score:74,hold_minutes:142,pattern:'MEGA_SHORT',be_done:true,be2_done:true},
+    {symbol:'CGPTUSDT',bot:'short',direction:'short',entry_price:0.0315,close_price:0.0298,pnl:5.4,close_type:'tp',tp_level:'TP2',score:79,hold_minutes:88,pattern:'MEGA_SHORT',be_done:true,be2_done:false},
+  ];
+  renderBot(D.long,'l','ldot','lmode');
+  renderBot(D.short,'s','sdot','smode');
+  renderCombined();renderPositions();renderVirt();renderHist();
+  $('statusDot').className='dot live';
+  $('statusText').textContent='Demo mode';
+  $('lastUpd').textContent='· Demo data';
+}
+
+setInterval(()=>{const u=localStorage.getItem('dashApiUrl')||'';if(u){$('apiUrl').value=u;_apiUrl=u;connect();}},60000);
+
+window.onload=()=>{
+  const u=localStorage.getItem('dashApiUrl')||'';
+  if(u){$('apiUrl').value=u;connect();}
+  else loadDemo();
+};
+</script>
+</body>
+</html>

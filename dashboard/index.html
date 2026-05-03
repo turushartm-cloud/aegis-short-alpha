@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aegis Trading Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117; --bg2: #1a1d27; --bg3: #222535;
+    --border: #2e3248; --border2: #3d4260;
+    --text: #e2e8f0; --text2: #8892a4; --text3: #555f72;
+    --green: #22c55e; --green-bg: rgba(34,197,94,.12);
+    --red: #ef4444; --red-bg: rgba(239,68,68,.12);
+    --blue: #3b82f6; --blue-bg: rgba(59,130,246,.12);
+    --amber: #f59e0b; --amber-bg: rgba(245,158,11,.12);
+    --purple: #a78bfa; --purple-bg: rgba(167,139,250,.12);
+    --r: 8px; --r2: 12px;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: var(--font); background: var(--bg); color: var(--text); min-height: 100vh; }
+
+  header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
+  .logo { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
+  .logo span { color: var(--blue); }
+  .header-right { display: flex; gap: 10px; align-items: center; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text3); }
+  .dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+  .status-text { font-size: 12px; color: var(--text2); }
+
+  .main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
+
+  /* Config bar */
+  .cfg { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r2); padding: 14px 16px; margin-bottom: 18px; }
+  .cfg h3 { font-size: 12px; font-weight: 500; color: var(--text2); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 10px; }
+  .cfg-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .cfg-row input { flex: 1; min-width: 220px; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--r); color: var(--text); padding: 8px 12px; font-size: 13px; outline: none; transition: border-color .2s; }
+  .cfg-row input:focus { border-color: var(--blue); }
+  .cfg-row input::placeholder { color: var(--text3); }
+  .btn { padding: 8px 18px; border-radius: var(--r); border: none; font-size: 13px; font-weight: 500; cursor: pointer; transition: all .15s; }
+  .btn-primary { background: var(--blue); color: #fff; }
+  .btn-primary:hover { background: #2563eb; }
+  .btn-secondary { background: var(--bg3); color: var(--text2); border: 1px solid var(--border); }
+  .btn-secondary:hover { border-color: var(--border2); color: var(--text); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 18px; }
+  .tab { padding: 8px 16px; font-size: 13px; font-weight: 500; color: var(--text2); cursor: pointer; border-bottom: 2px solid transparent; transition: all .15s; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+
+  /* Metric cards */
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr)); gap: 10px; margin-bottom: 18px; }
+  .metric { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r2); padding: 14px; }
+  .metric .lbl { font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }
+  .metric .val { font-size: 22px; font-weight: 600; }
+  .metric .sub { font-size: 11px; color: var(--text3); margin-top: 3px; }
+  .green { color: var(--green); }
+  .red { color: var(--red); }
+  .blue { color: var(--blue); }
+  .amber { color: var(--amber); }
+  .purple { color: var(--purple); }
+  .muted { color: var(--text2); }
+
+  /* Bot cards grid */
+  .bot-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
+  @media(max-width:640px){ .bot-grid{ grid-template-columns:1fr; } }
+  .bot-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r2); padding: 16px; }
+  .bot-card.long { border-top: 3px solid var(--green); }
+  .bot-card.short { border-top: 3px solid var(--red); }
+  .bot-header { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+  .badge { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 20px; }
+  .badge.long { background: var(--green-bg); color: var(--green); }
+  .badge.short { background: var(--red-bg); color: var(--red); }
+  .badge.demo { background: var(--amber-bg); color: var(--amber); }
+  .badge.real { background: var(--blue-bg); color: var(--blue); }
+  .bot-stat { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .bot-stat:last-child { border-bottom: none; }
+  .bot-stat .k { color: var(--text2); }
+  .bot-stat .v { font-weight: 500; }
+  .wr-wrap { margin-top: 12px; }
+  .wr-label { display: flex; justify-content: space-between; font-size: 11px; color: var(--text2); margin-bottom: 4px; }
+  .wr-bar { height: 6px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
+  .wr-fill { height: 100%; border-radius: 3px; transition: width .5s; }
+
+  /* Tables */
+  .table-wrap { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r2); overflow: hidden; margin-bottom: 18px; }
+  .table-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .table-title { font-size: 13px; font-weight: 500; }
+  .table-actions { display: flex; gap: 8px; align-items: center; }
+  select { background: var(--bg3); border: 1px solid var(--border); border-radius: var(--r); color: var(--text2); padding: 5px 10px; font-size: 12px; outline: none; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  thead th { text-align: left; padding: 8px 14px; font-size: 11px; font-weight: 500; color: var(--text2); text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid var(--border); background: var(--bg3); }
+  tbody td { padding: 9px 14px; border-bottom: 1px solid var(--border); color: var(--text); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: rgba(255,255,255,.02); }
+
+  /* Tags */
+  .tag { font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; display: inline-block; }
+  .tag.long { background: var(--green-bg); color: var(--green); }
+  .tag.short { background: var(--red-bg); color: var(--red); }
+  .tag.real { background: var(--blue-bg); color: var(--blue); }
+  .tag.virt { background: var(--amber-bg); color: var(--amber); }
+  .tag.sl { background: var(--red-bg); color: var(--red); }
+  .tag.tp { background: var(--green-bg); color: var(--green); }
+
+  .pnl { font-weight: 600; font-size: 12px; }
+  .pnl.pos { color: var(--green); }
+  .pnl.neg { color: var(--red); }
+
+  .empty { text-align: center; padding: 32px; color: var(--text3); font-size: 13px; }
+  .mono { font-family: 'SF Mono', monospace; font-size: 11px; }
+
+  .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border2); border-top-color: var(--blue); border-radius: 50%; animation: spin .7s linear infinite; vertical-align: middle; margin-right: 5px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .section-title { font-size: 11px; font-weight: 500; color: var(--text2); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 10px; }
+  .last-update { font-size: 11px; color: var(--text3); }
+
+  .score-bar { display: inline-flex; align-items: center; gap: 4px; }
+  .score-val { font-size: 12px; font-weight: 600; }
+  .score-val.hi { color: var(--green); }
+  .score-val.md { color: var(--amber); }
+  .score-val.lo { color: var(--text2); }
+
+  /* Footer */
+  footer { text-align: center; padding: 24px; font-size: 11px; color: var(--text3); border-top: 1px solid var(--border); margin-top: 20px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Aegis <span>Dashboard</span> v3.0</div>
+  <div class="header-right">
+    <div class="dot" id="statusDot"></div>
+    <span class="status-text" id="statusText">Not connected</span>
+    <span class="last-update" id="lastUpdate"></span>
+  </div>
+</header>
+
+<div class="main">
+
+  <!-- Config -->
+  <div class="cfg">
+    <h3>Bot Endpoints</h3>
+    <div class="cfg-row">
+      <input id="longUrl"  placeholder="Long bot URL — https://aegis-long.onrender.com" />
+      <input id="shortUrl" placeholder="Short bot URL — https://aegis-short.onrender.com" />
+      <button class="btn btn-primary" id="connectBtn" onclick="connectBots()">Connect</button>
+      <button class="btn btn-secondary" onclick="loadDemo()">Demo</button>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('overview',this)">Overview</div>
+    <div class="tab" onclick="switchTab('positions',this)">Open Positions</div>
+    <div class="tab" onclick="switchTab('virtual',this)">Virtual Signals</div>
+    <div class="tab" onclick="switchTab('history',this)">Trade History</div>
+  </div>
+
+  <!-- ===== OVERVIEW ===== -->
+  <div id="tab-overview">
+    <p class="section-title">Combined performance</p>
+    <div class="metrics" id="combinedMetrics">
+      <div class="metric"><div class="lbl">Total P&L</div><div class="val muted" id="cm-pnl">—</div><div class="sub" id="cm-pnl-sub"></div></div>
+      <div class="metric"><div class="lbl">Win Rate</div><div class="val muted" id="cm-wr">—</div><div class="sub" id="cm-wrt"></div></div>
+      <div class="metric"><div class="lbl">Today P&L</div><div class="val muted" id="cm-day">—</div><div class="sub" id="cm-day-sub"></div></div>
+      <div class="metric"><div class="lbl">SL Hits Today</div><div class="val muted" id="cm-sl">—</div><div class="sub" id="cm-sl-sub">stops today</div></div>
+      <div class="metric"><div class="lbl">Open / Exchange</div><div class="val muted" id="cm-open">—</div><div class="sub">real positions</div></div>
+      <div class="metric"><div class="lbl">Virtual Signals</div><div class="val muted" id="cm-virt">—</div><div class="sub">tracked by bots</div></div>
+      <div class="metric"><div class="lbl">Total Trades</div><div class="val muted" id="cm-trades">—</div><div class="sub" id="cm-trades-sub"></div></div>
+      <div class="metric"><div class="lbl">Wins / Losses</div><div class="val muted" id="cm-wl">—</div><div class="sub"></div></div>
+    </div>
+
+    <p class="section-title">Per-bot stats</p>
+    <div class="bot-grid">
+      <div class="bot-card long" id="longCard">
+        <div class="bot-header">
+          <div class="dot" id="longDot"></div>
+          <span class="badge long">LONG Bot</span>
+          <span class="badge demo" id="longMode">—</span>
+        </div>
+        <div class="bot-stat"><span class="k">Total P&L</span><span class="v muted" id="l-pnl">—</span></div>
+        <div class="bot-stat"><span class="k">Today P&L</span><span class="v muted" id="l-day">—</span></div>
+        <div class="bot-stat"><span class="k">Win Rate</span><span class="v muted" id="l-wr">—</span></div>
+        <div class="bot-stat"><span class="k">Wins / Losses</span><span class="v muted" id="l-wl">—</span></div>
+        <div class="bot-stat"><span class="k">Open (exchange)</span><span class="v blue" id="l-open">—</span></div>
+        <div class="bot-stat"><span class="k">Virtual signals</span><span class="v amber" id="l-virt">—</span></div>
+        <div class="bot-stat"><span class="k">SL hits today</span><span class="v" id="l-sl">—</span></div>
+        <div class="bot-stat"><span class="k">Score threshold</span><span class="v muted" id="l-score">—</span></div>
+        <div class="wr-wrap">
+          <div class="wr-label"><span>Win Rate</span><span id="l-wr-pct">—</span></div>
+          <div class="wr-bar"><div class="wr-fill" id="l-wr-bar" style="width:0%;background:var(--green)"></div></div>
+        </div>
+      </div>
+      <div class="bot-card short" id="shortCard">
+        <div class="bot-header">
+          <div class="dot" id="shortDot"></div>
+          <span class="badge short">SHORT Bot</span>
+          <span class="badge demo" id="shortMode">—</span>
+        </div>
+        <div class="bot-stat"><span class="k">Total P&L</span><span class="v muted" id="s-pnl">—</span></div>
+        <div class="bot-stat"><span class="k">Today P&L</span><span class="v muted" id="s-day">—</span></div>
+        <div class="bot-stat"><span class="k">Win Rate</span><span class="v muted" id="s-wr">—</span></div>
+        <div class="bot-stat"><span class="k">Wins / Losses</span><span class="v muted" id="s-wl">—</span></div>
+        <div class="bot-stat"><span class="k">Open (exchange)</span><span class="v blue" id="s-open">—</span></div>
+        <div class="bot-stat"><span class="k">Virtual signals</span><span class="v amber" id="s-virt">—</span></div>
+        <div class="bot-stat"><span class="k">SL hits today</span><span class="v" id="s-sl">—</span></div>
+        <div class="bot-stat"><span class="k">Score threshold</span><span class="v muted" id="s-score">—</span></div>
+        <div class="wr-wrap">
+          <div class="wr-label"><span>Win Rate</span><span id="s-wr-pct">—</span></div>
+          <div class="wr-bar"><div class="wr-fill" id="s-wr-bar" style="width:0%;background:var(--red)"></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== OPEN POSITIONS ===== -->
+  <div id="tab-positions" style="display:none">
+    <div class="table-wrap">
+      <div class="table-header">
+        <span class="table-title">Real Open Positions (Exchange)</span>
+        <div class="table-actions">
+          <button class="btn btn-secondary" style="font-size:11px;padding:5px 12px" onclick="refreshAll()">↻ Refresh</button>
+        </div>
+      </div>
+      <table><thead><tr>
+        <th>Symbol</th><th>Bot</th><th>Direction</th><th>Entry</th><th>SL</th><th>TP1</th><th>Score</th><th>BE</th><th>Unrealized</th><th>Opened</th>
+      </tr></thead><tbody id="posBody"><tr><td colspan="10" class="empty">Connect bots to load real positions</td></tr></tbody></table>
+    </div>
+  </div>
+
+  <!-- ===== VIRTUAL SIGNALS ===== -->
+  <div id="tab-virtual" style="display:none">
+    <div class="table-wrap">
+      <div class="table-header">
+        <span class="table-title">Virtual Signals (Bot tracking, not on exchange)</span>
+        <div class="table-actions">
+          <select id="virtFilter" onchange="renderVirtual()">
+            <option value="all">All bots</option>
+            <option value="long">Long bot</option>
+            <option value="short">Short bot</option>
+          </select>
+        </div>
+      </div>
+      <table><thead><tr>
+        <th>Symbol</th><th>Bot</th><th>Direction</th><th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>Score</th><th>Pattern</th><th>Age</th>
+      </tr></thead><tbody id="virtBody"><tr><td colspan="10" class="empty">Connect bots to load virtual signals</td></tr></tbody></table>
+    </div>
+  </div>
+
+  <!-- ===== HISTORY ===== -->
+  <div id="tab-history" style="display:none">
+    <div class="table-wrap">
+      <div class="table-header">
+        <span class="table-title">Closed Trades (last 40)</span>
+        <div class="table-actions">
+          <select id="histBot" onchange="renderHistory()">
+            <option value="all">All</option><option value="long">Long</option><option value="short">Short</option>
+          </select>
+          <select id="histResult" onchange="renderHistory()">
+            <option value="all">All results</option><option value="sl">SL only</option><option value="tp">TP only</option>
+          </select>
+        </div>
+      </div>
+      <table><thead><tr>
+        <th>Symbol</th><th>Bot</th><th>Dir</th><th>Entry</th><th>Close</th><th>P&L</th><th>Result</th><th>Score</th><th>BE</th><th>Duration</th><th>Pattern</th>
+      </tr></thead><tbody id="histBody"><tr><td colspan="11" class="empty">Connect bots or click Demo to see history</td></tr></tbody></table>
+    </div>
+  </div>
+
+</div>
+
+<footer>Aegis Trading Dashboard v3.0 &nbsp;·&nbsp; Auto-refresh every 60s &nbsp;·&nbsp; Data via bot REST API</footer>
+
+<script>
+const S = { long: null, short: null, realPos: [], virtSigs: [], history: [], loading: false };
+
+// ── Utils ──────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const pStr = v => v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(2) + '%';
+const pClass = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
+const wrColor = w => w >= 55 ? 'var(--green)' : w >= 40 ? 'var(--amber)' : 'var(--red)';
+function fmtAge(ts) {
+  if (!ts) return '—';
+  const m = Math.round((Date.now() - new Date(ts)) / 60000);
+  return m < 60 ? m+'m' : Math.floor(m/60)+'h '+(m%60)+'m';
+}
+function fmtDur(mins) {
+  if (mins == null) return '—';
+  return mins < 60 ? mins+'m' : Math.floor(mins/60)+'h '+(mins%60)+'m';
+}
+function tp1Price(tps) {
+  if (!tps || !tps.length) return null;
+  const t = tps[0];
+  if (Array.isArray(t)) return +t[0];
+  if (typeof t === 'object') return +t.price;
+  return null;
+}
+function tp2Price(tps) {
+  if (!tps || tps.length < 2) return null;
+  const t = tps[1];
+  if (Array.isArray(t)) return +t[0];
+  if (typeof t === 'object') return +t.price;
+  return null;
+}
+function fmtP(v, decimals=6) {
+  if (!v) return '—';
+  const n = +v;
+  return n < 0.001 ? n.toExponential(3) : n.toFixed(decimals > 4 ? (n < 1 ? 5 : 4) : decimals);
+}
+function scoreClass(s) { return s >= 75 ? 'hi' : s >= 60 ? 'md' : 'lo'; }
+function beStr(be, be2) {
+  if (be2) return '<span style="color:var(--green);font-size:10px">LOCK</span>';
+  if (be) return '<span style="color:var(--amber);font-size:10px">BE</span>';
+  return '<span style="color:var(--text3);font-size:10px">—</span>';
+}
+
+// ── Tab switcher ───────────────────────────────────────────────────────────
+function switchTab(name, el) {
+  ['overview','positions','virtual','history'].forEach(t => {
+    $('tab-'+t).style.display = t === name ? '' : 'none';
+  });
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+}
+
+// ── Render combined ────────────────────────────────────────────────────────
+function renderCombined() {
+  const L = S.long || {}, R = S.short || {};
+  const lw = L.wins||0, ll = L.losses||0, sw = R.wins||0, sl = R.losses||0;
+  const tw = lw+sw, tl = ll+sl, tt = tw+tl;
+  const wr = tt > 0 ? Math.round(tw/tt*100) : 0;
+  const pnl = (L.total_pnl||0) + (R.total_pnl||0);
+  const day = (L.daily_pnl||0) + (R.daily_pnl||0);
+  const slH = (L.sl_today||0) + (R.sl_today||0);
+  const wT  = (L.wins_today||0) + (R.wins_today||0);
+  const openEx = (L.open_exchange||0)+(R.open_exchange||0);
+  const openVirt = (L.open_virtual||0)+(R.open_virtual||0);
+
+  $('cm-pnl').textContent = pStr(pnl);
+  $('cm-pnl').className = 'val ' + pClass(pnl);
+  $('cm-wr').textContent = wr+'%';
+  $('cm-wr').className = 'val ' + (wr>=55?'green':wr>=40?'amber':'red');
+  $('cm-wrt').textContent = tw+' wins / '+tl+' losses';
+  $('cm-day').textContent = pStr(day);
+  $('cm-day').className = 'val ' + pClass(day);
+  $('cm-day-sub').textContent = wT+' wins today';
+  $('cm-sl').textContent = slH;
+  $('cm-sl').className = 'val ' + (slH > 5 ? 'red' : slH > 2 ? 'amber' : 'muted');
+  $('cm-sl-sub').textContent = 'stops today';
+  $('cm-open').textContent = openEx;
+  $('cm-open').className = 'val blue';
+  $('cm-virt').textContent = openVirt;
+  $('cm-virt').className = 'val amber';
+  $('cm-trades').textContent = tt;
+  $('cm-trades').className = 'val muted';
+  $('cm-wl').textContent = tw+' / '+tl;
+  $('cm-wl').className = 'val ' + (tw>tl?'green':tw<tl?'red':'muted');
+}
+
+function renderBot(data, prefix, dotId, modeId) {
+  if (!data) return;
+  const w = data.wins||0, l = data.losses||0, t = w+l;
+  const wr = t > 0 ? Math.round(w/t*100) : 0;
+  const pnl = data.total_pnl||0;
+  const day = data.daily_pnl||0;
+  const set = (id, val, cls) => { const e = $(id); if(!e)return; e.textContent=val; if(cls) e.className='v '+cls; };
+  set(prefix+'-pnl', pStr(pnl), pClass(pnl));
+  set(prefix+'-day', pStr(day), pClass(day));
+  set(prefix+'-wr', wr+'%', wr>=55?'green':wr>=40?'amber':'red');
+  set(prefix+'-wl', w+' / '+l, '');
+  set(prefix+'-open', data.open_exchange||0, 'blue');
+  set(prefix+'-virt', data.open_virtual||0, 'amber');
+  const slV = data.sl_today||0;
+  set(prefix+'-sl', slV, slV>5?'red':slV>2?'amber':'muted');
+  set(prefix+'-score', 'Score≥'+(data.min_score||60), 'muted');
+  $(dotId).className = 'dot live';
+  const mEl = $(modeId);
+  if (mEl) { mEl.textContent = data.mode||'DEMO'; mEl.className = 'badge '+(data.mode==='REAL'?'real':'demo'); }
+  $(prefix+'-wr-pct').textContent = wr+'%';
+  const bar = $(prefix+'-wr-bar');
+  if (bar) { bar.style.width = wr+'%'; bar.style.background = wrColor(wr); }
+}
+
+// ── Render open positions ──────────────────────────────────────────────────
+function renderPositions() {
+  const tbody = $('posBody');
+  const data = S.realPos;
+  if (!data.length) { tbody.innerHTML = '<tr><td colspan="10" class="empty">No real positions open</td></tr>'; return; }
+  tbody.innerHTML = data.map(p => {
+    const dir = p.direction||'long';
+    const tp1 = tp1Price(p.take_profits);
+    const uPnl = p.unrealized_pct;
+    return `<tr>
+      <td style="font-weight:600">${p.symbol}</td>
+      <td><span class="tag ${p.bot}">${(p.bot||'?').toUpperCase()}</span></td>
+      <td><span class="tag ${dir}">${dir.toUpperCase()}</span></td>
+      <td class="mono">${fmtP(p.entry_price)}</td>
+      <td class="mono" style="color:var(--red)">${fmtP(p.stop_loss)}</td>
+      <td class="mono" style="color:var(--green)">${tp1 ? fmtP(tp1) : '—'}</td>
+      <td><span class="score-val ${scoreClass(p.signal_score||p.score||0)}">${p.signal_score||p.score||'—'}</span></td>
+      <td>${beStr(p.be_done, p.be2_done)}</td>
+      <td>${uPnl!=null?`<span class="pnl ${uPnl>=0?'pos':'neg'}">${pStr(uPnl)}</span>`:'—'}</td>
+      <td style="color:var(--text2);font-size:11px">${fmtAge(p.opened_at||p.timestamp)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Render virtual signals ─────────────────────────────────────────────────
+function renderVirtual() {
+  const filter = $('virtFilter').value;
+  let data = S.virtSigs;
+  if (filter !== 'all') data = data.filter(s => s.bot === filter);
+  const tbody = $('virtBody');
+  if (!data.length) { tbody.innerHTML = '<tr><td colspan="10" class="empty">No virtual signals</td></tr>'; return; }
+  tbody.innerHTML = data.map(s => {
+    const dir = s.direction||'long';
+    const tp1 = tp1Price(s.take_profits);
+    const tp2 = tp2Price(s.take_profits);
+    return `<tr>
+      <td style="font-weight:600">${s.symbol}</td>
+      <td><span class="tag ${s.bot}">${(s.bot||'?').toUpperCase()}</span></td>
+      <td><span class="tag ${dir}">${dir.toUpperCase()}</span></td>
+      <td class="mono">${fmtP(s.entry_price)}</td>
+      <td class="mono" style="color:var(--red)">${fmtP(s.stop_loss)}</td>
+      <td class="mono" style="color:var(--green)">${tp1 ? fmtP(tp1) : '—'}</td>
+      <td class="mono" style="color:var(--blue)">${tp2 ? fmtP(tp2) : '—'}</td>
+      <td><span class="score-val ${scoreClass(s.signal_score||s.score||0)}">${s.signal_score||s.score||'—'}</span></td>
+      <td style="color:var(--text2);font-size:11px;max-width:90px;overflow:hidden;white-space:nowrap" title="${s.pattern||''}">${s.pattern||'—'}</td>
+      <td style="color:var(--text2)">${fmtAge(s.timestamp)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Render history ─────────────────────────────────────────────────────────
+function renderHistory() {
+  const fBot = $('histBot').value;
+  const fRes = $('histResult').value;
+  let data = S.history;
+  if (fBot !== 'all') data = data.filter(h => (h.bot||h.direction) === fBot);
+  if (fRes === 'sl') data = data.filter(h => h.close_type==='sl'||h.tp_level==='SL');
+  if (fRes === 'tp') data = data.filter(h => h.close_type==='tp');
+  const tbody = $('histBody');
+  if (!data.length) { tbody.innerHTML = '<tr><td colspan="11" class="empty">No history</td></tr>'; return; }
+  tbody.innerHTML = data.slice(0,40).map(h => {
+    const isSL = h.close_type==='sl'||h.tp_level==='SL';
+    const pnl = h.pnl||0;
+    return `<tr>
+      <td style="font-weight:600">${h.symbol}</td>
+      <td><span class="tag ${h.bot||h.direction}">${(h.bot||'?').toUpperCase()}</span></td>
+      <td><span class="tag ${h.direction}">${(h.direction||'?').toUpperCase()}</span></td>
+      <td class="mono">${fmtP(h.entry_price)}</td>
+      <td class="mono">${fmtP(h.close_price)}</td>
+      <td><span class="pnl ${pnl>=0?'pos':'neg'}">${pStr(pnl)}</span></td>
+      <td><span class="tag ${isSL?'sl':'tp'}">${h.tp_level||'?'}</span></td>
+      <td><span class="score-val ${scoreClass(h.score||0)}">${h.score||'—'}</span></td>
+      <td>${beStr(h.be_done, h.be2_done)}</td>
+      <td style="color:var(--text2)">${fmtDur(h.hold_minutes)}</td>
+      <td style="color:var(--text2);font-size:11px;max-width:90px;overflow:hidden;white-space:nowrap" title="${h.pattern||''}">${h.pattern||'—'}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Fetch from bot API ─────────────────────────────────────────────────────
+async function fetchBot(url, botType) {
+  const headers = { 'Accept': 'application/json' };
+  const [statusR, perfR, signalsR, posR] = await Promise.all([
+    fetch(url+'/status', {headers}).then(r=>r.json()).catch(()=>null),
+    fetch(url+'/api/performance', {headers}).then(r=>r.json()).catch(()=>null),
+    fetch(url+'/api/signals', {headers}).then(r=>r.json()).catch(()=>null),
+    fetch(url+'/api/positions', {headers}).then(r=>r.json()).catch(()=>null),
+  ]);
+
+  const bot = { mode: 'DEMO' };
+  if (perfR) {
+    bot.wins = perfR.wins || perfR.total_wins || 0;
+    bot.losses = perfR.losses || perfR.total_losses || 0;
+    bot.total_pnl = perfR.total_pnl || perfR.pnl || 0;
+    bot.daily_pnl = perfR.daily_pnl || 0;
+    bot.sl_today = perfR.sl_today || 0;
+    bot.wins_today = perfR.wins_today || 0;
+  }
+  if (statusR) {
+    bot.mode = statusR.config?.auto_trading ? 'AUTO' : 'MANUAL';
+    bot.min_score = statusR.config?.min_score;
+  }
+
+  const sigs = (signalsR?.signals || []).map(s => ({
+    ...s, bot: botType,
+    is_real: !!s.order_id,
+  }));
+
+  const realPos = (posR?.positions || []).map(p => ({ ...p, bot: botType, is_real: true }));
+  const virtSigs = sigs.filter(s => !s.order_id && s.status === 'active');
+  const realFromSigs = sigs.filter(s => !!s.order_id);
+
+  bot.open_exchange = realPos.length + realFromSigs.length;
+  bot.open_virtual = virtSigs.length;
+
+  return { bot, realPos: [...realPos, ...realFromSigs], virtSigs };
+}
+
+async function connectBots() {
+  const longUrl  = $('longUrl').value.trim().replace(/\/$/,'');
+  const shortUrl = $('shortUrl').value.trim().replace(/\/$/,'');
+  if (!longUrl && !shortUrl) { loadDemo(); return; }
+
+  S.loading = true;
+  const btn = $('connectBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>Connecting...';
+  $('statusText').textContent = 'Connecting...';
+
+  const results = await Promise.allSettled([
+    longUrl  ? fetchBot(longUrl,  'long')  : Promise.resolve(null),
+    shortUrl ? fetchBot(shortUrl, 'short') : Promise.resolve(null),
+  ]);
+
+  S.realPos = []; S.virtSigs = [];
+
+  if (results[0].status==='fulfilled' && results[0].value) {
+    const d = results[0].value;
+    S.long = d.bot;
+    S.realPos.push(...d.realPos);
+    S.virtSigs.push(...d.virtSigs);
+    renderBot(S.long, 'l', 'longDot', 'longMode');
+  }
+  if (results[1].status==='fulfilled' && results[1].value) {
+    const d = results[1].value;
+    S.short = d.bot;
+    S.realPos.push(...d.realPos);
+    S.virtSigs.push(...d.virtSigs);
+    renderBot(S.short, 's', 'shortDot', 'shortMode');
+  }
+
+  renderCombined();
+  renderPositions();
+  renderVirtual();
+  renderHistory();
+
+  S.loading = false;
+  btn.disabled = false;
+  btn.textContent = 'Refresh';
+  $('statusDot').className = 'dot live';
+  $('statusText').textContent = 'Connected';
+  $('lastUpdate').textContent = '· Updated ' + new Date().toLocaleTimeString();
+
+  localStorage.setItem('longUrl', longUrl);
+  localStorage.setItem('shortUrl', shortUrl);
+}
+
+async function refreshAll() { await connectBots(); }
+
+// ── Demo data ──────────────────────────────────────────────────────────────
+function loadDemo() {
+  const ago = m => new Date(Date.now()-m*60000).toISOString();
+
+  S.long  = { wins:34, losses:18, total_pnl:12.4, daily_pnl:-1.2, sl_today:3, wins_today:2, open_exchange:3, open_virtual:5, mode:'AUTO', min_score:60 };
+  S.short = { wins:28, losses:22, total_pnl:-8.3, daily_pnl:-3.1, sl_today:4, wins_today:1, open_exchange:4, open_virtual:7, mode:'AUTO', min_score:60 };
+
+  S.realPos = [
+    { symbol:'NEARUSDT', bot:'long',  is_real:true, direction:'long',  entry_price:1.2715, stop_loss:1.2715, take_profits:[[1.32,25],[1.38,25],[1.45,25],[1.55,25]], signal_score:68, unrealized_pct:1.8, be_done:true, be2_done:false, timestamp:ago(47) },
+    { symbol:'OPENUSDT', bot:'long',  is_real:true, direction:'long',  entry_price:0.221,  stop_loss:0.2234, take_profits:[[0.240,25],[0.255,25],[0.270,25],[0.290,25]], signal_score:72, unrealized_pct:3.1, be_done:true, be2_done:true, timestamp:ago(110) },
+    { symbol:'RSRUSDT',  bot:'long',  is_real:true, direction:'long',  entry_price:0.001680, stop_loss:0.001700, take_profits:[[0.00190,25],[0.00210,25]], signal_score:71, unrealized_pct:5.1, be_done:true, be2_done:true, timestamp:ago(85) },
+    { symbol:'CGPTUSDT', bot:'short', is_real:true, direction:'short', entry_price:0.0302,  stop_loss:0.0302, take_profits:[[0.0275,25],[0.0260,25],[0.0240,25]], signal_score:79, unrealized_pct:2.7, be_done:true, be2_done:false, timestamp:ago(130) },
+    { symbol:'4USDT',    bot:'short', is_real:true, direction:'short', entry_price:0.01080, stop_loss:0.01059, take_profits:[[0.00980,25],[0.00900,25]], signal_score:74, unrealized_pct:4.1, be_done:true, be2_done:true, timestamp:ago(95) },
+    { symbol:'BUSDT',    bot:'short', is_real:true, direction:'short', entry_price:0.480,   stop_loss:0.5269, take_profits:[[0.44,25],[0.40,25]], signal_score:84, unrealized_pct:null, be_done:false, be2_done:false, timestamp:ago(15) },
+    { symbol:'THETAUSDT',bot:'short', is_real:true, direction:'short', entry_price:0.215,   stop_loss:0.2256, take_profits:[[0.195,25],[0.180,25]], signal_score:77, unrealized_pct:null, be_done:false, be2_done:false, timestamp:ago(12) },
+  ];
+
+  S.virtSigs = [
+    { symbol:'PARTIUSDT', bot:'short', is_real:false, direction:'short', entry_price:0.0515, stop_loss:0.0492, take_profits:[[0.0470,25],[0.0430,25]], signal_score:82, pattern:'MEGA_SHORT', timestamp:ago(8) },
+    { symbol:'CHIPUSDT',  bot:'long',  is_real:false, direction:'long',  entry_price:0.00142, stop_loss:0.00128, take_profits:[[0.00165,25],[0.00185,25]], signal_score:62, pattern:'MTF_OVERSOLD', timestamp:ago(20) },
+    { symbol:'DOGUSDT',   bot:'short', is_real:false, direction:'short', entry_price:0.1820, stop_loss:0.1950, take_profits:[[0.165,25],[0.150,25]], signal_score:77, pattern:'MEGA_SHORT', timestamp:ago(18) },
+    { symbol:'SANDUSDT',  bot:'long',  is_real:false, direction:'long',  entry_price:0.335,  stop_loss:0.312,  take_profits:[[0.365,25],[0.390,25]], signal_score:65, pattern:'WYCKOFF_SPRING', timestamp:ago(35) },
+    { symbol:'LINKUSDT',  bot:'long',  is_real:false, direction:'long',  entry_price:12.44,  stop_loss:11.85,  take_profits:[[13.2,25],[14.1,25],[15.0,25]], signal_score:73, pattern:'BREAKOUT_LONG', timestamp:ago(52) },
+  ];
+
+  S.history = [
+    { symbol:'TSTBSCUSDT', bot:'short', direction:'short', entry_price:0.0412, close_price:0.0371, pnl:9.9,  close_type:'tp', tp_level:'TP3', score:87, hold_minutes:190, pattern:'MEGA_SHORT',          be_done:true, be2_done:true  },
+    { symbol:'OPENUSDT',   bot:'long',  direction:'long',  entry_price:0.198,  close_price:0.192,  pnl:-3.0, close_type:'sl', tp_level:'SL',  score:68, hold_minutes:35,  pattern:'LIQUIDITY_SWEEP_LONG', be_done:false, be2_done:false },
+    { symbol:'DOGUSDT',    bot:'short', direction:'short', entry_price:0.195,  close_price:0.198,  pnl:-1.5, close_type:'sl', tp_level:'SL',  score:77, hold_minutes:22,  pattern:'MEGA_SHORT',          be_done:false, be2_done:false },
+    { symbol:'ALCHUSDT',   bot:'long',  direction:'long',  entry_price:0.0821, close_price:0.0798, pnl:-2.8, close_type:'sl', tp_level:'SL',  score:65, hold_minutes:18,  pattern:'MOMENTUM_LONG',       be_done:false, be2_done:false },
+    { symbol:'PARTIUSDT',  bot:'short', direction:'short', entry_price:0.0430, close_price:0.0385, pnl:10.5, close_type:'tp', tp_level:'TP4', score:82, hold_minutes:280, pattern:'MEGA_SHORT',          be_done:true,  be2_done:true  },
+    { symbol:'BUSDT',      bot:'short', direction:'short', entry_price:0.51,   close_price:0.515,  pnl:-1.0, close_type:'sl', tp_level:'SL',  score:84, hold_minutes:12,  pattern:'MEGA_SHORT',          be_done:false, be2_done:false },
+    { symbol:'NEARUSDT',   bot:'long',  direction:'long',  entry_price:1.21,   close_price:1.18,   pnl:-2.5, close_type:'sl', tp_level:'SL',  score:56, hold_minutes:55,  pattern:'WYCKOFF_SPRING',      be_done:false, be2_done:false },
+    { symbol:'4USDT',      bot:'short', direction:'short', entry_price:0.01150,close_price:0.01055,pnl:8.3,  close_type:'tp', tp_level:'TP2', score:74, hold_minutes:142, pattern:'MEGA_SHORT',          be_done:true,  be2_done:true  },
+    { symbol:'CGPTUSDT',   bot:'short', direction:'short', entry_price:0.0315, close_price:0.0298, pnl:5.4,  close_type:'tp', tp_level:'TP2', score:79, hold_minutes:88,  pattern:'MEGA_SHORT',          be_done:true,  be2_done:false },
+    { symbol:'RSRUSDT',    bot:'long',  direction:'long',  entry_price:0.00162,close_price:0.00155,pnl:-4.3, close_type:'sl', tp_level:'SL',  score:70, hold_minutes:30,  pattern:'BREAKOUT_LONG',       be_done:false, be2_done:false },
+    { symbol:'THETAUSDT',  bot:'short', direction:'short', entry_price:0.220,  close_price:0.224,  pnl:-1.8, close_type:'sl', tp_level:'SL',  score:77, hold_minutes:27,  pattern:'MEGA_SHORT',          be_done:false, be2_done:false },
+    { symbol:'LUNA2USDT',  bot:'long',  direction:'long',  entry_price:0.0381, close_price:0.0372, pnl:-2.4, close_type:'sl', tp_level:'SL',  score:45, hold_minutes:40,  pattern:'WYCKOFF_SPRING',      be_done:false, be2_done:false },
+  ];
+
+  renderBot(S.long,  'l', 'longDot',  'longMode');
+  renderBot(S.short, 's', 'shortDot', 'shortMode');
+  renderCombined();
+  renderPositions();
+  renderVirtual();
+  renderHistory();
+  $('statusDot').className = 'dot live';
+  $('statusText').textContent = 'Demo mode';
+  $('lastUpdate').textContent = '· Demo data';
+}
+
+// ── Auto-refresh 60s ──────────────────────────────────────────────────────
+setInterval(() => {
+  const lu = localStorage.getItem('longUrl')||'';
+  const su = localStorage.getItem('shortUrl')||'';
+  if (lu || su) connectBots();
+}, 60000);
+
+// ── Init ──────────────────────────────────────────────────────────────────
+window.onload = () => {
+  const lu = localStorage.getItem('longUrl')||'';
+  const su = localStorage.getItem('shortUrl')||'';
+  if (lu) $('longUrl').value = lu;
+  if (su) $('shortUrl').value = su;
+  if (lu || su) connectBots();
+  else loadDemo();
+};
+</script>
+</body>
+</html>
