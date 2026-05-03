@@ -24,8 +24,11 @@ services:
         sync: false
       - key: BINGX_API_SECRET
         sync: false
+      # ✅ П5: BINGX_DEMO_MODE убран из render.yaml — управляй через ENV в Dashboard
+      # Установи BINGX_DEMO_MODE=false в Render Dashboard → Environment для реальной торговли
+      # Установи BINGX_DEMO_MODE=true для демо-режима
       - key: BINGX_DEMO_MODE
-        value: "true"
+        sync: false  # ← Управляй через Render Dashboard Environment Variables!
       - key: SHORT_TELEGRAM_BOT_TOKEN
         sync: false
       - key: SHORT_TELEGRAM_CHAT_ID
@@ -41,15 +44,19 @@ services:
       - key: MAX_WATCHLIST
         value: "500"
       - key: MIN_SHORT_SCORE
-        value: "60"
+        value: "65"          # AEGIS final threshold
+      - key: MIN_SHORT_BASE_SCORE
+        value: "50"          # BASE_SCORER порог (мягче — AEGIS потом доуточняет)
       - key: SCAN_INTERVAL
-        value: "180"
+        value: "120"          # П8: было 180 → 120s
       - key: MAX_POSITIONS
         value: "15"
       - key: SHORT_SL_BUFFER
         value: "2.5"
       - key: SHORT_LEVERAGE
         value: "5-30"
+      - key: MIN_VOLUME_USDT
+        value: "150000"       # П15: было 300000 → 150000
       - key: RISK_PER_TRADE
         value: "0.001"
       - key: MAX_POSITION_PCT
@@ -98,13 +105,14 @@ services:
       - key: BOT_TYPE
         value: "long"
       - key: REDIS_URL
-        sync: false  # Тот же Redis что и у SHORT
+        sync: false
       - key: BINGX_API_KEY
         sync: false
       - key: BINGX_API_SECRET
         sync: false
+      # ✅ П5: BINGX_DEMO_MODE управляется через ENV Dashboard (не хардкод)
       - key: BINGX_DEMO_MODE
-        value: "true"
+        sync: false  # ← Установи true/false в Render Dashboard Environment Variables
       - key: LONG_TELEGRAM_BOT_TOKEN
         sync: false
       - key: LONG_TELEGRAM_CHAT_ID
@@ -120,15 +128,19 @@ services:
       - key: MAX_WATCHLIST
         value: "500"
       - key: MIN_LONG_SCORE
-        value: "70"
+        value: "70"           # AEGIS final threshold
+      - key: MIN_LONG_BASE_SCORE
+        value: "45"           # BASE_SCORER порог (мягче — ищет перепроданность)
       - key: SCAN_INTERVAL
-        value: "240"
+        value: "180"          # Long чуть медленнее short
       - key: MAX_POSITIONS
         value: "15"
       - key: LONG_SL_BUFFER
         value: "3.0"
       - key: LONG_LEVERAGE
         value: "5-20"
+      - key: MIN_VOLUME_USDT
+        value: "200000"       # П15: long — чуть выше порог для качества
       - key: RISK_PER_TRADE
         value: "0.001"
       - key: MAX_POSITION_PCT

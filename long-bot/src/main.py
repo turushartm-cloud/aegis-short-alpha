@@ -91,7 +91,7 @@ class Config:
     SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "240"))    # Long = медленнее
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "15"))
 
-    MIN_SCORE     = int(os.getenv("MIN_LONG_SCORE", "58"))     # Чуть мягче Short (60)
+    MIN_SCORE     = int(os.getenv("MIN_LONG_SCORE", "50"))   # Было 58 — fallback даёт ~42-52 без реальных детекторов
     SL_BUFFER     = float(os.getenv("LONG_SL_BUFFER", "3.0")) # Long = больше SL
     LEVERAGE      = os.getenv("LONG_LEVERAGE", "5-20")
 
@@ -124,7 +124,8 @@ class Config:
 
     # Auto trading
     AUTO_TRADING = os.getenv("AUTO_TRADING_ENABLED", "false").lower() == "true"
-    BINGX_DEMO   = os.getenv("BINGX_DEMO_MODE", "true").lower() == "true"
+    # DEMO / REAL режим: BINGX_DEMO_MODE=true (демо, по умолч.) | BINGX_DEMO_MODE=false (реальные деньги ⚠️)
+    BINGX_DEMO   = os.getenv("BINGX_DEMO_MODE", "true").strip().lower() not in ("false", "0", "no", "real")
 
     # Watchlist
     MIN_VOLUME_USDT = int(os.getenv("MIN_VOLUME_USDT", "300000"))
@@ -244,7 +245,9 @@ async def lifespan(app: FastAPI):
     state.binance = get_binance_client()
     await state.binance._init_source()
 
-    state.scorer           = get_long_scorer(Config.MIN_SCORE)
+    # П2 FIX: BASE_SCORER получает мягкий порог — строгий порог только у AEGIS
+    _long_base_min = int(os.getenv("MIN_LONG_BASE_SCORE", "45"))
+    state.scorer           = get_long_scorer(_long_base_min)
     state.pattern_detector = LongPatternDetector()
     
     # 🆕 Consolidation Detector — блокировка входов в середине диапазона
@@ -431,9 +434,11 @@ async def _count_long_positions() -> int:
         try:
             pos = await state.auto_trader.bingx.get_positions()
             long_pos = [p for p in pos if (
-                getattr(p, "position_side", "").upper() == "LONG" or
-                getattr(p, "side", "").upper() == "LONG"
-            )]
+                getattr(p, "position_side", "").upper() == "LONG"
+                or getattr(p, "positionSide", "").upper() == "LONG"
+                or getattr(p, "side", "").upper() == "LONG"
+                or getattr(p, "direction", "").upper() == "BUY"
+            ) and getattr(p, "size", 0) != 0]
             return len(long_pos)
         except Exception as e:
             print(f"[LONG] count error: {e}")
@@ -509,6 +514,48 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         if isinstance(ohlcv_30m, Exception): ohlcv_30m = []
         if isinstance(ohlcv_4h, Exception):  ohlcv_4h  = []
 
+        # П10: Multi-Timeframe RSI bonus (LONG: oversold = бонус, momentum = нейтральный)
+        _mtf_bonus = 0
+        try:
+            def _calc_rsi_l(candles, period=14):
+                if not candles or len(candles) < period + 1: return None
+                closes = [c.close for c in candles]
+                gains, losses = [], []
+                for i in range(1, len(closes)):
+                    d = closes[i] - closes[i-1]
+                    gains.append(max(d, 0)); losses.append(max(-d, 0))
+                avg_g = sum(gains[:period]) / period
+                avg_l = sum(losses[:period]) / period
+                for i in range(period, len(gains)):
+                    avg_g = (avg_g*(period-1)+gains[i])/period
+                    avg_l = (avg_l*(period-1)+losses[i])/period
+                rs = avg_g / avg_l if avg_l > 0 else 100
+                return round(100 - 100/(1+rs), 1)
+
+            rsi_30m = _calc_rsi_l(ohlcv_30m) if ohlcv_30m else None
+            rsi_4h  = _calc_rsi_l(ohlcv_4h)  if ohlcv_4h  else None
+            rsi_1h  = md.rsi_1h or 50
+            _price_1h_chg = getattr(md, "price_change_1h", 0) or 0
+            _price_4h_chg = getattr(md, "price_change_4h", 0) or 0
+            _is_momentum_up = _price_1h_chg > 3.0 or _price_4h_chg > 8.0
+
+            if rsi_4h and rsi_30m:
+                if rsi_4h < 30 and rsi_1h < 35 and rsi_30m < 35:
+                    _mtf_bonus = 15
+                    if verbose: print(f"{log_prefix} 📉 [MTF] RSI 4H={rsi_4h} 1H={rsi_1h:.0f} 30M={rsi_30m} — всё перепродано +15 LONG")
+                elif rsi_4h < 35 and rsi_1h < 40:
+                    _mtf_bonus = 8
+                    if verbose: print(f"{log_prefix} 📉 [MTF] RSI 4H={rsi_4h} 1H={rsi_1h:.0f} — перепродан +8 LONG")
+                elif rsi_4h > 70 and rsi_1h > 70 and _is_momentum_up:
+                    # MOMENTUM LONG: RSI высокий, но цена реально растёт — не штрафуем
+                    _mtf_bonus = 5
+                    if verbose: print(f"{log_prefix} 🚀 [MTF] RSI {rsi_1h:.0f} высокий но MOMENTUM +{_price_1h_chg:.1f}%/1H — нейтральный +5")
+                elif rsi_4h > 70 and rsi_1h > 70:
+                    _mtf_bonus = -5  # Перегрет без ценового подтверждения — лёгкий штраф
+                    if verbose: print(f"{log_prefix} ⚠️ [MTF] RSI 4H={rsi_4h} перегрет без тренда {_mtf_bonus}")
+        except Exception as _mtf_e:
+            if verbose: print(f"{log_prefix} ⚠️ [MTF] error: {_mtf_e}")
+
         # ── Базовый scorer (backward compat) ─────────────────────────
         hourly_deltas = await state.binance.get_hourly_volume_profile(symbol, 7)
         price_trend   = state.pattern_detector._get_price_trend(ohlcv_15m)
@@ -534,6 +581,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             patterns=patterns,
             volume_spike_ratio=getattr(md, "volume_spike_ratio", 1.0),
             atr_14_pct=getattr(md, "atr_14_pct", 0.5),
+            price_change_1h=getattr(md, "price_change_1h", 0.0),
         )
         if not base_result.is_valid:
             if verbose:
@@ -882,11 +930,11 @@ async def _daily_report_task():
         if now >= next_report:
             next_report += timedelta(days=1)
         await asyncio.sleep((next_report - now).total_seconds())
-        if state.performance_tracker and state.is_running:
+        if state.is_running and state.telegram:
             try:
-                await state.telegram.send_message(
-                    state.performance_tracker.daily_report()
-                )
+                # Redis-история — не обнуляется при рестарте (как /daily_rep)
+                await state.telegram.cmd_daily_report("", state.telegram.chat_id)
+                print("✅ Daily report sent (Redis-based)")
             except Exception as e:
                 print(f"Daily report error: {e}")
 

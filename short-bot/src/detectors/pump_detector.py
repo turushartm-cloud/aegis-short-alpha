@@ -132,35 +132,38 @@ class PumpDetector:
         rsi = self._calc_rsi(closes[-20:])
         velocity = self._calc_price_velocity(ohlcv, 5)
 
-        # Скоринг
+        # Скоринг — иерархия: Z-score PRIMARY → Volume → Velocity → RSI вспомогательный
         score = 0.0
 
-        # Z-Score компонент (0-40 баллов)
-        if z_score > 4.0:   score += 40
-        elif z_score > 3.0: score += 32
-        elif z_score > 2.5: score += 24
-        elif z_score > 2.0: score += 16
-        elif z_score > 1.5: score += 8
-        else:               score += max(0, z_score * 4)
+        # Z-Score компонент (0-55 баллов) — ГЛАВНЫЙ сигнал mean-reversion
+        # Чем дальше от VWAP, тем выше вероятность возврата
+        if z_score > 4.5:   score += 55   # Экстремальное отклонение — ULTRA
+        elif z_score > 4.0: score += 48
+        elif z_score > 3.0: score += 38
+        elif z_score > 2.5: score += 28
+        elif z_score > 2.0: score += 18
+        elif z_score > 1.5: score += 9
+        else:               score += max(0, z_score * 5)
 
-        # Volume компонент (0-30 баллов)
+        # Volume компонент (0-30 баллов) — подтверждает истощение
         if vol_ratio > 5.0:   score += 30
         elif vol_ratio > 3.0: score += 24
         elif vol_ratio > 2.5: score += 18
         elif vol_ratio > 2.0: score += 12
         elif vol_ratio > 1.5: score += 6
 
-        # RSI компонент (0-20 баллов)
-        if rsi > 85:    score += 20
-        elif rsi > 78:  score += 16
-        elif rsi > 72:  score += 12
-        elif rsi > 65:  score += 6
-        elif rsi < 30:  score -= 10   # Перепродан — не шортим
-
-        # Price velocity (0-10 баллов)
+        # Price velocity (0-10 баллов) — скорость памп
         if velocity > 5.0:   score += 10
         elif velocity > 3.0: score += 7
         elif velocity > 1.5: score += 4
+
+        # RSI — вспомогательный (0-10 баллов, НЕ блокирует)
+        # Высокий RSI = бонус к уверенности; низкий RSI = лёгкий штраф
+        if rsi > 85:    score += 10
+        elif rsi > 78:  score += 7
+        elif rsi > 72:  score += 5
+        elif rsi > 65:  score += 3
+        elif rsi < 30:  score -= 5   # Перепродан — осторожнее (мягкий штраф)
 
         score = min(max(score, 0.0), 100.0)
 
@@ -171,28 +174,34 @@ class PumpDetector:
         )
         if confirmation_candles == 0 and z_score > 2.0:
             # Памп без подтверждения разворота — снижаем скор
-            score *= 0.7
+            score *= 0.75
 
-        # Байесовский корректор: исторически ~60% пампов с Z>2.5 дают откат ≥3%
+        # Байесовский корректор
         bayesian_mult = 1.0
-        if z_score > 3.0 and vol_ratio > 3.0 and rsi > 75:
-            bayesian_mult = 1.15   # Классический ULTRA pump
+        if z_score > 3.0 and vol_ratio > 3.0:
+            bayesian_mult = 1.15   # Z>3 + Vol>3x — классический истощение
         elif z_score > 2.0 and vol_ratio > 2.0:
             bayesian_mult = 1.0
         else:
-            bayesian_mult = 0.85
+            bayesian_mult = 0.88
 
         score = min(score * bayesian_mult, 100.0)
 
+        # PRIMARY: Z-score + Volume — RSI вспомогательный, НЕ gate
+        # Исторически: Z>2.5 + Vol>2.5x → достаточно для mean-reversion SHORT
         detected = (
             z_score >= self.cfg.threshold and
-            vol_ratio >= self.cfg.volume_spike and
-            rsi >= self.cfg.rsi_overbought
+            vol_ratio >= self.cfg.volume_spike
         )
 
-        if z_score > 2.0 and vol_ratio > 2.0 and not detected:
-            # Частичный сигнал
-            detected = score >= 55
+        # RSI даёт бонусное подтверждение, но не блокирует
+        # Если RSI перекуплен — повышаем уверенность
+        if detected and rsi >= self.cfg.rsi_overbought:
+            score = min(score * 1.1, 100.0)  # +10% confidence bonus
+
+        # Частичный сигнал: Z>2.0 + Vol>1.8 = ранний вход
+        if not detected and z_score > 2.0 and vol_ratio > 1.8:
+            detected = score >= 52
 
         return {
             "detected":     detected,

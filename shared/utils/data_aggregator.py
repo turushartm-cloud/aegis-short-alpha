@@ -18,6 +18,7 @@ from api.binance_client import get_binance_client, MarketData as BinanceData
 from api.bybit_client import get_bybit_client, BybitMarketData
 from api.coinmarketcap_client import get_coinmarketcap_client, CMCMarketData
 from api.coinglass_client import get_coinglass_client, LiquidationData
+from api.okx_client import get_okx_client, OKXOIData
 
 
 @dataclass
@@ -86,12 +87,13 @@ class DataAggregator:
         self.bybit = get_bybit_client(testnet=True)  # Только для данных, не торговли
         self.cmc = get_coinmarketcap_client()
         self.coinglass = get_coinglass_client()
+        self.okx       = get_okx_client()
         
         # Кэш
         self._cache = {}
         self._cache_ttl = 30  # 30 секунд кэш
         
-        print("🔄 DataAggregator initialized (Binance + Bybit + CMC + Coinglass)")
+        print("🔄 DataAggregator initialized (Binance + Bybit + CMC + Coinglass + OKX)")
     
     async def get_aggregated_data(self, 
                                   symbol: str,
@@ -126,10 +128,11 @@ class DataAggregator:
             self._get_binance_data(binance_symbol),
             self._get_bybit_data(symbol),  # Bybit использует полный символ
             self._get_cmc_data(cmc_symbol),
-            self._get_coinglass_data(coinglass_symbol)
+            self._get_coinglass_data(coinglass_symbol),
+            self.okx.get_open_interest(symbol),   # OKX OI (публичный, без ключа)
         ]
         
-        binance_data, bybit_data, cmc_data, coinglass_data = await asyncio.gather(
+        binance_data, bybit_data, cmc_data, coinglass_data, okx_data = await asyncio.gather(
             *tasks, return_exceptions=True
         )
         
@@ -146,10 +149,12 @@ class DataAggregator:
         if isinstance(coinglass_data, Exception):
             print(f"Coinglass error for {symbol}: {coinglass_data}")
             coinglass_data = None
+        if isinstance(okx_data, Exception):
+            okx_data = None
         
         # Агрегируем данные
         aggregated = self._aggregate_data(
-            symbol, binance_data, bybit_data, cmc_data, coinglass_data
+            symbol, binance_data, bybit_data, cmc_data, coinglass_data, okx_data
         )
         
         # Сохраняем в кэш
@@ -218,7 +223,8 @@ class DataAggregator:
                        binance_data: Optional[BinanceData],
                        bybit_data: Optional[BybitMarketData],
                        cmc_data: Optional[CMCMarketData],
-                       coinglass_data: Optional[Dict]) -> AggregatedMarketData:
+                       coinglass_data: Optional[Dict],
+                       okx_data: Optional["OKXOIData"] = None) -> AggregatedMarketData:
         """
         Агрегирует данные из всех источников
         """
@@ -276,6 +282,9 @@ class DataAggregator:
             oi_values.append(binance_data.oi_change_4d)
         if bybit_data:
             oi_values.append(bybit_data.oi_change_24h)
+        # ✅ OKX OI — третий источник (публичный, без API ключа)
+        if okx_data:
+            oi_values.append(okx_data.oi_change_24h)
         
         if oi_values:
             avg_oi_change = sum(oi_values) / len(oi_values)

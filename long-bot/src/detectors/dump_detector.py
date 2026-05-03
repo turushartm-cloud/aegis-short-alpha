@@ -124,41 +124,42 @@ class DumpExhaustionDetector:
 
         score = 0.0
 
-        # Z-Score компонент (0-40 баллов) — только при цене НИЖЕ VWAP
+        # Z-Score компонент (0-55 баллов) — ГЛАВНЫЙ сигнал mean-reversion LONG
+        # Цена экстремально ниже VWAP = перепродана = отскок вероятен
         if is_below_vwap:
-            if abs_z > 4.0:   score += 40
-            elif abs_z > 3.0: score += 32
-            elif abs_z > 2.5: score += 24
-            elif abs_z > 2.0: score += 16
-            elif abs_z > 1.5: score += 8
-            else:             score += max(0, abs_z * 4)
+            if abs_z > 4.5:   score += 55
+            elif abs_z > 4.0: score += 48
+            elif abs_z > 3.0: score += 38
+            elif abs_z > 2.5: score += 28
+            elif abs_z > 2.0: score += 18
+            elif abs_z > 1.5: score += 9
+            else:             score += max(0, abs_z * 5)
         else:
-            score += 0  # Цена выше VWAP — не дамп, не ищем LONG отскок
+            score += 0  # Цена выше VWAP — не дамп
 
-        # Volume компонент (0-30 баллов) — объём на дампе = selling climax
+        # Volume компонент (0-30 баллов) — selling climax подтверждение
         if vol_ratio > 5.0:   score += 30
         elif vol_ratio > 3.0: score += 24
         elif vol_ratio > 2.5: score += 18
         elif vol_ratio > 2.0: score += 12
         elif vol_ratio > 1.5: score += 6
 
-        # RSI перепроданность (0-20 баллов)
-        if rsi < 15:    score += 20
-        elif rsi < 20:  score += 16
-        elif rsi < 25:  score += 12
-        elif rsi < 30:  score += 6
-        elif rsi > 70:  score -= 10  # Перекуплен — не ищем LONG
-
-        # Price Velocity (0-10 баллов) — скорость падения = сила дампа
-        if velocity < -5.0:   score += 10  # Агрессивный дамп = capitulation
+        # Price Velocity (0-10 баллов) — скорость падения
+        if velocity < -5.0:   score += 10
         elif velocity < -3.0: score += 7
         elif velocity < -1.5: score += 4
         elif velocity > 1.0:  score -= 5   # Уже растёт — момент пропущен
 
+        # RSI — вспомогательный (0-10 баллов, НЕ блокирует)
+        if rsi < 15:    score += 10
+        elif rsi < 20:  score += 7
+        elif rsi < 25:  score += 5
+        elif rsi < 30:  score += 3
+        elif rsi > 70:  score -= 5   # Перекуплен при дампе — осторожно (мягко)
+
         score = min(max(score, 0.0), 100.0)
 
         # Подтверждение бычьими разворотными свечами (hammer, doji)
-        # Первые признаки разворота: small body, long lower wick
         reversal_candles = 0
         for c in ohlcv[-self.cfg.confirmation_candles:]:
             body = abs(c.close - c.open)
@@ -168,11 +169,11 @@ class DumpExhaustionDetector:
                 reversal_candles += 1
 
         if reversal_candles >= 1:
-            score *= 1.15  # Есть молоток/пин-бар — усиливаем
+            score *= 1.15  # Молоток/пин-бар — усиливаем
 
-        # Байесовский корректор: капитуляции с Z < -3.0 дают отскок ≥3% в ~65% случаев
-        if abs_z > 3.0 and vol_ratio > 3.0 and rsi < 20:
-            bayesian = 1.20   # Классическая капитуляция
+        # Байесовский корректор: Z < -3.0 + Vol > 3x = капитуляция
+        if abs_z > 3.0 and vol_ratio > 3.0:
+            bayesian = 1.20
         elif abs_z > 2.5 and vol_ratio > 2.0:
             bayesian = 1.05
         else:
@@ -180,15 +181,19 @@ class DumpExhaustionDetector:
 
         score = min(score * bayesian, 100.0)
 
+        # PRIMARY: Z-score + Volume — RSI вспомогательный, НЕ gate
         detected = (
             z_score < -self.cfg.threshold and
-            vol_ratio >= self.cfg.volume_spike and
-            rsi <= self.cfg.rsi_oversold
+            vol_ratio >= self.cfg.volume_spike
         )
 
-        # Частичный сигнал
-        if abs_z > 2.0 and vol_ratio > 1.8 and not detected:
-            detected = score >= 50
+        # RSI даёт бонусное подтверждение перепроданности
+        if detected and rsi <= self.cfg.rsi_oversold:
+            score = min(score * 1.1, 100.0)  # +10% confidence bonus
+
+        # Частичный сигнал: abs_z > 2.0 + Vol > 1.8
+        if not detected and abs_z > 2.0 and vol_ratio > 1.8:
+            detected = score >= 48
 
         return {
             "detected":     detected,

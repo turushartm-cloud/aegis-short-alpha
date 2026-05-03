@@ -71,12 +71,30 @@ class BingXClient:
     def __init__(self, api_key=None, api_secret=None, demo=True):
         self.api_key    = api_key    or os.getenv("BINGX_API_KEY", "")
         self.api_secret = api_secret or os.getenv("BINGX_API_SECRET", "")
-        force_real = os.getenv("BINGX_FORCE_REAL", "false").lower() == "true"
-        self.demo  = (not force_real) or demo
+
+        # ──────────────────────────────────────────────────────────────
+        # DEMO / REAL режим — управляется ОДНИМ ENV:
+        #   BINGX_DEMO_MODE=true  → демо-торговля (безопасно, по умолчанию)
+        #   BINGX_DEMO_MODE=false → РЕАЛЬНЫЕ деньги ⚠️
+        #
+        # BINGX_FORCE_REAL устарел и игнорируется.
+        # ──────────────────────────────────────────────────────────────
+        env_demo = os.getenv("BINGX_DEMO_MODE", "true").strip().lower()
+        if env_demo in ("false", "0", "no", "real"):
+            self.demo = False
+        else:
+            self.demo = True  # default SAFE
+
         if not self.demo:
-            print("🚨 WARNING: REAL MODE!")
+            print("=" * 50)
+            print("🚨  ВНИМАНИЕ: РЕАЛЬНЫЙ РЕЖИМ ТОРГОВЛИ!")
+            print("🚨  BINGX_DEMO_MODE=false — деньги настоящие!")
+            print("=" * 50)
+        else:
+            print("✅  DEMO режим активен (BINGX_DEMO_MODE=true)")
+
         if not self.api_key or not self.api_secret:
-            raise ValueError("BingX API key and secret required")
+            raise ValueError("BingX API key and secret required (BINGX_API_KEY / BINGX_API_SECRET)")
         self.base_url = self.DEMO_BASE_URL if self.demo else self.REAL_BASE_URL
         self.session: Optional[aiohttp.ClientSession] = None
         self._symbol_info_cache: Dict[str, Dict] = {}
