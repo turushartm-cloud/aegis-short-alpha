@@ -216,23 +216,20 @@ class BaseScorer:
 
 class ShortScorer(BaseScorer):
 
-    def __init__(self, min_score: int = 54):  # Было 65 — откалибровано под fallback
+    def __init__(self, min_score: int = 65):
         super().__init__(min_score, Direction.SHORT)
 
     def calculate_rsi_component(self, rsi_1h: float) -> ScoreComponent:
-        # RSI — ВСПОМОГАТЕЛЬНЫЙ фактор для mean-reversion SHORT
-        # Главное: Z-score + Volume. RSI лишь подтверждает или слегка штрафует.
-        # Максимум 12 (было 20) — снизили вес относительно структурных сигналов
-        if rsi_1h >= 80:   score, desc = 12, f"RSI {rsi_1h:.1f} — Экстремальная перекупленность ✅"
-        elif rsi_1h >= 75: score, desc = 10, f"RSI {rsi_1h:.1f} — Сильная перекупленность"
-        elif rsi_1h >= 70: score, desc = 8,  f"RSI {rsi_1h:.1f} — Перекупленность"
-        elif rsi_1h >= 65: score, desc = 6,  f"RSI {rsi_1h:.1f} — Начало перекупленности"
-        elif rsi_1h >= 55: score, desc = 4,  f"RSI {rsi_1h:.1f} — Нейтрально-bullish (ок)"
-        elif rsi_1h >= 40: score, desc = 3,  f"RSI {rsi_1h:.1f} — Нейтральная зона"
-        elif rsi_1h >= 30: score, desc = 2,  f"RSI {rsi_1h:.1f} — Нижняя нейтраль"
-        else:              score, desc = 1,  f"RSI {rsi_1h:.1f} — Перепродан (осторожнее)"
-        # Не даём 0: RSI — не gate, лишь снижает вес при экстремальной перепроданности
-        return ScoreComponent("RSI", score, 12, desc, rsi_1h)
+        if rsi_1h >= 80:   score, desc = 20, f"RSI {rsi_1h:.1f} — Экстремальная перекупленность"
+        elif rsi_1h >= 75: score, desc = 18, f"RSI {rsi_1h:.1f} — Сильная перекупленность"
+        elif rsi_1h >= 70: score, desc = 15, f"RSI {rsi_1h:.1f} — Перекупленность"
+        elif rsi_1h >= 65: score, desc = 12, f"RSI {rsi_1h:.1f} — Начало перекупленности"
+        elif rsi_1h >= 60: score, desc = 8,  f"RSI {rsi_1h:.1f} — Близко к перекупленности"
+        elif rsi_1h >= 55: score, desc = 4,  f"RSI {rsi_1h:.1f} — Нейтрально-bullish"
+        elif rsi_1h >= 50: score, desc = 3,  f"RSI {rsi_1h:.1f} — Нейтраль 50-55"  # ✅ FIX
+        elif rsi_1h < 30:  score, desc = 0,  f"RSI {rsi_1h:.1f} — Перепроданность (плохо для шорта)"
+        else:              score, desc = 2,  f"RSI {rsi_1h:.1f} — Нейтральная зона"
+        return ScoreComponent("RSI", score, 20, desc, rsi_1h)
 
     def calculate_funding_component(self, current_funding: float,
                                     accumulated_4d: float) -> ScoreComponent:
@@ -352,9 +349,7 @@ class LongScorer(BaseScorer):
     def __init__(self, min_score: int = 55):  # Ниже порог для лонгов
         super().__init__(min_score, Direction.LONG)
 
-    def calculate_rsi_component(self, rsi_1h: float, price_change_1h: float = 0.0) -> ScoreComponent:
-        # RSI — ВСПОМОГАТЕЛЬНЫЙ фактор. Не блокирует при трендовом движении.
-        is_momentum = price_change_1h > 3.0  # цена +3%/час = явный тренд вверх
+    def calculate_rsi_component(self, rsi_1h: float) -> ScoreComponent:
         if rsi_1h <= 20:   score, desc = 20, f"RSI {rsi_1h:.1f} — Экстремальная перепроданность"
         elif rsi_1h <= 25: score, desc = 18, f"RSI {rsi_1h:.1f} — Сильная перепроданность"
         elif rsi_1h <= 30: score, desc = 15, f"RSI {rsi_1h:.1f} — Перепроданность"
@@ -363,10 +358,9 @@ class LongScorer(BaseScorer):
         elif rsi_1h <= 45: score, desc = 8,  f"RSI {rsi_1h:.1f} — Нейтрально-bearish"
         elif rsi_1h <= 55: score, desc = 6,  f"RSI {rsi_1h:.1f} — Нейтральная зона (ок для моментума)"
         elif rsi_1h <= 60: score, desc = 4,  f"RSI {rsi_1h:.1f} — Умеренный моментум"
-        elif rsi_1h <= 65: score, desc = 3,  f"RSI {rsi_1h:.1f} — Начало перекупленности"
-        elif rsi_1h <= 75: score, desc = (5 if is_momentum else 1), f"RSI {rsi_1h:.1f} — {'MOMENTUM тренд' if is_momentum else 'Высокий RSI'}"
-        elif rsi_1h <= 85: score, desc = (6 if is_momentum else 0), f"RSI {rsi_1h:.1f} — {'Сильный MOMENTUM — тренд продолжается' if is_momentum else 'Перекупленность'}"
-        else:              score, desc = (4 if is_momentum else 0), f"RSI {rsi_1h:.1f} — {'Экстремальный MOMENTUM' if is_momentum else 'Перекупленность крит.'}"
+        elif rsi_1h <= 65: score, desc = 2,  f"RSI {rsi_1h:.1f} — Начало перекупленности"
+        elif rsi_1h > 75:  score, desc = 0,  f"RSI {rsi_1h:.1f} — Перекупленность (плохо для лонга)"
+        else:              score, desc = 1,  f"RSI {rsi_1h:.1f} — Высокий"
         return ScoreComponent("RSI", score, 20, desc, rsi_1h)
 
     def calculate_funding_component(self, current_funding: float,
@@ -451,10 +445,9 @@ class LongScorer(BaseScorer):
                         long_ratio, oi_change_4d, price_change_4d,
                         hourly_deltas, price_trend, patterns,
                         volume_spike_ratio: float = 1.0,
-                        atr_14_pct: float = 0.5,
-                        price_change_1h: float = 0.0) -> ScoreResult:
+                        atr_14_pct: float = 0.5) -> ScoreResult:
         components = []
-        components.append(self.calculate_rsi_component(rsi_1h, price_change_1h))
+        components.append(self.calculate_rsi_component(rsi_1h))
         components.append(self.calculate_funding_component(funding_current, funding_accumulated))
         components.append(self.calculate_ratio_component(long_ratio))
         components.append(self.calculate_oi_component(oi_change_4d, price_change_4d))

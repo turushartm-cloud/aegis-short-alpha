@@ -667,12 +667,12 @@ class TelegramCommandHandler:
             try:
                 all_positions = await self.state.auto_trader.bingx.get_positions()
                 expected_side = self.bot_type.upper()
-                real_positions_count = len([
-                    p for p in all_positions
-                    if (getattr(p, "position_side", "").upper() == expected_side
-                        or getattr(p, "side", "").upper() == expected_side)
-                    and abs(getattr(p, "size", 0)) > 0
-                ])
+                real_positions_count = len([p for p in all_positions if (
+                    getattr(p, "position_side", "").upper() == expected_side or
+                    getattr(p, "side", "").upper() == expected_side or
+                    (expected_side == "SHORT" and getattr(p, "size", 0) < 0) or
+                    (expected_side == "LONG" and getattr(p, "size", 0) > 0)
+                )])
             except Exception:
                 pass  # Fallback к сигналам если ошибка
         
@@ -846,21 +846,14 @@ class TelegramCommandHandler:
             mode = "DEMO" if getattr(self.config, "BINGX_DEMO", True) else "REAL"
             
             # ✅ FIX: Фильтруем позиции по стороне бота
-            # BingX: size всегда > 0, направление только в position_side / side
+            # SHORT бот видит только SHORT, LONG — только LONG
             expected_side = self.bot_type.upper()
-            def _is_expected(p):
-                ps = getattr(p, "position_side", "").upper()
-                s  = getattr(p, "side", "").upper()
-                # Прямое совпадение
-                if ps == expected_side: return True
-                if s  == expected_side: return True
-                # BingX BOTH режим — смотрим на size знак (редкий случай)
-                if ps == "BOTH":
-                    sz = getattr(p, "size", 0)
-                    if expected_side == "SHORT" and sz < 0: return True
-                    if expected_side == "LONG"  and sz > 0: return True
-                return False
-            positions = [p for p in all_positions if _is_expected(p) and abs(getattr(p, "size", 0)) > 0]
+            positions = [p for p in all_positions if (
+                getattr(p, "position_side", "").upper() == expected_side or
+                getattr(p, "side", "").upper() == expected_side or
+                (expected_side == "SHORT" and getattr(p, "size", 0) < 0) or
+                (expected_side == "LONG" and getattr(p, "size", 0) > 0)
+            )]
             
             if not positions:
                 await self._reply(reply_chat_id, f"📈 Нет открытых {expected_side} позиций [{mode}]")

@@ -95,7 +95,7 @@ class AegisSignalEngine:
     }
 
     # Минимальные компоненты для валидного сигнала
-    MIN_COMPONENTS_VALID = 1        # ≥1 детектора должны дать score>30
+    MIN_COMPONENTS_VALID = 2        # ≥2 детектора должны дать score>30
     MIN_COMPONENT_SCORE  = 30.0
 
     def __init__(
@@ -105,7 +105,7 @@ class AegisSignalEngine:
         liq_mapper=None,
         smc_detector=None,
         delta_analyzer=None,
-        min_score: float = 54.0,  # Было 60
+        min_score: float = 60.0,
     ):
         self.pump_detector  = pump_detector
         self.oi_analyzer    = oi_analyzer
@@ -438,32 +438,21 @@ class AegisSignalEngine:
         # Нормируем обратно к 0-100 (так как raw_score уже 0-100)
         final_score = total_weighted  # Это уже 0-100 (веса суммируются в 1.0)
 
-        # Интеграция с base_score из исходного scorer
-        # Логика: AEGIS не должен тянуть вниз уже высокий base_score
-        # Используем: max(base_score, aegis_weighted) с небольшим бонусом от AEGIS
+        # Интеграция с base_score из исходного scorer (бонус при совпадении)
         if base_score > 0:
-            aegis_only = final_score  # AEGIS weighted score (0-100)
-            if base_score >= 65:
-                # base уже хороший — AEGIS даёт бонус до +15, не режет
-                final_score = base_score + min(aegis_only * 0.15, 15)
-            else:
-                # base слабый — честный блендинг 50/50
-                final_score = aegis_only * 0.50 + base_score * 0.50
+            # Blended: 70% Aegis + 30% существующий scorer
+            final_score = final_score * 0.70 + base_score * 0.30
 
         # Проверка минимального порога и минимума компонентов
         if final_score < self.min_score:
-            comp_str = " | ".join(f"{k}={v.raw_score:.0f}" for k,v in components.items())
-            logger.info(f"[AEGIS REJECT] {symbol}: score={final_score:.1f} < min={self.min_score} | {comp_str}")
             return None
 
         if valid_components < self.MIN_COMPONENTS_VALID:
-            comp_str = " | ".join(f"{k}={v.raw_score:.0f}" for k,v in components.items())
-            logger.info(f"[AEGIS REJECT] {symbol}: valid_components={valid_components} < {self.MIN_COMPONENTS_VALID} | {comp_str}")
+            logger.debug(f"{symbol}: only {valid_components} valid components — skip")
             return None
 
         strength = self._score_to_strength(final_score)
         if strength == SignalStrength.NOISE:
-            logger.info(f"[AEGIS REJECT] {symbol}: score={final_score:.1f} → NOISE strength")
             return None
 
         from datetime import datetime

@@ -83,7 +83,7 @@ class AegisLongSignalEngine:
         SignalStrengthLong.WATCH:    50.0,
     }
 
-    MIN_COMPONENTS_VALID = 1
+    MIN_COMPONENTS_VALID = 2
     MIN_COMPONENT_SCORE  = 15.0  # Ниже порог = больше сигналов
 
     def __init__(
@@ -93,7 +93,7 @@ class AegisLongSignalEngine:
         bsl_scanner=None,
         wyckoff_detector=None,
         delta_analyzer=None,
-        min_score: float = 50.0,  # Было 58
+        min_score: float = 58.0,
     ):
         self.dump_detector   = dump_detector
         self.oi_analyzer     = oi_analyzer
@@ -125,25 +125,14 @@ class AegisLongSignalEngine:
             else:
                 rsi      = getattr(md, "rsi_1h", 50) or 50
                 vol_spike = getattr(md, "volume_spike_ratio", 1.0) or 1.0
-                price_chg_1h = getattr(md, "price_change_1h", 0) or 0
-                price_chg_4h = getattr(md, "price_change_4h", 0) or 0
-                is_momentum_up = (price_chg_1h > 3.0 or price_chg_4h > 8.0)
-
                 if rsi < 20 and vol_spike > 2.0:
                     score = 75; reasons.append(f"RSI перепродан {rsi:.0f} + Vol×{vol_spike:.1f}")
                 elif rsi < 25:
                     score = 55; reasons.append(f"RSI сильно перепродан {rsi:.0f}")
                 elif rsi < 35:
                     score = 35; reasons.append(f"RSI перепродан {rsi:.0f}")
-                elif rsi >= 70 and is_momentum_up and vol_spike > 1.8:
-                    # MOMENTUM LONG: RSI высокий, но цена летит вверх с объёмом
-                    # Не mean-reversion, а trend continuation → даём скор
-                    score = 45 + min((rsi - 70) * 0.8, 20)
-                    reasons.append(f"MOMENTUM LONG: RSI={rsi:.0f} цена+{price_chg_1h:.1f}%/1H Vol×{vol_spike:.1f} — тренд продолжается")
-                elif rsi >= 70 and is_momentum_up:
-                    score = 30; reasons.append(f"Momentum up RSI={rsi:.0f} цена+{price_chg_1h:.1f}%/1H — умеренный тренд")
                 elif rsi > 70:
-                    score = 15; reasons.append(f"RSI перекуплен {rsi:.0f} без объёмного подтверждения — осторожно")
+                    score = 5;  reasons.append(f"RSI перекуплен {rsi:.0f} — не для LONG отскока")
         except Exception as e:
             logger.warning(f"dump_score {symbol}: {e}"); score = 20.0
         return ComponentScoreLong(
@@ -340,12 +329,7 @@ class AegisLongSignalEngine:
         final_score  = total_weighted if total_weight > 0 else 0.0
 
         if base_score > 0:
-            # LONG: AEGIS не должен тянуть вниз хороший base_score
-            aegis_only = final_score
-            if base_score >= 60:
-                final_score = base_score + min(aegis_only * 0.15, 15)
-            else:
-                final_score = aegis_only * 0.50 + base_score * 0.50
+            final_score = final_score * 0.70 + base_score * 0.30
 
         if final_score < self.min_score or valid_components < self.MIN_COMPONENTS_VALID:
             return None

@@ -94,7 +94,7 @@ class Config:
     SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "180"))
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "15"))
 
-    MIN_SCORE     = int(os.getenv("MIN_SHORT_SCORE", "54"))  # Было 60 — fallback даёт ~45-55 без реальных детекторов
+    MIN_SCORE     = int(os.getenv("MIN_SHORT_SCORE", "60"))
     SL_BUFFER     = float(os.getenv("SHORT_SL_BUFFER", "2.5"))
     LEVERAGE      = os.getenv("SHORT_LEVERAGE", "5-30")
 
@@ -254,9 +254,7 @@ async def lifespan(app: FastAPI):
     await state.binance._init_source()
 
     # ── Existing scorer + patterns ──
-    # BASE_SCORER получает мягкий порог (50) — строгий порог у AEGIS (65)
-    _short_base_min = int(os.getenv("MIN_SHORT_BASE_SCORE", "50"))
-    state.scorer           = get_short_scorer(_short_base_min)
+    state.scorer           = get_short_scorer(Config.MIN_SCORE)
     state.pattern_detector = ShortPatternDetector()
     
     # 🆕 Consolidation Detector — блокировка входов в середине диапазона
@@ -470,19 +468,8 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
     try:
         md = await state.binance.get_complete_market_data(symbol)
         if not md:
-            # П1: Попробовать альтернативный формат (SPACE-USDT для OKX)
-            alt_symbol = symbol  # Binance/Bybit уже пробовали
-            try:
-                from api.okx_client import get_okx_client
-                okx = get_okx_client()
-                okx_data = await okx.get_open_interest(symbol)
-                if okx_data:
-                    # OKX даёт OI/funding — используем как дополнение, но нужен полный md
-                    pass  # Fallback частичный — продолжаем с Bybit-only
-            except Exception:
-                pass
             if verbose:
-                print(f"{log_prefix} ❌ Нет market data от Binance/Bybit — пропуск")
+                print(f"{log_prefix} ❌ Нет market data от Binance")
             return None
 
         # Загружаем OHLCV параллельно
@@ -498,54 +485,6 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             return None
         if isinstance(ohlcv_30m, Exception): ohlcv_30m = []
         if isinstance(ohlcv_4h, Exception):  ohlcv_4h  = []
-
-        # ── П10: Multi-Timeframe RSI bonus ──────────────────────────────
-        _mtf_bonus = 0
-        try:
-            def _calc_rsi(candles, period=14):
-                if not candles or len(candles) < period + 1:
-                    return None
-                closes = [c.close for c in candles]
-                gains, losses = [], []
-                for i in range(1, len(closes)):
-                    d = closes[i] - closes[i-1]
-                    gains.append(max(d, 0)); losses.append(max(-d, 0))
-                avg_g = sum(gains[:period]) / period
-                avg_l = sum(losses[:period]) / period
-                for i in range(period, len(gains)):
-                    avg_g = (avg_g * (period-1) + gains[i]) / period
-                    avg_l = (avg_l * (period-1) + losses[i]) / period
-                rs = avg_g / avg_l if avg_l > 0 else 100
-                return round(100 - 100 / (1 + rs), 1)
-
-            rsi_30m = _calc_rsi(ohlcv_30m) if ohlcv_30m else None
-            rsi_4h  = _calc_rsi(ohlcv_4h)  if ohlcv_4h  else None
-            rsi_1h  = md.rsi_1h or 50
-            _p1h = getattr(md, "price_change_1h", 0) or 0
-            _p4h = getattr(md, "price_change_4h", 0) or 0
-            _is_downtrend = _p1h < -3.0 or _p4h < -8.0  # Явный даунтренд по цене
-
-            # Шорт: все таймфреймы перегреты → сильный сигнал
-            if rsi_4h and rsi_30m:
-                if rsi_4h > 70 and rsi_1h > 65 and rsi_30m > 65:
-                    _mtf_bonus = 15
-                    if verbose: print(f"{log_prefix} 📈 [MTF] RSI 4H={rsi_4h} 1H={rsi_1h:.0f} 30M={rsi_30m} — всё перегрето +15")
-                elif rsi_4h > 65 and rsi_1h > 60:
-                    _mtf_bonus = 8
-                    if verbose: print(f"{log_prefix} 📈 [MTF] RSI 4H={rsi_4h} 1H={rsi_1h:.0f} — перегрев +8")
-                elif rsi_4h < 40 and rsi_1h < 45 and _is_downtrend:
-                    # MOMENTUM SHORT: RSI низкий, цена падает → trend continuation SHORT
-                    _mtf_bonus = 5
-                    if verbose: print(f"{log_prefix} 📉 [MTF] RSI {rsi_1h:.0f} низкий но DOWNTREND {_p1h:.1f}%/1H — SHORT продолжение +5")
-                elif rsi_4h < 40 and rsi_1h < 45:
-                    _mtf_bonus = -5  # Перепродан без ценового подтверждения — лёгкий штраф
-                    if verbose: print(f"{log_prefix} ⚠️ [MTF] RSI 4H={rsi_4h} перепродан без тренда {_mtf_bonus}")
-            elif rsi_4h:
-                if rsi_4h > 70: _mtf_bonus = 8
-                elif rsi_4h > 65: _mtf_bonus = 4
-        except Exception as _mtf_e:
-            if verbose: print(f"{log_prefix} ⚠️ [MTF] error: {_mtf_e}")
-        # ────────────────────────────────────────────────────────────────
 
         # ── Существующий базовый scorer (keep backward compat) ──
         hourly_deltas = await state.binance.get_hourly_volume_profile(symbol, 7)
@@ -601,11 +540,8 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 if verbose:
                     print(f"{log_prefix} ✅ [BREAKOUT] +8 — пробой консолидации")
         
-        # Apply MTF bonus to base_score
-        if _mtf_bonus != 0:
-            base_score = min(base_score + _mtf_bonus, 100)
         if verbose:
-            print(f"{log_prefix} 📊 [BASE_SCORER] score={base_score:.1f} | MTF={_mtf_bonus:+d} | reasons: {list(base_result.reasons)[:3]}")
+            print(f"{log_prefix} 📊 [BASE_SCORER] score={base_score:.1f} | reasons: {list(base_result.reasons)[:3]}")
 
         # ── SHORT-специфичные фильтры (сохраняем) ──
         sf   = get_short_filter()
@@ -620,9 +556,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             return None
 
         if filt.score_delta != 0 and verbose:
-            reason_str = getattr(filt, 'reasons', None)
-            reason_str = (", ".join(reason_str) if reason_str else getattr(filt, 'block_reason', 'N/A')) or 'score adjustment'
-            print(f"{log_prefix} ⚠️ [SHORT_FILTER] delta={filt.score_delta:+.1f} | причина: {reason_str}")
+            print(f"{log_prefix} ⚠️ [SHORT_FILTER] delta={filt.score_delta:+.1f} | причина: {getattr(filt, 'block_reason', 'N/A')}")
 
         base_score += filt.score_delta
 
@@ -765,7 +699,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                     current_exposure_usd=open_usd,
                 )
                 if verbose and risk_result:
-                    print(f"{log_prefix} 💰 [RISK] Kelly pos={risk_result.size_usd:.2f}$ | size={risk_result.size_pct:.2f}%")
+                    print(f"{log_prefix} 💰 [RISK] Kelly pos={risk_result.position_size_usd:.2f}$ | risk={risk_result.risk_pct:.2f}%")
             except Exception as e:
                 if verbose:
                     print(f"{log_prefix} ⚠️ [RISK] error: {e}")
@@ -895,6 +829,7 @@ async def scan_market():
             signal = await scan_symbol(symbol, _btc_cache_1h)
             if not signal:
                 rejected_count += 1
+                # Детектируем причину по последнему логу (упрощённо)
                 continue
 
             # BTC correlation adj
@@ -960,7 +895,10 @@ async def scan_market():
     })
     print(f"✅ Scan done. Signals: {new_signals} | TG-only: {tg_only_count} | "
           f"Rejected: {rejected_count} | Exchange: {active_count}/{Config.MAX_POSITIONS}")
-    print(f"   ℹ️  Reject tracking now via [AEGIS REJECT] / [BASE_SCORER] / [REALTIME] log lines above")
+    if rejected_count > 0:
+        print(f"   📊 Reject reasons: base_scorer={reject_reasons['base_scorer']} | "
+              f"filter={reject_reasons['short_filter']} | realtime={reject_reasons['realtime']} | "
+              f"aegis={reject_reasons['aegis']} | low_score={reject_reasons['low_score']}")
 
 
 async def background_scanner():
@@ -983,12 +921,10 @@ async def _daily_report_task():
             next_report += timedelta(days=1)
         await asyncio.sleep((next_report - now).total_seconds())
 
-        if state.is_running and state.telegram:
+        if state.performance_tracker and state.is_running:
             try:
-                # Используем Redis-историю (те же данные что и /daily_rep)
-                # PerformanceTracker хранит данные только в RAM и обнуляется при рестарте
-                await state.telegram.cmd_daily_report("", state.telegram.chat_id)
-                print("✅ Daily report sent (Redis-based)")
+                report = state.performance_tracker.daily_report()
+                await state.telegram.send_message(report)
             except Exception as e:
                 print(f"Daily report error: {e}")
 
