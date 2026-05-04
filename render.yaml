@@ -87,10 +87,6 @@ services:
         value: "true"
       - key: AUTO_TRADING_ENABLED
         value: "false"
-      - key: USE_BINANCE
-        value: "true"
-      - key: PROXY_LIST
-        sync: false  # Задать прокси-лист вручную в dashboard
 
   # ═══════════════════════════════════════════════════════════════════════
   # 🟢 AEGIS LONG ALPHA - Long Trading Bot
@@ -183,7 +179,3 @@ services:
         value: "-3.0"
       - key: AUTO_TRADING_ENABLED
         value: "false"
-      - key: USE_BINANCE
-        value: "true"
-      - key: PROXY_LIST
-        sync: false  # Задать прокси-лист вручную в dashboard

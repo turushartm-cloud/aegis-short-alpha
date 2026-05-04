@@ -50,9 +50,14 @@ def _find_shared() -> str:
 
 _SHARED = _find_shared()
 _SRC    = os.path.dirname(os.path.abspath(__file__))
-for _p in [_SHARED, os.path.dirname(_SHARED), _SRC]:
+# ВАЖНО: _SHARED должен быть в sys.path РАНЬШЕ _SRC, иначе пустой
+# long-bot/src/execution/ затенит shared/execution/ (package shadowing bug)
+for _p in [_SHARED, os.path.dirname(_SHARED)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# _SRC добавляем в конец — локальные модули (aegis/, detectors/) не конфликтуют с shared
+if _SRC not in sys.path:
+    sys.path.append(_SRC)
 
 print(f"📁 shared: {_SHARED}")
 
