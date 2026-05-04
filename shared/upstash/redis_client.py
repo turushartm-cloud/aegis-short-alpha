@@ -32,7 +32,8 @@ class UpstashRedisClient:
         # TTL для разных типов данных (в секундах)
         self.TTL = {
             "signal": 86400,        # 24 часа для сигналов
-            "position": 604800,     # 7 дней для позиций
+            "position": 604800,     # 7 дней для подтвержденных позиций
+            "position_unconfirmed": 60,  # 🆕 60 сек для НЕподтвержденных позиций
             "state": 3600,          # 1 час для состояния
             "stats": 2592000,       # 30 дней для статистики
             "cache": 300            # 5 минут для кэша API
@@ -55,9 +56,22 @@ class UpstashRedisClient:
             key = f"{bot_type}:signals:{symbol}"
             if "timestamp" not in signal_data:
                 signal_data["timestamp"] = datetime.utcnow().isoformat()
+            
+            # 🆕 Динамический TTL: 60 сек для неподтвержденных, 7 дней для подтвержденных
+            confirmed = signal_data.get("confirmed", False)
+            if confirmed:
+                ttl = self.TTL["position"]  # 7 дней
+            else:
+                ttl = self.TTL["position_unconfirmed"]  # 60 сек
+            
             self.client.lpush(key, json.dumps(signal_data))
-            self.client.expire(key, self.TTL["signal"])
+            self.client.expire(key, ttl)
             self.client.ltrim(key, 0, 49)
+            
+            # 🆕 Логирование TTL для дебага
+            if not confirmed:
+                print(f"⏱️ [Redis] {symbol}: TTL=60s (unconfirmed), will auto-expire if not confirmed")
+            
             return True
         except Exception as e:
             print(f"Error saving signal: {e}")
@@ -145,7 +159,7 @@ class UpstashRedisClient:
             return []
     
     def close_position(self, bot_type: str, symbol: str,
-                       pnl: float, close_price: float) -> bool:
+                       pnl: float, close_price: float, tp_level: str = "SL") -> bool:
         try:
             key = f"{bot_type}:positions:{symbol}"
             data = self.client.get(key)
@@ -154,10 +168,15 @@ class UpstashRedisClient:
                 position["status"] = "closed"
                 position["close_price"] = close_price
                 position["pnl"] = pnl
+                position["tp_level"] = tp_level  # ✅ FIX: Сохраняем tp_level
                 position["closed_at"] = datetime.utcnow().isoformat()
                 history_key = f"{bot_type}:history:{symbol}"
                 self.client.lpush(history_key, json.dumps(position))
                 self.client.ltrim(history_key, 0, 99)
+                # 🆕 Также пишем в all_trades для статистики
+                all_key = f"{bot_type}:all_trades"
+                self.client.lpush(all_key, json.dumps(position))
+                self.client.ltrim(all_key, 0, 9999)
                 self.client.delete(key)
                 return True
             return False
@@ -307,6 +326,135 @@ class UpstashRedisClient:
             print(f"Error getting Redis info: {e}")
             return {}
     
+    # =========================================================================
+    # SIGNAL LOG — постоянный лог ВСЕХ сигналов (исполненных + пропущенных)
+    # =========================================================================
+
+    def save_signal_log(self, bot_type: str, signal_data: Dict) -> bool:
+        """
+        Сохраняет КАЖДЫЙ сигнал, который прошёл MIN_SCORE и попал в Telegram.
+        Включает флаг executed=True/False и skip_reason.
+        Используется для статистики сигналов и виртуальных трейдов.
+        """
+        try:
+            key = f"{bot_type}:signal_log"
+            entry = dict(signal_data)
+            entry["log_ts"] = datetime.utcnow().isoformat()
+            self.client.lpush(key, json.dumps(entry))
+            self.client.ltrim(key, 0, 4999)  # Хранить последние 5000 сигналов
+            return True
+        except Exception as e:
+            print(f"Error saving signal log: {e}")
+            return False
+
+    def get_signal_log(self, bot_type: str, limit: int = 100, offset: int = 0) -> List[Dict]:
+        """Получение лога сигналов для дашборда"""
+        try:
+            key = f"{bot_type}:signal_log"
+            items = self.client.lrange(key, offset, offset + limit - 1)
+            return [json.loads(i) for i in items]
+        except Exception as e:
+            print(f"Error getting signal log: {e}")
+            return []
+
+    # =========================================================================
+    # VIRTUAL POSITIONS — мониторинг TP/SL для TG-only сигналов
+    # =========================================================================
+
+    def save_virtual_position(self, bot_type: str, symbol: str, signal_data: Dict) -> bool:
+        """
+        Сохраняет виртуальную позицию для мониторинга TP/SL.
+        Используется для сигналов, не открытых на бирже (exchange_full, paused и т.д.)
+        Структура: HASH {bot}:virtual_positions, field = {symbol}:{unix_ts}
+
+        ✅ FIX: Дедупликация — не создаём новую виртуальную позицию если по этому символу
+        уже есть открытая (outcome=None). Без этого бот каждый скан (~3 мин) добавлял
+        дубликат CHIPUSDT/MEGAUSDT → в дашборде одна монета появлялась 3-4 раза.
+        """
+        try:
+            key = f"{bot_type}:virtual_positions"
+
+            # ✅ Проверяем: нет ли уже открытой виртуальной позиции по этому символу
+            existing = self.client.hgetall(key)
+            if existing:
+                for field_key, val in existing.items():
+                    try:
+                        pos = json.loads(val)
+                        pos_symbol = pos.get("symbol", "")
+                        pos_outcome = pos.get("outcome")
+                        # Совпадение символа + нет исхода (позиция ещё открыта)
+                        if pos_symbol == symbol and pos_outcome is None:
+                            print(f"[VIRT-DEDUP] {bot_type}: {symbol} уже в virtual_positions — пропускаем дубликат")
+                            return False
+                    except Exception:
+                        continue
+
+            ts = int(datetime.utcnow().timestamp())
+            field = f"{symbol}:{ts}"
+            entry = {
+                **signal_data,
+                "virtual_key": field,
+                "virtual_opened_at": datetime.utcnow().isoformat(),
+                "outcome": None,
+                "bot_type": bot_type,
+            }
+            self.client.hset(key, field, json.dumps(entry))
+            self.client.expire(key, 604800)  # 7 дней TTL для всего hash
+            return True
+        except Exception as e:
+            print(f"Error saving virtual position: {e}")
+            return False
+
+    def get_virtual_positions(self, bot_type: str) -> Dict[str, Dict]:
+        """Возвращает все активные виртуальные позиции (без исхода)"""
+        try:
+            key = f"{bot_type}:virtual_positions"
+            data = self.client.hgetall(key)
+            if not data:
+                return {}
+            return {field: json.loads(val) for field, val in data.items()}
+        except Exception as e:
+            print(f"Error getting virtual positions: {e}")
+            return {}
+
+    def close_virtual_position(self, bot_type: str, field: str, outcome: str,
+                               outcome_price: float, pnl_pct: float) -> bool:
+        """
+        Закрывает виртуальную позицию с результатом.
+        outcome: "tp" | "sl" | "expired"
+        Запись уходит в {bot}:virtual_trades LIST (lpush, ltrim 5000).
+        """
+        try:
+            key = f"{bot_type}:virtual_positions"
+            raw = self.client.hget(key, field)
+            if not raw:
+                return False
+            pos = json.loads(raw)
+            pos["outcome"] = outcome
+            pos["outcome_price"] = outcome_price
+            pos["pnl_pct"] = pnl_pct
+            pos["closed_at"] = datetime.utcnow().isoformat()
+            # Записываем в историю
+            hist_key = f"{bot_type}:virtual_trades"
+            self.client.lpush(hist_key, json.dumps(pos))
+            self.client.ltrim(hist_key, 0, 4999)
+            # Удаляем из активных
+            self.client.hdel(key, field)
+            return True
+        except Exception as e:
+            print(f"Error closing virtual position: {e}")
+            return False
+
+    def get_virtual_trades(self, bot_type: str, limit: int = 100) -> List[Dict]:
+        """Получение закрытых виртуальных сделок"""
+        try:
+            key = f"{bot_type}:virtual_trades"
+            items = self.client.lrange(key, 0, limit - 1)
+            return [json.loads(i) for i in items]
+        except Exception as e:
+            print(f"Error getting virtual trades: {e}")
+            return []
+
     def get_memory_usage(self) -> Dict:
         try:
             info = self.client.info("memory")
@@ -327,6 +475,51 @@ class UpstashRedisClient:
 
 
 # ============================================================================
+    # =========================================================================
+    # PROXY METHODS — совместимость с MicroTrailingStop (redis-py interface)
+    # =========================================================================
+
+    def set(self, key: str, value: str, ex=None) -> bool:
+        try:
+            if ex:
+                return bool(self.client.set(key, value, ex=ex))
+            return bool(self.client.set(key, value))
+        except Exception as e:
+            print(f'[Redis] set error: {e}')
+            return False
+
+    def get(self, key: str):
+        try:
+            return self.client.get(key)
+        except Exception as e:
+            print(f'[Redis] get error: {e}')
+            return None
+
+    def keys(self, pattern: str = '*'):
+        try:
+            return self.client.keys(pattern)
+        except Exception as e:
+            print(f'[Redis] keys error: {e}')
+            return []
+
+    def delete(self, *keys: str) -> int:
+        try:
+            return self.client.delete(*keys)
+        except Exception as e:
+            print(f'[Redis] delete error: {e}')
+            return 0
+
+    def remove_position(self, bot_type: str, symbol: str) -> bool:
+        """Удаляет ключ positions:{symbol} из Redis (вызывается при закрытии позиции)."""
+        try:
+            key = f"{bot_type}:positions:{symbol}"
+            self.client.delete(key)
+            print(f"[Redis] 🗑️ positions key deleted: {key}")
+            return True
+        except Exception as e:
+            print(f"[Redis] remove_position error: {e}")
+            return False
+
 # SINGLETON INSTANCE
 # ============================================================================
 
