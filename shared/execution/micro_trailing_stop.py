@@ -157,6 +157,64 @@ class MicroTrailingStop:
         
         return None
     
+    def on_tp_taken(self, symbol: str, tp_level: int, current_price: float) -> Optional[float]:
+        """
+        Called when a take-profit level is hit.
+        Returns the new stop-loss level or None if no change needed.
+        
+        Args:
+            symbol: Trading pair symbol
+            tp_level: TP level number (1-based: 1, 2, 3...)
+            current_price: Current market price
+        """
+        state = self._states.get(symbol)
+        if not state:
+            return None
+        
+        # Convert to 0-based index for internal logic
+        tp_index = tp_level - 1
+        current_sl = state.current_sl
+        
+        return self.calculate_micro_sl(symbol, tp_index, current_sl)
+    
+    def get_summary(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Get summary of trailing stop activity for a symbol.
+        Returns dict with steps_taken, total_moved_pct, etc.
+        """
+        state = self._states.get(symbol)
+        if not state:
+            return None
+        
+        # Calculate total percentage moved from initial SL
+        initial_sl = state.initial_sl
+        current_sl = state.current_sl
+        entry = state.entry_price
+        
+        if state.direction == "long":
+            total_moved_pct = ((current_sl - initial_sl) / entry) * 100 if entry else 0
+        else:
+            total_moved_pct = ((initial_sl - current_sl) / entry) * 100 if entry else 0
+        
+        # Count steps taken
+        steps_taken = 0
+        if state.be_triggered:
+            steps_taken += 1
+        if state.be2_triggered:
+            steps_taken += 1
+        
+        return {
+            'symbol': symbol,
+            'direction': state.direction,
+            'steps_taken': steps_taken,
+            'total_moved_pct': abs(total_moved_pct),
+            'initial_sl': initial_sl,
+            'current_sl': current_sl,
+            'entry_price': entry,
+            'be_triggered': state.be_triggered,
+            'be2_triggered': state.be2_triggered,
+        }
+    
     def calculate_trail_sl(self, symbol: str, current_price: float, current_sl: float) -> Optional[float]:
         """
         Рассчитать трейлинг SL на основе текущей цены.
