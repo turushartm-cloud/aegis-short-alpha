@@ -204,9 +204,13 @@ class BinanceFuturesClient:
             await self.session.close()
 
     async def _init_source(self):
+        # v3.0: Re-check source every 30 min (don't cache dead proxy forever)
+        now = time.time()
         if hasattr(self, '_source_ready'):
-            return
+            if now - getattr(self, '_source_checked_at', 0) < 1800:
+                return
         self._source_ready = True
+        self._source_checked_at = now
 
         if not self._try_binance:
             self._use_binance = False
@@ -238,13 +242,20 @@ class BinanceFuturesClient:
     # BYBIT / BINANCE REQUESTS
     # =========================================================================
 
-    _bybit_blocked: bool = False  # class-level flag: Bybit geo-blocked
+    _bybit_blocked: bool = False       # class-level flag: Bybit geo-blocked
+    _bybit_blocked_at: float = 0.0     # timestamp when blocked (for retry)
+    BYBIT_RETRY_INTERVAL: int = 1800   # retry Bybit every 30 min
 
     async def _bybit(self, endpoint: str, params: Dict = None) -> Optional[Any]:
         await self._rate_limit()
-        # ✅ FIX: if Bybit is geo-blocked (403), skip immediately - don't spam logs
+        # v3.0 FIX: retry Bybit every 30 min (was: blocked forever)
         if BinanceFuturesClient._bybit_blocked:
-            return None
+            elapsed = time.time() - BinanceFuturesClient._bybit_blocked_at
+            if elapsed < BinanceFuturesClient.BYBIT_RETRY_INTERVAL:
+                return None
+            # Reset and retry
+            BinanceFuturesClient._bybit_blocked = False
+            print(f"🔄 Bybit retry after {elapsed/60:.0f}m block — testing connection...")
         try:
             session = await self._get_session()
             async with session.get(
@@ -258,10 +269,11 @@ class BinanceFuturesClient:
                         return data.get("result")
                     return None
                 if resp.status == 403:
-                    # Geo-block: Render IP banned. Stop trying Bybit.
+                    # Geo-block: Render IP banned. Try Binance via proxy.
                     if not BinanceFuturesClient._bybit_blocked:
                         BinanceFuturesClient._bybit_blocked = True
-                        print("⛔ Bybit geo-blocked (403). Switching to Binance-only mode.")
+                        BinanceFuturesClient._bybit_blocked_at = time.time()
+                        print("⛔ Bybit geo-blocked (403). Falling back to Binance proxy.")
                     return None
                 return None
         except Exception:
@@ -290,8 +302,23 @@ class BinanceFuturesClient:
                    bybit_params: Dict = None) -> Optional[Any]:
         await self._init_source()
         if self._use_binance:
-            return await self._binance(binance_ep, binance_params)
-        return await self._bybit(bybit_ep, bybit_params)
+            result = await self._binance(binance_ep, binance_params)
+            if result is not None:
+                return result
+            # Binance failed → fallback to Bybit
+            return await self._bybit(bybit_ep, bybit_params)
+
+        # v3.0: Bybit first. If geo-blocked AND proxies available → try Binance
+        result = await self._bybit(bybit_ep, bybit_params)
+        if result is None and BinanceFuturesClient._bybit_blocked and self._proxies:
+            # Auto-switch to Binance via proxy when Bybit is geo-blocked
+            if not self._active_proxy:
+                self._active_proxy = self._next_proxy()
+            result = await self._binance(binance_ep, binance_params)
+            if result is not None and not self._use_binance:
+                self._use_binance = True
+                print(f"✅ Auto-switched to Binance proxy: {self._active_proxy}")
+        return result
 
     # =========================================================================
     # SYMBOLS
