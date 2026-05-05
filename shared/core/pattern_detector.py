@@ -224,7 +224,11 @@ class LongPatternDetector:
         )
 
     def detect_liquidity_sweep_long(self, candles, hourly_deltas=None, md=None) -> Optional[PatternResult]:
-        """LIQUIDITY_SWEEP_LONG: Stop hunt вниз → разворот (ICT/SMC)."""
+        """LIQUIDITY_SWEEP_LONG: Stop hunt вниз → разворот (ICT/SMC).
+        
+        v2: sweep.close может быть чуть ниже recent_sl (буфер 0.5%) —
+        на криптоалтах свеча часто закрывается в зоне swept lows, а не выше.
+        """
         if len(candles) < 20:
             return None
         last  = candles[-1]
@@ -240,7 +244,10 @@ class LongPatternDetector:
             return None
         recent_sl = (min(swing_lows_list[-3:]) if len(swing_lows_list) >= 3
                      else swing_lows_list[-1])
-        if sweep.low > recent_sl or sweep.close < recent_sl:
+        if sweep.low > recent_sl:
+            return None
+        # ✅ FIX v2: буфер 0.5% — sweep.close может чуть не дойти выше recent_sl
+        if sweep.close < recent_sl * 0.995:
             return None
         if last.close <= last.open:
             return None
@@ -281,7 +288,12 @@ class LongPatternDetector:
         )
 
     def detect_wyckoff_spring(self, candles, hourly_deltas=None, md=None) -> Optional[PatternResult]:
-        """WYCKOFF_SPRING: Ложный пробой лоу диапазона накопления."""
+        """WYCKOFF_SPRING: Ложный пробой лоу диапазона накопления.
+        
+        v2: расширен диапазон 1.5-25% (крипто-алты имеют широкие диапазоны),
+        ослаблен volume фильтр (2.5x вместо 1.5x),
+        допускается слабо-медвежья последняя свеча при wick-восстановлении.
+        """
         if len(candles) < 30:
             return None
         acc    = candles[-30:-5]
@@ -290,23 +302,33 @@ class LongPatternDetector:
         r_high = max(c.high for c in acc)
         r_low  = min(c.low  for c in acc)
         r_pct  = (r_high - r_low) / r_low * 100 if r_low else 999
-        if not (1.5 < r_pct < 8.0):
+        # ✅ FIX v2: крипто-алты имеют диапазоны 10-25% — расширяем порог
+        if not (1.5 < r_pct < 25.0):
             return None
         if prev.low > r_low or prev.close < r_low:
             return None
         avg_vol = _avg_vol(acc, min(len(acc), 15))
-        if prev.quote_volume > avg_vol * 1.5:
+        # ✅ FIX v2: расслабляем volume фильтр — памп на спринге допустим
+        if prev.quote_volume > avg_vol * 2.5:
             return None
-        if last.close < r_low or last.close <= last.open:
+        if last.close < r_low:
+            return None
+        # ✅ FIX v2: допускаем слабо-медвежью свечу если lower wick показывает отскок
+        lower_wick_last = min(last.open, last.close) - last.low
+        atr_v = _atr(candles[-15:], 14)
+        is_recovering = last.close > last.open or lower_wick_last > atr_v * 0.3
+        if not is_recovering:
             return None
         spring_depth = (r_low - prev.low) / r_low * 100
+        # Бонус выше для широких диапазонов (более значимые паттерны)
+        bonus = 22 if r_pct < 8.0 else 20
         return PatternResult(
-            name="WYCKOFF_SPRING", score_bonus=22,
+            name="WYCKOFF_SPRING", score_bonus=bonus,
             confidence=0.80, direction="long",
             suggested_sl_pct=round((last.close - prev.low) / last.close * 100 + 0.3, 2),
             reasons=[f"Wyckoff Spring: диапазон {r_pct:.1f}%",
                      f"Spring -{spring_depth:.2f}% ниже поддержки",
-                     "Низкий объём на spring — ложный пробой"],
+                     "Объём в норме — ложный пробой"],
         )
 
     # ── КЛАССИЧЕСКИЕ ПАТТЕРНЫ ─────────────────────────────────────────────────
@@ -462,7 +484,11 @@ class ShortPatternDetector:
         )
 
     def detect_liquidity_sweep_short(self, candles, hourly_deltas=None, md=None) -> Optional[PatternResult]:
-        """LIQUIDITY_SWEEP_SHORT: Stop hunt вверх → разворот вниз (ICT/SMC)."""
+        """LIQUIDITY_SWEEP_SHORT: Stop hunt вверх → разворот вниз (ICT/SMC).
+        
+        v2: sweep.close может быть чуть выше recent_sh (буфер 0.5%) —
+        на криптоалтах свеча часто закрывается в зоне swept highs, а не ниже.
+        """
         if len(candles) < 20:
             return None
         last  = candles[-1]
@@ -478,7 +504,11 @@ class ShortPatternDetector:
             return None
         recent_sh = (max(swing_highs_list[-3:]) if len(swing_highs_list) >= 3
                      else swing_highs_list[-1])
-        if sweep.high < recent_sh or sweep.close > recent_sh:
+        if sweep.high < recent_sh:
+            return None
+        # ✅ FIX v2: буфер 0.5% — sweep.close может чуть не дойти ниже recent_sh
+        # (на памп-свечах закрытие часто остаётся в зоне swept high)
+        if sweep.close > recent_sh * 1.005:
             return None
         if last.close >= last.open:
             return None
@@ -589,7 +619,11 @@ class ShortPatternDetector:
         )
 
     def detect_wyckoff_upthrust(self, candles, hourly_deltas=None, md=None) -> Optional[PatternResult]:
-        """WYCKOFF_UPTHRUST: Ложный пробой хая зоны распределения."""
+        """WYCKOFF_UPTHRUST: Ложный пробой хая зоны распределения.
+        
+        v2: расширен диапазон 1.5-25%, ослаблен volume фильтр,
+        допускается верхний wick на последней свече как подтверждение.
+        """
         if len(candles) < 30:
             return None
         dist   = candles[-30:-5]
@@ -598,23 +632,32 @@ class ShortPatternDetector:
         r_h    = max(c.high for c in dist)
         r_l    = min(c.low  for c in dist)
         r_pct  = (r_h - r_l) / r_l * 100 if r_l else 999
-        if not (1.5 < r_pct < 8.0):
+        # ✅ FIX v2: крипто-алты имеют диапазоны 10-25%
+        if not (1.5 < r_pct < 25.0):
             return None
         if prev.high < r_h or prev.close > r_h:
             return None
         avg_vol = _avg_vol(dist, min(len(dist), 15))
-        if prev.quote_volume > avg_vol * 1.5:
+        # ✅ FIX v2: расслабляем — памп на upthrust допустим
+        if prev.quote_volume > avg_vol * 2.5:
             return None
-        if last.close > r_h or last.close >= last.open:
+        if last.close > r_h:
+            return None
+        # ✅ FIX v2: принимаем медвежью свечу ИЛИ свечу с большим верхним wick
+        upper_wick_last = last.high - max(last.open, last.close)
+        atr_v = _atr(candles[-15:], 14)
+        is_rejecting = last.close < last.open or upper_wick_last > atr_v * 0.3
+        if not is_rejecting:
             return None
         uth = (prev.high - r_h) / r_h * 100
+        bonus = 22 if r_pct < 8.0 else 20
         return PatternResult(
-            name="WYCKOFF_UPTHRUST", score_bonus=22,
+            name="WYCKOFF_UPTHRUST", score_bonus=bonus,
             confidence=0.80, direction="short",
             suggested_sl_pct=round((prev.high - last.close) / last.close * 100 + 0.3, 2),
             reasons=[f"Wyckoff Upthrust: диапазон {r_pct:.1f}%",
                      f"Upthrust +{uth:.2f}% выше сопротивления",
-                     "Низкий объём на upthrust — ложный пробой"],
+                     "Объём в норме — ложный пробой"],
         )
 
     # ── КЛАССИЧЕСКИЕ ПАТТЕРНЫ ─────────────────────────────────────────────────
