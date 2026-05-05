@@ -574,6 +574,19 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         except Exception:
             p4d = md.price_change_24h * 4
 
+        # 🆕 OKX Liquidations fallback — ПЕРЕД скорером, чтобы данные попали в md
+        if md.recent_liquidations_usd is None or md.liq_side is None:
+            try:
+                from api.okx_client import get_okx_client
+                okx_liq = await get_okx_client().get_liquidations(symbol)
+                if okx_liq:
+                    md.recent_liquidations_usd = okx_liq["total_usd"]
+                    md.liq_side = okx_liq["dominant_side"]
+                    if verbose:
+                        print(f"{log_prefix} 🔄 [OKX_LIQ] fallback: {okx_liq['dominant_side']} ${okx_liq['total_usd']:.0f}")
+            except Exception:
+                pass
+
         base_result = state.scorer.calculate_score(
             rsi_1h=md.rsi_1h or 50,
             funding_current=md.funding_rate / 100,
@@ -586,45 +599,44 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             patterns=patterns,
             volume_spike_ratio=getattr(md, "volume_spike_ratio", 1.0),
             atr_14_pct=getattr(md, "atr_14_pct", 0.5),
-            top_trader_ratio=getattr(md, "top_trader_long_short_ratio", None),  # 🆕
-            taker_ratio=getattr(md, "taker_buy_sell_ratio", None),              # 🆕
+            top_trader_ratio=getattr(md, "top_trader_long_short_ratio", None),
+            taker_ratio=getattr(md, "taker_buy_sell_ratio", None),
         )
-        if not base_result.is_valid:
+
+        # Fear & Greed макро-модификатор — применяем ДО проверки is_valid
+        fg = state.fear_greed_index
+        fg_modifier = 0
+        fg_reason = ""
+        if fg is not None:
+            if fg > 80:
+                fg_modifier, fg_reason = 6,  f"🧠 [F&G] {fg} Жадность → SHORT +6"
+            elif fg > 65:
+                fg_modifier, fg_reason = 3,  f"🧠 [F&G] {fg} Умеренная жадность → SHORT +3"
+            elif fg < 20:
+                fg_modifier, fg_reason = -5, f"🧠 [F&G] {fg} Экстремальный страх → SHORT -5"
+            elif fg < 35:
+                fg_modifier, fg_reason = -2, f"🧠 [F&G] {fg} Страх → SHORT -2"
+
+        raw_score      = base_result.total_score
+        effective_score = max(min(raw_score + fg_modifier, 100), 0)
+        min_score       = state.scorer.min_score
+
+        if verbose:
+            fg_str = f" F&G={fg_modifier:+d}" if fg_modifier != 0 else ""
+            print(f"{log_prefix} 📊 [BASE_SCORER] score={raw_score}{fg_str} → {effective_score} (min={min_score})"
+                  f" | components: {[(c.name, c.score) for c in base_result.components]}")
+
+        if effective_score < min_score:
             if verbose:
                 print(f"{log_prefix} ❌ [BASE_SCORER] is_valid=False — базовый скоринг отклонил")
+                if fg_reason: print(f"{log_prefix} {fg_reason}")
             return None
 
+        if verbose and fg_reason:
+            print(f"{log_prefix} {fg_reason}")
+
         price      = md.price
-        base_score = base_result.total_score
-
-        # 🆕 Fear & Greed макро-модификатор (глобальный, обновляется каждые 30 мин)
-        fg = state.fear_greed_index
-        if fg is not None:
-            if fg > 80:    # Жадность — рынок перегрет, SHORT благоприятен
-                base_score = min(base_score + 6, 100)
-                if verbose: print(f"{log_prefix} 🧠 [F&G] {fg} Жадность → SHORT +6")
-            elif fg > 65:
-                base_score = min(base_score + 3, 100)
-                if verbose: print(f"{log_prefix} 🧠 [F&G] {fg} Умеренная жадность → SHORT +3")
-            elif fg < 20:  # Экстремальный страх — шортить опасно (потенциальный отскок)
-                base_score = max(base_score - 5, 0)
-                if verbose: print(f"{log_prefix} 🧠 [F&G] {fg} Экстремальный страх → SHORT -5")
-            elif fg < 35:
-                base_score = max(base_score - 2, 0)
-                if verbose: print(f"{log_prefix} 🧠 [F&G] {fg} Страх → SHORT -2")
-
-        # 🆕 OKX Liquidations fallback (если Binance liq данные недоступны)
-        if md.recent_liquidations_usd is None or md.liq_side is None:
-            try:
-                from api.okx_client import get_okx_client
-                okx_liq = await get_okx_client().get_liquidations(symbol)
-                if okx_liq:
-                    md.recent_liquidations_usd = okx_liq["total_usd"]
-                    md.liq_side = okx_liq["dominant_side"]
-                    if verbose:
-                        print(f"{log_prefix} 🔄 [OKX_LIQ] fallback: {okx_liq['dominant_side']} ${okx_liq['total_usd']:.0f}")
-            except Exception:
-                pass
+        base_score = effective_score
         
         # 🆕 Консолидация фильтр — блокировка входов в середине диапазона
         if state.consolidation_detector and ohlcv_15m:
@@ -649,8 +661,8 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         # Apply MTF bonus to base_score
         if _mtf_bonus != 0:
             base_score = min(base_score + _mtf_bonus, 100)
-        if verbose:
-            print(f"{log_prefix} 📊 [BASE_SCORER] score={base_score:.1f} | MTF={_mtf_bonus:+d} | reasons: {list(base_result.reasons)[:3]}")
+        if verbose and _mtf_bonus != 0:
+            print(f"{log_prefix} 📊 [BASE_SCORER+MTF] score={base_score:.1f} | MTF={_mtf_bonus:+d} | reasons: {list(base_result.reasons)[:3]}")
 
         # ── SHORT-специфичные фильтры (сохраняем) ──
         sf   = get_short_filter()
@@ -1019,16 +1031,15 @@ async def background_scanner():
 
 
 async def _fear_greed_task():
-    """🆕 Fear & Greed Index polling — обновляем каждые 30 мин."""
-    from api.coinmarketcap_client import get_cmc_client
-    cmc = get_cmc_client()
+    """Fear & Greed Index polling — обновляем каждые 30 мин (alternative.me, без ключа)."""
+    from core.fear_greed import get_fear_greed
+    fg_cache = get_fear_greed()
     while state.is_running:
         try:
-            fg = await cmc.get_fear_greed_index()
-            if fg:
-                state.fear_greed_index = fg["value"]
-                cls = fg.get("classification", "?")
-                print(f"🧠 Fear & Greed: {state.fear_greed_index} ({cls})")
+            value = await fg_cache.get()
+            if value is not None:
+                state.fear_greed_index = value
+                print(f"🧠 Fear & Greed: {value} ({fg_cache.label})")
         except Exception as e:
             pass  # некритично — продолжаем без F&G
         await asyncio.sleep(1800)  # 30 минут
