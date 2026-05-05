@@ -5,10 +5,13 @@ CoinMarketCap API Client
 
 import os
 import asyncio
+import logging
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
 from datetime import datetime
 import aiohttp
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -215,12 +218,28 @@ class CoinMarketCapClient:
     
     async def get_fear_greed_index(self) -> Optional[Dict]:
         """
-        Получить Fear & Greed Index (если доступен)
-        Альтернатива: alternative.me API
+        Fear & Greed Index через alternative.me (бесплатно, без ключа).
+        Возвращает: {"value": 42, "classification": "Fear", "timestamp": ...}
+        Обновляется раз в сутки на источнике — кэшируем 30 мин.
         """
-        # CMC не предоставляет F&G напрямую
-        # Вернём заглушку, можно добавить alternative.me позже
-        return None
+        try:
+            session = await self._get_session()
+            url = "https://api.alternative.me/fng/?limit=1"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+                entry = data.get("data", [{}])[0]
+                if not entry:
+                    return None
+                return {
+                    "value":          int(entry.get("value", 50)),
+                    "classification": entry.get("value_classification", "Neutral"),
+                    "timestamp":      entry.get("timestamp", ""),
+                }
+        except Exception as e:
+            logger.debug(f"F&G request error: {e}")
+            return None
     
     async def get_futures_data(self, symbol: str) -> Optional[Dict]:
         """

@@ -179,6 +179,7 @@ class BotState:
         self.wyckoff_detector:    Optional[WyckoffAccumulationDetector] = None
         self.bsl_scanner:         Optional[BSLScanner]              = None
         self.oi_analyzer:         Optional[OIAnalyzerLong]          = None
+        self.fear_greed_index: Optional[int] = None   # 🆕 0-100
 
 
 state = BotState()
@@ -408,6 +409,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(background_scanner())
     asyncio.create_task(state.tracker.run())
     asyncio.create_task(_daily_report_task())
+    asyncio.create_task(_fear_greed_task())   # 🆕 F&G polling
 
     yield
 
@@ -593,6 +595,8 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             volume_spike_ratio=getattr(md, "volume_spike_ratio", 1.0),
             atr_14_pct=getattr(md, "atr_14_pct", 0.5),
             price_change_1h=getattr(md, "price_change_1h", 0.0),
+            top_trader_ratio=getattr(md, "top_trader_long_short_ratio", None),  # 🆕
+            taker_ratio=getattr(md, "taker_buy_sell_ratio", None),              # 🆕
         )
         if not base_result.is_valid:
             if verbose:
@@ -601,6 +605,35 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
 
         price      = md.price
         base_score = base_result.total_score
+
+        # 🆕 Fear & Greed макро-модификатор
+        fg = state.fear_greed_index
+        if fg is not None:
+            if fg < 20:    # Экстремальный страх — LONG благоприятен (все продают = покупай)
+                base_score = min(base_score + 6, 100)
+                if verbose: print(f"{log_prefix} 🧠 [F&G] {fg} Экстремальный страх → LONG +6")
+            elif fg < 35:
+                base_score = min(base_score + 3, 100)
+                if verbose: print(f"{log_prefix} 🧠 [F&G] {fg} Страх → LONG +3")
+            elif fg > 80:  # Жадность — лонговать опасно
+                base_score = max(base_score - 5, 0)
+                if verbose: print(f"{log_prefix} 🧠 [F&G] {fg} Жадность → LONG -5")
+            elif fg > 65:
+                base_score = max(base_score - 2, 0)
+                if verbose: print(f"{log_prefix} 🧠 [F&G] {fg} Умеренная жадность → LONG -2")
+
+        # 🆕 OKX Liquidations fallback
+        if md.recent_liquidations_usd is None or md.liq_side is None:
+            try:
+                from api.okx_client import get_okx_client
+                okx_liq = await get_okx_client().get_liquidations(symbol)
+                if okx_liq:
+                    md.recent_liquidations_usd = okx_liq["total_usd"]
+                    md.liq_side = okx_liq["dominant_side"]
+                    if verbose:
+                        print(f"{log_prefix} 🔄 [OKX_LIQ] fallback: {okx_liq['dominant_side']} ${okx_liq['total_usd']:.0f}")
+            except Exception:
+                pass
         
         # 🆕 Консолидация фильтр — блокировка входов в середине диапазона
         if state.consolidation_detector and ohlcv_15m:
@@ -932,6 +965,22 @@ async def background_scanner():
             except Exception as e:
                 print(f"Scanner error: {e}")
         await asyncio.sleep(Config.SCAN_INTERVAL)
+
+
+async def _fear_greed_task():
+    """🆕 Fear & Greed Index polling — обновляем каждые 30 мин."""
+    from api.coinmarketcap_client import get_cmc_client
+    cmc = get_cmc_client()
+    while state.is_running:
+        try:
+            fg = await cmc.get_fear_greed_index()
+            if fg:
+                state.fear_greed_index = fg["value"]
+                cls = fg.get("classification", "?")
+                print(f"🧠 Fear & Greed: {state.fear_greed_index} ({cls})")
+        except Exception:
+            pass
+        await asyncio.sleep(1800)
 
 
 async def _daily_report_task():

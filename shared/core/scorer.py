@@ -171,6 +171,68 @@ class BaseScorer:
             return -3, f"Высокая волатильность ATR={atr_pct:.1f}% -3"
         return 0, ""
 
+    def calculate_top_trader_component(
+        self,
+        top_trader_ratio: Optional[float],
+        direction: str,
+    ) -> ScoreComponent:
+        """
+        Smart money позиционирование топ-трейдеров (Binance /fapi/v1/topLongShortPositionRatio).
+        top_trader_ratio = long_vol / short_vol.
+        Значение > 1.0 = топ-трейдеры в лонге, < 1.0 = в шорте.
+
+        Отличие от retail L/S:
+          - Retail L/S → contrarian (толпа в лонге = шорти)
+          - Top Trader L/S → directional (smart money в шорте = шорти вместе)
+
+        Max score: 10 (дополнительный компонент, не заменяет retail ratio)
+        """
+        if top_trader_ratio is None:
+            return ScoreComponent("TopTrader", 0, 10, "Нет данных топ-трейдеров", 0)
+
+        if direction == "short":
+            # Для SHORT: топ-трейдеры в шорте = хороший знак
+            if top_trader_ratio <= 0.6:   score, desc = 10, f"🐋 Топ-трейдеры {top_trader_ratio:.2f} — активно шортят"
+            elif top_trader_ratio <= 0.8: score, desc = 7,  f"Топ-трейдеры {top_trader_ratio:.2f} — шорт перевес"
+            elif top_trader_ratio <= 1.0: score, desc = 4,  f"Топ-трейдеры {top_trader_ratio:.2f} — нейтраль"
+            elif top_trader_ratio <= 1.3: score, desc = 2,  f"Топ-трейдеры {top_trader_ratio:.2f} — лёгкий лонг"
+            else:                          score, desc = 0,  f"Топ-трейдеры {top_trader_ratio:.2f} — в лонге (осторожно)"
+        else:
+            # Для LONG: топ-трейдеры в лонге = хороший знак
+            if top_trader_ratio >= 1.7:   score, desc = 10, f"🐋 Топ-трейдеры {top_trader_ratio:.2f} — активно лонгуют"
+            elif top_trader_ratio >= 1.3: score, desc = 7,  f"Топ-трейдеры {top_trader_ratio:.2f} — лонг перевес"
+            elif top_trader_ratio >= 1.0: score, desc = 4,  f"Топ-трейдеры {top_trader_ratio:.2f} — нейтраль"
+            elif top_trader_ratio >= 0.8: score, desc = 2,  f"Топ-трейдеры {top_trader_ratio:.2f} — лёгкий шорт"
+            else:                          score, desc = 0,  f"Топ-трейдеры {top_trader_ratio:.2f} — в шорте (осторожно)"
+
+        return ScoreComponent("TopTrader", score, 10, desc, top_trader_ratio)
+
+    def _taker_bonus(self, taker_ratio: Optional[float], direction: str) -> Tuple[int, str]:
+        """
+        Бонус за Taker Buy/Sell ratio (агрессивные ордера).
+        taker_ratio = buy_volume / (buy_volume + sell_volume), 0.0-1.0.
+        > 0.5 = покупатели агрессивнее, < 0.5 = продавцы агрессивнее.
+
+        Добавляется к итоговому скору (не компонент, а бонус — аналог volume spike).
+        Max ±5.
+        """
+        if taker_ratio is None:
+            return 0, ""
+        if direction == "short":
+            # SHORT: продавцы агрессивнее → подтверждение давления
+            if taker_ratio <= 0.35:   return 5, f"🔴 Taker sell {(1-taker_ratio)*100:.0f}% — продавцы доминируют +5"
+            elif taker_ratio <= 0.42: return 3, f"Taker sell перевес {(1-taker_ratio)*100:.0f}% +3"
+            elif taker_ratio <= 0.48: return 1, f"Taker нейтраль +1"
+            elif taker_ratio >= 0.60: return -2, f"Taker buy {taker_ratio*100:.0f}% — покупают (осторожно) -2"
+            return 0, ""
+        else:
+            # LONG: покупатели агрессивнее → подтверждение спроса
+            if taker_ratio >= 0.65:   return 5, f"🟢 Taker buy {taker_ratio*100:.0f}% — покупатели доминируют +5"
+            elif taker_ratio >= 0.58: return 3, f"Taker buy перевес {taker_ratio*100:.0f}% +3"
+            elif taker_ratio >= 0.52: return 1, f"Taker нейтраль +1"
+            elif taker_ratio <= 0.40: return -2, f"Taker sell {(1-taker_ratio)*100:.0f}% — продают (осторожно) -2"
+            return 0, ""
+
     def calculate_liquidation_component(
         self, 
         liq_analysis: Optional[LiquidationAnalysis]
@@ -307,7 +369,9 @@ class ShortScorer(BaseScorer):
                         long_ratio, oi_change_4d, price_change_4d,
                         hourly_deltas, price_trend, patterns,
                         volume_spike_ratio: float = 1.0,
-                        atr_14_pct: float = 0.5) -> ScoreResult:
+                        atr_14_pct: float = 0.5,
+                        top_trader_ratio: Optional[float] = None,
+                        taker_ratio: Optional[float] = None) -> ScoreResult:
         components = []
         components.append(self.calculate_rsi_component(rsi_1h))
         components.append(self.calculate_funding_component(funding_current, funding_accumulated))
@@ -316,6 +380,8 @@ class ShortScorer(BaseScorer):
         components.append(self.calculate_delta_component(hourly_deltas, price_trend))
         pat_comp, pat_names = self.calculate_pattern_component(patterns)
         components.append(pat_comp)
+        # 🆕 Top Trader component
+        components.append(self.calculate_top_trader_component(top_trader_ratio, "short"))
         total = sum(c.score for c in components)
         max_p = sum(c.max_score for c in components)
         # Confluence bonus
@@ -328,6 +394,9 @@ class ShortScorer(BaseScorer):
         # ATR penalty
         atr_pen, atr_reason = self._atr_penalty(atr_14_pct)
         total += atr_pen
+        # 🆕 Taker flow bonus
+        tk_bonus, tk_reason = self._taker_bonus(taker_ratio, "short")
+        total += tk_bonus
         total = min(max(total, 0), 100)
         reasons = []
         if components[0].score >= 15: reasons.append(f"RSI перекуплен ({rsi_1h:.1f})")
@@ -336,8 +405,10 @@ class ShortScorer(BaseScorer):
         if components[3].score >= 10: reasons.append("Лонги перегружены (OI растёт)")
         if components[4].score >= 10: reasons.append("Медвежья дивергенция")
         if components[5].score >= 20: reasons.append(f"Сильный паттерн: {pat_names[0] if pat_names else 'N/A'}")
+        if components[6].score >= 7:  reasons.append(components[6].description)
         if vs_reason: reasons.append(vs_reason)
         if atr_reason: reasons.append(atr_reason)
+        if tk_reason: reasons.append(tk_reason)
         return ScoreResult(
             total_score=total, max_possible=max_p, direction=Direction.SHORT,
             is_valid=total >= self.min_score,
@@ -452,7 +523,9 @@ class LongScorer(BaseScorer):
                         hourly_deltas, price_trend, patterns,
                         volume_spike_ratio: float = 1.0,
                         atr_14_pct: float = 0.5,
-                        price_change_1h: float = 0.0) -> ScoreResult:
+                        price_change_1h: float = 0.0,
+                        top_trader_ratio: Optional[float] = None,
+                        taker_ratio: Optional[float] = None) -> ScoreResult:
         components = []
         components.append(self.calculate_rsi_component(rsi_1h, price_change_1h))
         components.append(self.calculate_funding_component(funding_current, funding_accumulated))
@@ -461,6 +534,8 @@ class LongScorer(BaseScorer):
         components.append(self.calculate_delta_component(hourly_deltas, price_trend))
         pat_comp, pat_names = self.calculate_pattern_component(patterns)
         components.append(pat_comp)
+        # 🆕 Top Trader component
+        components.append(self.calculate_top_trader_component(top_trader_ratio, "long"))
         total = sum(c.score for c in components)
         max_p = sum(c.max_score for c in components)
         strong = sum(1 for c in components if c.score >= c.max_score * 0.6)
@@ -470,6 +545,9 @@ class LongScorer(BaseScorer):
         total += vs_bonus
         atr_pen, atr_reason = self._atr_penalty(atr_14_pct)
         total += atr_pen
+        # 🆕 Taker flow bonus
+        tk_bonus, tk_reason = self._taker_bonus(taker_ratio, "long")
+        total += tk_bonus
         total = min(max(total, 0), 100)
         reasons = []
         if components[0].score >= 15: reasons.append(f"RSI перепродан ({rsi_1h:.1f})")
@@ -478,8 +556,10 @@ class LongScorer(BaseScorer):
         if components[3].score >= 10: reasons.append("Шорты закрываются (OI падает)")
         if components[4].score >= 10: reasons.append("Бычья дивергенция")
         if components[5].score >= 20: reasons.append(f"Сильный паттерн: {pat_names[0] if pat_names else 'N/A'}")
+        if components[6].score >= 7:  reasons.append(components[6].description)
         if vs_reason: reasons.append(vs_reason)
         if atr_reason: reasons.append(atr_reason)
+        if tk_reason: reasons.append(tk_reason)
         return ScoreResult(
             total_score=total, max_possible=max_p, direction=Direction.LONG,
             is_valid=total >= self.min_score,

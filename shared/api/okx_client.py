@@ -80,6 +80,59 @@ class OKXClient:
     # Public methods
     # ─────────────────────────────────────────────
 
+    async def get_liquidations(self, symbol: str, limit: int = 20) -> Optional[Dict]:
+        """
+        Ликвидации с OKX (/public/liquidation-orders).
+        Fallback когда Binance/Coinglass недоступны.
+
+        Возвращает: {
+            "total_usd":      float,  # суммарный объём ликвидаций USD
+            "long_usd":       float,  # ликвидации лонгов
+            "short_usd":      float,  # ликвидации шортов
+            "dominant_side":  str,    # "long" | "short" | "neutral"
+            "count":          int,
+        }
+        """
+        okx_sym = self._to_okx_symbol(symbol)
+        data = await self._get(
+            "/public/liquidation-orders",
+            {"instType": "SWAP", "instId": okx_sym, "state": "filled"}
+        )
+        if not data or not data.get("data"):
+            return None
+
+        orders = data["data"]
+        long_usd = short_usd = 0.0
+        for order in orders[:limit]:
+            # OKX: side="buy" = ликвидация шорта, side="sell" = ликвидация лонга
+            try:
+                sz    = float(order.get("sz", 0))
+                px    = float(order.get("bkPx", 0))   # bankruptcy price
+                usd   = sz * px
+                side  = order.get("side", "")
+                if side == "sell":    long_usd  += usd  # лонг ликвидирован
+                elif side == "buy":   short_usd += usd  # шорт ликвидирован
+            except (ValueError, TypeError):
+                continue
+
+        total_usd = long_usd + short_usd
+        if total_usd == 0:
+            return None
+
+        dominant = (
+            "long"    if long_usd  > short_usd * 1.5 else
+            "short"   if short_usd > long_usd  * 1.5 else
+            "neutral"
+        )
+        return {
+            "total_usd":     round(total_usd, 2),
+            "long_usd":      round(long_usd, 2),
+            "short_usd":     round(short_usd, 2),
+            "dominant_side": dominant,
+            "count":         len(orders),
+            "source":        "okx",
+        }
+
     async def get_open_interest(self, symbol: str) -> Optional[OKXOIData]:
         """
         Получить OI с OKX для символа (BTCUSDT формат).
