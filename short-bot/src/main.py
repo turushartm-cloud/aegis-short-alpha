@@ -618,12 +618,13 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 fg_modifier, fg_reason = -2, f"🧠 [F&G] {fg} Страх → SHORT -2"
 
         raw_score      = base_result.total_score
-        effective_score = max(min(raw_score + fg_modifier, 100), 0)
+        effective_score = max(min(raw_score + fg_modifier + _mtf_bonus, 100), 0)
         min_score       = state.scorer.min_score
 
         if verbose:
-            fg_str = f" F&G={fg_modifier:+d}" if fg_modifier != 0 else ""
-            print(f"{log_prefix} 📊 [BASE_SCORER] score={raw_score}{fg_str} → {effective_score} (min={min_score})"
+            fg_str  = f" F&G={fg_modifier:+d}" if fg_modifier != 0 else ""
+            mtf_str = f" MTF={_mtf_bonus:+d}"  if _mtf_bonus  != 0 else ""
+            print(f"{log_prefix} 📊 [BASE_SCORER] score={raw_score}{fg_str}{mtf_str} → {effective_score} (min={min_score})"
                   f" | components: {[(c.name, c.score) for c in base_result.components]}")
 
         if effective_score < min_score:
@@ -658,12 +659,6 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 if verbose:
                     print(f"{log_prefix} ✅ [BREAKOUT] +8 — пробой консолидации")
         
-        # Apply MTF bonus to base_score
-        if _mtf_bonus != 0:
-            base_score = min(base_score + _mtf_bonus, 100)
-        if verbose and _mtf_bonus != 0:
-            print(f"{log_prefix} 📊 [BASE_SCORER+MTF] score={base_score:.1f} | MTF={_mtf_bonus:+d} | reasons: {list(base_result.reasons)[:3]}")
-
         # ── SHORT-специфичные фильтры (сохраняем) ──
         sf   = get_short_filter()
         filt = sf.check(
