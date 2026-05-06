@@ -576,14 +576,29 @@ class LongScorer(BaseScorer):
 _short_scorer = None
 _long_scorer  = None
 
-def get_short_scorer(min_score: int = 65) -> ShortScorer:
+def get_short_scorer(min_score: int = 54) -> ShortScorer:
+    """
+    Синглтон ShortScorer.
+    Дефолт 54 совпадает с ShortScorer.__init__ — чтобы не было
+    расхождения при вызове без явного min_score.
+    """
     global _short_scorer
     if _short_scorer is None:
         _short_scorer = ShortScorer(min_score)
     return _short_scorer
 
-def get_long_scorer(min_score: int = 65) -> LongScorer:
+def get_long_scorer(min_score: int = 55) -> LongScorer:
+    """
+    Синглтон LongScorer.
+    Дефолт 55 совпадает с LongScorer.__init__.
+    """
     global _long_scorer
     if _long_scorer is None:
         _long_scorer = LongScorer(min_score)
     return _long_scorer
+
+def reset_scorers() -> None:
+    """Сброс синглтонов — для тестов и перезапуска с новым min_score."""
+    global _short_scorer, _long_scorer
+    _short_scorer = None
+    _long_scorer  = None

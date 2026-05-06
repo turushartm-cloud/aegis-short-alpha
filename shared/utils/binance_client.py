@@ -275,8 +275,13 @@ class BinanceFuturesClient:
                         BinanceFuturesClient._bybit_blocked_at = time.time()
                         print("⛔ Bybit geo-blocked (403). Falling back to Binance proxy.")
                     return None
+                logger.warning(f"[Bybit] HTTP {resp.status} | {endpoint} | params={params}")
                 return None
-        except Exception:
+        except asyncio.TimeoutError:
+            logger.warning(f"[Bybit] TIMEOUT | {endpoint}")
+            return None
+        except Exception as e:
+            logger.debug(f"[Bybit] ERROR | {endpoint} | {type(e).__name__}: {e}")
             return None
 
     async def _binance(self, endpoint: str, params: Dict = None) -> Optional[Any]:
@@ -293,8 +298,16 @@ class BinanceFuturesClient:
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
+                # ── Логируем HTTP-ошибки (раньше глотались молча) ──
+                logger.warning(
+                    f"[Binance] HTTP {resp.status} | {endpoint} | proxy={proxy} | params={params}"
+                )
                 return None
-        except Exception:
+        except asyncio.TimeoutError:
+            logger.warning(f"[Binance] TIMEOUT | {endpoint} | proxy={proxy}")
+            return None
+        except Exception as e:
+            logger.warning(f"[Binance] ERROR | {endpoint} | proxy={proxy} | {type(e).__name__}: {e}")
             return None
 
     async def _req(self, binance_ep: str, bybit_ep: str,
@@ -602,15 +615,24 @@ class BinanceFuturesClient:
         0.0 = все продают агрессивно, 1.0 = все покупают агрессивно.
         """
         await self._init_source()
-        if self._use_binance:
+        if not self._use_binance:
+            logger.debug(f"[TakerRatio] {symbol}: Binance недоступен, пропускаем")
+            return None
+        try:
             d = await self._binance("/futures/data/takerBuySellVolRatio",
                                     {"symbol": symbol, "period": period, "limit": 1})
             if d and len(d) > 0:
-                buy_vol = float(d[0].get("buyVol", 0))
+                buy_vol  = float(d[0].get("buyVol",  0))
                 sell_vol = float(d[0].get("sellVol", 0))
                 total = buy_vol + sell_vol
-                return buy_vol / total if total > 0 else None
-        return None
+                ratio = buy_vol / total if total > 0 else None
+                logger.debug(f"[TakerRatio] {symbol}: buy={buy_vol:.0f} sell={sell_vol:.0f} → ratio={ratio}")
+                return ratio
+            logger.warning(f"[TakerRatio] {symbol}: пустой ответ API")
+            return None
+        except Exception as e:
+            logger.warning(f"[TakerRatio] {symbol}: ошибка — {type(e).__name__}: {e}")
+            return None
 
     async def get_liquidations(self, symbol: str,
                                 limit: int = 100) -> Optional[Dict]:
@@ -655,14 +677,25 @@ class BinanceFuturesClient:
         >1.5 = топы в лонгах, <0.8 = топы в шортах.
         """
         await self._init_source()
-        if self._use_binance:
+        if not self._use_binance:
+            logger.debug(f"[TopTrader] {symbol}: Binance недоступен, пропускаем")
+            return None
+        try:
             d = await self._binance("/futures/data/topLongShortPositionRatio",
                                     {"symbol": symbol, "period": period, "limit": 1})
             if d and len(d) > 0:
-                long_pos = float(d[0].get("longPosition", 0))
+                long_pos  = float(d[0].get("longPosition",  0))
                 short_pos = float(d[0].get("shortPosition", 0))
-                return long_pos / short_pos if short_pos > 0 else None
-        return None
+                ratio = long_pos / short_pos if short_pos > 0 else None
+                logger.debug(
+                    f"[TopTrader] {symbol}: long={long_pos:.3f} short={short_pos:.3f} → ratio={ratio}"
+                )
+                return ratio
+            logger.warning(f"[TopTrader] {symbol}: пустой ответ API (d={d!r})")
+            return None
+        except Exception as e:
+            logger.warning(f"[TopTrader] {symbol}: ошибка — {type(e).__name__}: {e}")
+            return None
 
     # =========================================================================
     # VOLUME PROFILE

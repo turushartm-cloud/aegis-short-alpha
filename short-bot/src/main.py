@@ -65,7 +65,7 @@ print(f"📁 shared: {_SHARED} | src: {_SRC}")
 # ── Shared modules (existing) ──
 from upstash.redis_client import get_redis_client
 from utils.binance_client import get_binance_client
-from core.scorer import get_short_scorer
+from core.scorer import get_short_scorer, reset_scorers
 from core.pattern_detector import ShortPatternDetector
 from core.position_tracker import PositionTracker
 from core.short_filter import get_short_filter, get_short_tp_config
@@ -268,6 +268,10 @@ async def lifespan(app: FastAPI):
     # BASE_SCORER получает мягкий порог (50) — строгий порог у AEGIS (65)
     _short_base_min = int(os.getenv("MIN_SHORT_BASE_SCORE", "50"))
     state.scorer           = get_short_scorer(_short_base_min)
+    print(
+        f"📐 Score thresholds: BASE_SCORER={_short_base_min} | "
+        f"AEGIS_ENGINE={Config.MIN_SCORE} | FINAL_FILTER={Config.MIN_SCORE}"
+    )
     state.pattern_detector = ShortPatternDetector()
     
     # 🆕 Consolidation Detector — блокировка входов в середине диапазона
@@ -566,6 +570,26 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         price_trend   = state.pattern_detector._get_price_trend(ohlcv_15m)
         patterns      = state.pattern_detector.detect_all(ohlcv_15m, hourly_deltas, md)
 
+        # ── PRE-SCORE LOG: все данные перед скорингом ─────────────────
+        if verbose:
+            top_trader_val = getattr(md, "top_trader_long_short_ratio", None)
+            taker_val      = getattr(md, "taker_buy_sell_ratio",       None)
+            print(
+                f"{log_prefix} 📋 [PRE-SCORE DATA] "
+                f"rsi={md.rsi_1h:.1f} | funding={md.funding_rate:.4f}% | "
+                f"acc_funding={md.funding_accumulated:.4f}% | "
+                f"L/S={md.long_short_ratio:.1f}% | "
+                f"OI_4d={md.oi_change_4d:.1f}% | "
+                f"vol_spike={getattr(md,'volume_spike_ratio',1.0):.2f}x | "
+                f"atr={getattr(md,'atr_14_pct',0.5):.2f}% | "
+                f"top_trader={'%.2f' % top_trader_val if top_trader_val is not None else '⚠️ None'} | "
+                f"taker={'%.2f' % taker_val if taker_val is not None else '⚠️ None'} | "
+                f"price_trend={price_trend} | "
+                f"patterns={[p.name for p in patterns]} | "
+                f"hourly_deltas({len(hourly_deltas)})={[round(d,0) for d in hourly_deltas[-5:]]}"
+            )
+        # ─────────────────────────────────────────────────────────────
+
         p4d = 0.0
         try:
             klines = await state.binance.get_klines(symbol, "1d", 6)
@@ -764,6 +788,8 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                     }
                 else:
                     # Aegis отклонил — не генерируем
+                    if verbose:
+                        print(f"{log_prefix} ❌ [AEGIS] сигнал отклонён движком (base_score={base_score:.1f})")
                     return None
             except Exception as e:
                 print(f"AegisEngine error {symbol}: {e}")

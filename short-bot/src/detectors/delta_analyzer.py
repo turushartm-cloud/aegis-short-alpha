@@ -24,6 +24,7 @@ class DeltaAnalyzer:
         score = 0.0
 
         if not ohlcv or len(ohlcv) < 10:
+            logger.warning(f"[Delta] {symbol}: недостаточно данных (len={len(ohlcv) if ohlcv else 0})")
             return {"score": 25.0, "reasons": ["Delta: недостаточно данных"],
                     "metadata": {}}
 
@@ -54,6 +55,11 @@ class DeltaAnalyzer:
             bear_candles = sum(1 for c in ohlcv[-10:] if c.close < c.open)
             bear_ratio   = bear_candles / 10
 
+            logger.debug(
+                f"[Delta] {symbol}: cvd_5={cvd_5:.0f} cvd_10={cvd_10:.0f} cvd_total={cvd_total:.0f} "
+                f"bear={bear_candles}/10 bear_flow={bear_flow_pct:.1f}%"
+            )
+
             # Скоринг
             if cvd_5 < 0 and cvd_10 < 0:
                 score += 40; reasons.append(f"CVD медвежий: 5c={cvd_5:.0f} 10c={cvd_10:.0f}")
@@ -77,6 +83,8 @@ class DeltaAnalyzer:
 
             score = min(max(score, 0), 100)
 
+            logger.debug(f"[Delta] {symbol}: итоговый score={score:.1f}")
+
             return {
                 "score":   round(score, 1),
                 "reasons": reasons,
@@ -90,7 +98,7 @@ class DeltaAnalyzer:
             }
 
         except Exception as e:
-            logger.warning(f"delta_analyze error {symbol}: {e}")
+            logger.warning(f"[Delta] {symbol}: ошибка расчёта — {type(e).__name__}: {e}")
             return {"score": 25.0, "reasons": ["Delta: ошибка расчёта"], "metadata": {}}
 
 
