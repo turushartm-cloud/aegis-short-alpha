@@ -863,6 +863,8 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 "Funding":  f"{md.funding_rate:+.3f}%",
                 "L/S":      f"{md.long_short_ratio:.0f}% longs",
                 "OI 4d":    f"{md.oi_change_4d:+.1f}%",
+                "OI 1h":    f"{getattr(md,'oi_change_1h',0.0):+.1f}%",
+                "OI 4h":    f"{getattr(md,'oi_change_4h',0.0):+.1f}%",
                 "Price 4d": f"{p4d:+.1f}%",
             },
             "aegis_components": aegis_components,
