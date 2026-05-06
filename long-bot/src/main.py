@@ -180,6 +180,7 @@ class BotState:
         self.bsl_scanner:         Optional[BSLScanner]              = None
         self.oi_analyzer:         Optional[OIAnalyzerLong]          = None
         self.fear_greed_index: Optional[int] = None   # 🆕 0-100
+        self.btc_change_1h:    Optional[float] = None  # ✅ FIX #5: кешируем BTC 1h для delta scorer
 
 
 state = BotState()
@@ -574,6 +575,33 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         price_trend   = state.pattern_detector._get_price_trend(ohlcv_15m)
         patterns      = state.pattern_detector.detect_all(ohlcv_15m, hourly_deltas, md)
 
+        # ✅ FIX #6: Wyckoff результат конвертируется в PatternResult для scorer
+        # Ранее Wyckoff давал бонус только внутри signal_engine, но не попадал в
+        # LongScorer.calculate_pattern_component() → ACCUMULATION всегда = 0
+        if state.wyckoff_detector and ohlcv_15m:
+            try:
+                from core.pattern_detector import PatternResult
+                wy_result = await state.wyckoff_detector.analyze(symbol, ohlcv_15m, md)
+                wy_score  = wy_result.get("score", 0) if wy_result else 0
+                wy_phase  = wy_result.get("phase", "unknown") if wy_result else "unknown"
+                wy_event  = wy_result.get("event", "") if wy_result else ""
+                if wy_score >= 40 and wy_phase in ("C", "D"):
+                    # Фаза C (Spring) или D (SOS/LPS) → WYCKOFF_SPRING или ACCUMULATION
+                    pat_name = "WYCKOFF_SPRING" if wy_event in ("SPRING", "LPS") else "ACCUMULATION"
+                    bonus    = min(int(wy_score * 0.3), 22)  # макс 22 = ACCUMULATION strength
+                    patterns.append(PatternResult(
+                        name=pat_name,
+                        score_bonus=bonus,
+                        confidence=min(wy_score / 100, 0.85),
+                        direction="long",
+                        reasons=[f"Wyckoff phase={wy_phase} event={wy_event} score={wy_score:.0f}"],
+                    ))
+                    if verbose:
+                        print(f"{log_prefix} ✅ [WYCKOFF→PATTERN] {pat_name} score={bonus} phase={wy_phase} event={wy_event}")
+            except Exception as _wy_e:
+                if verbose:
+                    print(f"{log_prefix} ⚠️ [WYCKOFF→PATTERN] {_wy_e}")
+
         p4d = 0.0
         try:
             klines = await state.binance.get_klines(symbol, "1d", 6)
@@ -611,6 +639,8 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             price_change_1h=getattr(md, "price_change_1h", 0.0),
             top_trader_ratio=getattr(md, "top_trader_long_short_ratio", None),
             taker_ratio=getattr(md, "taker_buy_sell_ratio", None),
+            # ✅ FIX #5: BTC 1h изменение для определения относительной слабости
+            btc_change_1h=state.btc_change_1h or 0.0,
         )
 
         # Fear & Greed макро-модификатор — применяем ДО проверки is_valid
@@ -652,7 +682,9 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         # 🆕 Консолидация фильтр — блокировка входов в середине диапазона
         if state.consolidation_detector and ohlcv_15m:
             cons = state.consolidation_detector.detect(ohlcv_15m, price)
-            allow, reason = filter_mid_range(cons, price, "long", verbose=False)
+            # ✅ FIX #4: передаём RSI 1H для исключения при экстремальной перепроданности
+            rsi_1h_val = getattr(md, "rsi_1h", 50.0) or 50.0
+            allow, reason = filter_mid_range(cons, price, "long", verbose=False, rsi_1h=rsi_1h_val)
             
             if cons.is_consolidating and not allow:
                 if verbose:
@@ -882,6 +914,8 @@ async def scan_market():
 
     # BTC data (главный фильтр для Long)
     _btc_cache_1h: Optional[float] = await _get_btc_change()
+    # ✅ FIX #5: сохраняем в state для delta scorer
+    state.btc_change_1h = _btc_cache_1h
 
     # BTC correlation score adjustment (Long — ПОЗИТИВНАЯ корреляция)
     btc_adj = 0

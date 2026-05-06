@@ -18,11 +18,15 @@ Market Data Client v2.1 — Bybit (основной) + Binance через про
 import os
 import asyncio
 import aiohttp
+import logging
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from datetime import datetime
 import time
 import statistics
+
+# ✅ FIX #1: logger был не определён → NameError на всех Binance API вызовах
+logger = logging.getLogger("aegis.binance")
 
 
 @dataclass
@@ -580,9 +584,16 @@ class BinanceFuturesClient:
         return []
 
     async def get_oi_change(self, symbol: str, days: int = 4) -> float:
+        # ✅ FIX #2: для новых/малых альтов "1d" даёт < 2 записей → fallback на "4h"
         history = await self.get_open_interest_history(symbol, "1d", days + 1)
         if not history or len(history) < 2:
-            return 0.0
+            # Fallback: берём 4h свечи (6 свечей = ~1 день), нормализуем к дням
+            logger.debug(f"[OI] {symbol}: '1d' вернул {len(history) if history else 0} записей, fallback → '4h'")
+            history_4h = await self.get_open_interest_history(symbol, "4h", (days + 1) * 6)
+            if not history_4h or len(history_4h) < 2:
+                logger.debug(f"[OI] {symbol}: '4h' тоже пустой → 0.0")
+                return 0.0
+            history = history_4h
         old = float(history[0].get("sumOpenInterest", 0))
         new = float(history[-1].get("sumOpenInterest", 0))
         return round((new - old) / old * 100, 2) if old else 0.0
@@ -675,27 +686,46 @@ class BinanceFuturesClient:
         """
         Получить Long/Short Position Ratio для топ-трейдеров.
         >1.5 = топы в лонгах, <0.8 = топы в шортах.
+        ✅ FIX #3: Bybit fallback через /v5/market/account-ratio если Binance недоступен.
         """
         await self._init_source()
-        if not self._use_binance:
-            logger.debug(f"[TopTrader] {symbol}: Binance недоступен, пропускаем")
-            return None
+        if self._use_binance:
+            try:
+                d = await self._binance("/futures/data/topLongShortPositionRatio",
+                                        {"symbol": symbol, "period": period, "limit": 1})
+                if d and len(d) > 0:
+                    long_pos  = float(d[0].get("longPosition",  0))
+                    short_pos = float(d[0].get("shortPosition", 0))
+                    ratio = long_pos / short_pos if short_pos > 0 else None
+                    logger.debug(
+                        f"[TopTrader] {symbol}: Binance long={long_pos:.3f} short={short_pos:.3f} → ratio={ratio}"
+                    )
+                    return ratio
+                logger.warning(f"[TopTrader] {symbol}: Binance пустой ответ (d={d!r}), пробуем Bybit fallback")
+            except Exception as e:
+                logger.warning(f"[TopTrader] {symbol}: Binance ошибка — {type(e).__name__}: {e}, пробуем Bybit fallback")
+
+        # ✅ FIX #3: Bybit fallback — account-ratio даёт buyRatio всех аккаунтов
         try:
-            d = await self._binance("/futures/data/topLongShortPositionRatio",
-                                    {"symbol": symbol, "period": period, "limit": 1})
-            if d and len(d) > 0:
-                long_pos  = float(d[0].get("longPosition",  0))
-                short_pos = float(d[0].get("shortPosition", 0))
-                ratio = long_pos / short_pos if short_pos > 0 else None
-                logger.debug(
-                    f"[TopTrader] {symbol}: long={long_pos:.3f} short={short_pos:.3f} → ratio={ratio}"
-                )
-                return ratio
-            logger.warning(f"[TopTrader] {symbol}: пустой ответ API (d={d!r})")
-            return None
+            imap = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h"}
+            result = await self._bybit("/v5/market/account-ratio",
+                                       {"category": "linear", "symbol": symbol,
+                                        "period": imap.get(period, "1h"), "limit": 1})
+            if result:
+                items = result.get("list", [])
+                if items:
+                    buy = items[0].get("buyRatio")
+                    if buy:
+                        buy_f = float(buy)
+                        # buyRatio из Bybit: доля 0-1, конвертируем в long/short ratio
+                        # ratio = longPct / shortPct = buy / (1 - buy)
+                        if 0 < buy_f < 1:
+                            ratio = buy_f / (1.0 - buy_f)
+                            logger.debug(f"[TopTrader] {symbol}: Bybit fallback buyRatio={buy_f:.3f} → ratio={ratio:.3f}")
+                            return round(ratio, 3)
         except Exception as e:
-            logger.warning(f"[TopTrader] {symbol}: ошибка — {type(e).__name__}: {e}")
-            return None
+            logger.warning(f"[TopTrader] {symbol}: Bybit fallback ошибка — {type(e).__name__}: {e}")
+        return None
 
     # =========================================================================
     # VOLUME PROFILE

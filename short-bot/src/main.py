@@ -666,7 +666,9 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         # 🆕 Консолидация фильтр — блокировка входов в середине диапазона
         if state.consolidation_detector and ohlcv_15m:
             cons = state.consolidation_detector.detect(ohlcv_15m, price)
-            allow, reason = filter_mid_range(cons, price, "short", verbose=False)
+            # ✅ FIX #4: передаём RSI 1H для исключения при экстремальной перегретости
+            rsi_1h_val = getattr(md, "rsi_1h", 50.0) or 50.0
+            allow, reason = filter_mid_range(cons, price, "short", verbose=False, rsi_1h=rsi_1h_val)
             
             if cons.is_consolidating and not allow:
                 if verbose:

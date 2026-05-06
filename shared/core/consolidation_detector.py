@@ -258,22 +258,26 @@ def filter_mid_range(
     price: float,
     direction: str,
     verbose: bool = False,
+    rsi_1h: float = 50.0,
 ) -> Tuple[bool, str]:
     """
     Фильтр: блокировать входы в середине диапазона.
-    
+    ✅ FIX #4: Исключение для экстремальной перепроданности/перегретости:
+       LONG: RSI 1H < 25 → пропускаем upper_half блокировку
+       SHORT: RSI 1H > 75 → пропускаем lower_half блокировку
+
     Returns:
         (allow_signal: bool, reason: str)
     """
     if not consolidation.is_consolidating:
         return True, "trending market"
-    
+
     status = consolidation.entry_zone_status(price)
-    
-    # В середине диапазона — БЛОКИРУЕМ
+
+    # В середине диапазона — БЛОКИРУЕМ (даже при экстремальном RSI)
     if status == "mid_range":
         return False, f"MID_RANGE: цена в {consolidation.position_in_range:.0%} диапазона {consolidation.range_pct:.1f}%"
-    
+
     # Для LONG — только нижняя половина или Spring
     if direction == "long":
         if consolidation.has_spring:
@@ -283,9 +287,12 @@ def filter_mid_range(
         if status == "near_support":
             return True, "near support"
         if status in ("upper_half", "near_resistance"):
+            # ✅ FIX #4: Экстремальная перепроданность важнее позиции в диапазоне
+            if rsi_1h < 25:
+                return True, f"LONG в {status} РАЗРЕШЁН — RSI 1H={rsi_1h:.1f} экстремально перепродан"
             return False, f"LONG в {status} — плохая зона для входа"
         return True, "lower half"
-    
+
     # Для SHORT — только верхняя половина или Upthrust
     if direction == "short":
         if consolidation.has_upthrust:
@@ -295,7 +302,10 @@ def filter_mid_range(
         if status == "near_resistance":
             return True, "near resistance"
         if status in ("lower_half", "near_support"):
+            # ✅ FIX #4: Экстремальная перегретость важнее позиции в диапазоне
+            if rsi_1h > 75:
+                return True, f"SHORT в {status} РАЗРЕШЁН — RSI 1H={rsi_1h:.1f} экстремально перегрет"
             return False, f"SHORT в {status} — плохая зона для входа"
         return True, "upper half"
-    
+
     return True, "ok"

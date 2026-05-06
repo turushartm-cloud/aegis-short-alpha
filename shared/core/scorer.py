@@ -480,7 +480,9 @@ class LongScorer(BaseScorer):
         return ScoreComponent("OI", min(score, 15), 15, " | ".join(reasons) or "Нейтральный OI", oi_change_4d)
 
     def calculate_delta_component(self, hourly_deltas: List[float],
-                                   price_trend: str) -> ScoreComponent:
+                                   price_trend: str,
+                                   btc_change_1h: float = 0.0,
+                                   coin_change_1h: float = 0.0) -> ScoreComponent:
         score, reasons = 0, []
         if not hourly_deltas:
             return ScoreComponent("Delta", 0, 20, "Нет данных дельты", 0)
@@ -495,6 +497,14 @@ class LongScorer(BaseScorer):
             score += 8; reasons.append("Слабая бычья дивергенция")
         elif price_trend == "sideways" and pos_hours >= 4:
             score += 6; reasons.append("Накопление в боковике")
+        # ✅ FIX #5: Относительная слабость vs BTC — монета падает сильнее BTC при общем росте
+        # Признак накопления: дельта бычья, но монета отстаёт от BTC (возможна ротация)
+        elif price_trend == "rising" and btc_change_1h > 0 and pos_hours >= 3:
+            relative_weakness = btc_change_1h - coin_change_1h
+            if relative_weakness > 1.0:
+                score += 10; reasons.append(f"Относит. слабость vs BTC (+{btc_change_1h:.1f}% vs +{coin_change_1h:.1f}%) — накопление при росте рынка")
+            elif relative_weakness > 0.5:
+                score += 6; reasons.append(f"Умеренная слабость vs BTC — дельта растёт")
         return ScoreComponent("Delta", min(score, 20), 20, " | ".join(reasons) or "Нейтральная дельта",
                               sum(hourly_deltas))
 
@@ -525,13 +535,15 @@ class LongScorer(BaseScorer):
                         atr_14_pct: float = 0.5,
                         price_change_1h: float = 0.0,
                         top_trader_ratio: Optional[float] = None,
-                        taker_ratio: Optional[float] = None) -> ScoreResult:
+                        taker_ratio: Optional[float] = None,
+                        btc_change_1h: float = 0.0) -> ScoreResult:
         components = []
         components.append(self.calculate_rsi_component(rsi_1h, price_change_1h))
         components.append(self.calculate_funding_component(funding_current, funding_accumulated))
         components.append(self.calculate_ratio_component(long_ratio))
         components.append(self.calculate_oi_component(oi_change_4d, price_change_4d))
-        components.append(self.calculate_delta_component(hourly_deltas, price_trend))
+        # ✅ FIX #5: передаём btc_change_1h для определения относительной слабости
+        components.append(self.calculate_delta_component(hourly_deltas, price_trend, btc_change_1h=btc_change_1h, coin_change_1h=price_change_1h))
         pat_comp, pat_names = self.calculate_pattern_component(patterns)
         components.append(pat_comp)
         # 🆕 Top Trader component
