@@ -579,7 +579,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 f"rsi={md.rsi_1h:.1f} | funding={md.funding_rate:.4f}% | "
                 f"acc_funding={md.funding_accumulated:.4f}% | "
                 f"L/S={md.long_short_ratio:.1f}% | "
-                f"OI_4d={md.oi_change_4d:.1f}% | "
+                f"OI_4d={md.oi_change_4d:.1f}% | OI_1h={getattr(md,'oi_change_1h',0.0):+.1f}% | OI_4h={getattr(md,'oi_change_4h',0.0):+.1f}% | "
                 f"vol_spike={getattr(md,'volume_spike_ratio',1.0):.2f}x | "
                 f"atr={getattr(md,'atr_14_pct',0.5):.2f}% | "
                 f"top_trader={'%.2f' % top_trader_val if top_trader_val is not None else '⚠️ None'} | "
@@ -880,6 +880,8 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 "Funding":  f"{md.funding_rate:+.3f}%",
                 "L/S":      f"{md.long_short_ratio:.0f}% longs",
                 "OI 4d":    f"{md.oi_change_4d:+.1f}%",
+                "OI 1h":    f"{getattr(md,'oi_change_1h',0.0):+.1f}%",
+                "OI 4h":    f"{getattr(md,'oi_change_4h',0.0):+.1f}%",
                 "Price 4d": f"{p4d:+.1f}%",
             },
             "aegis_components": aegis_components,

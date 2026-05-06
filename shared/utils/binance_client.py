@@ -86,8 +86,12 @@ class MarketData:
     # Расстояние до 24h low в %
     pct_from_low_24h:     float = 5.0
 
-    # ── Realtime метрики (из Pump Detector) ──────────────────────────────────
-    # Taker buy/sell ratio: 0.0 = все продают, 1.0 = все покупают
+    # ── Краткосрочные OI изменения (v3.1) ────────────────────────────────────
+    # Источник: get_oi_short_term() — цепочка Binance→Bybit→OKX
+    # oi_1h > +5% при росте цены = позиции накапливаются (лонгисты входят)
+    # oi_1h < -5% при падении цены = позиции закрываются (капитуляция)
+    oi_change_1h:         float = 0.0
+    oi_change_4h:         float = 0.0
     # >0.6 = агрессивные покупки (бычье давление), <0.4 = агрессивные продажи
     taker_buy_sell_ratio: Optional[float] = None
 
@@ -159,13 +163,21 @@ FALLBACK_WATCHLIST = [
 
 class BinanceFuturesClient:
     """
-    Клиент рыночных данных.
-    USE_BINANCE=false (default) → Bybit, без прокси
-    USE_BINANCE=true            → Binance через прокси
+    Клиент рыночных данных v3.1.
+    Цепочка источников: Binance(proxy) → Bybit → OKX(direct)
+    USE_BINANCE=false (default) → Bybit first, OKX fallback
+    USE_BINANCE=true            → Binance proxy first, Bybit, OKX fallback
     """
 
     BYBIT_URL   = "https://api.bybit.com"
     BINANCE_URL = "https://fapi.binance.com"
+    OKX_URL     = "https://www.okx.com"
+
+    # Dead symbol cache: {symbol: timestamp_when_first_failed}
+    # Symbols that fail 3+ consecutive fetches are skipped for DEAD_SYMBOL_TTL seconds
+    _dead_symbols:    dict = {}
+    DEAD_SYMBOL_TTL:  int  = 3600   # 1 час — потом перепроверяем
+    DEAD_SYMBOL_HITS: int  = 3      # сколько подряд фейлов → мёртвый
 
     def __init__(self, api_key=None, api_secret=None):
         self.api_key = api_key or os.getenv("BINANCE_API_KEY", "")
@@ -182,7 +194,7 @@ class BinanceFuturesClient:
         self._proxy_idx   = 0
         self._active_proxy: Optional[str] = None
 
-        print(f"🔧 Market client: {'Binance+proxy' if self._try_binance else 'Bybit'} mode")
+        print(f"🔧 Market client v3.1: {'Binance+proxy' if self._try_binance else 'Bybit'} → OKX fallback")
 
     def _next_proxy(self) -> Optional[str]:
         if not self._proxies:
@@ -313,6 +325,67 @@ class BinanceFuturesClient:
         except Exception as e:
             logger.warning(f"[Binance] ERROR | {endpoint} | proxy={proxy} | {type(e).__name__}: {e}")
             return None
+
+    # =========================================================================
+    # OKX DIRECT (no proxy needed — globally accessible)
+    # =========================================================================
+
+    @staticmethod
+    def _to_okx_instid(symbol: str) -> str:
+        """BTCUSDT → BTC-USDT  |  1000BONKUSDT → 1000BONK-USDT"""
+        if symbol.endswith("USDT"):
+            base = symbol[:-4]   # strip USDT
+            return f"{base}-USDT"
+        return symbol
+
+    async def _okx(self, endpoint: str, params: Dict = None) -> Optional[Any]:
+        """Прямой запрос OKX без прокси. Возвращает data[] или None."""
+        await self._rate_limit()
+        try:
+            session = await self._get_session()
+            async with session.get(
+                f"{self.OKX_URL}{endpoint}",
+                params=params or {},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status == 200:
+                    body = await resp.json()
+                    if body.get("code") == "0":
+                        return body.get("data")
+                    logger.debug(f"[OKX] {endpoint} | code={body.get('code')} msg={body.get('msg')}")
+                else:
+                    logger.debug(f"[OKX] HTTP {resp.status} | {endpoint}")
+        except asyncio.TimeoutError:
+            logger.debug(f"[OKX] TIMEOUT | {endpoint}")
+        except Exception as e:
+            logger.debug(f"[OKX] ERROR | {endpoint} | {type(e).__name__}: {e}")
+        return None
+
+    # =========================================================================
+    # DEAD SYMBOL CACHE
+    # =========================================================================
+
+    def _is_dead_symbol(self, symbol: str) -> bool:
+        entry = BinanceFuturesClient._dead_symbols.get(symbol)
+        if not entry:
+            return False
+        hits, ts = entry
+        if time.time() - ts > self.DEAD_SYMBOL_TTL:
+            # TTL истёк — перепроверяем
+            del BinanceFuturesClient._dead_symbols[symbol]
+            return False
+        return hits >= self.DEAD_SYMBOL_HITS
+
+    def _mark_symbol_fail(self, symbol: str):
+        entry = BinanceFuturesClient._dead_symbols.get(symbol)
+        if entry:
+            hits, ts = entry
+            BinanceFuturesClient._dead_symbols[symbol] = (hits + 1, ts)
+        else:
+            BinanceFuturesClient._dead_symbols[symbol] = (1, time.time())
+
+    def _mark_symbol_ok(self, symbol: str):
+        BinanceFuturesClient._dead_symbols.pop(symbol, None)
 
     async def _req(self, binance_ep: str, bybit_ep: str,
                    binance_params: Dict = None,
@@ -567,164 +640,301 @@ class BinanceFuturesClient:
 
     async def get_open_interest_history(self, symbol: str,
                                          period: str = "1h", limit: int = 5) -> List[Dict]:
+        """
+        OI история: Binance(proxy) → Bybit → OKX(direct).
+        Возвращает [{sumOpenInterest: float}, ...] — старый формат сохранён.
+        Поддерживаемые period: 5m, 15m, 30m, 1h, 4h, 1d
+        """
         await self._init_source()
+
+        # ── 1. Binance via proxy ──────────────────────────────────────────────
         if self._use_binance:
             d = await self._binance("/fapi/v1/openInterestHist",
                                     {"symbol": symbol, "period": period, "limit": limit})
-            return d or []
-        imap = {"5m": "5min", "15m": "15min", "30m": "30min",
-                "1h": "1h", "4h": "4h", "1d": "1d"}
+            if d and len(d) >= 2:
+                return d
+
+        # ── 2. Bybit ─────────────────────────────────────────────────────────
+        imap_bybit = {"5m": "5min", "15m": "15min", "30m": "30min",
+                      "1h": "1h", "4h": "4h", "1d": "1d"}
         result = await self._bybit("/v5/market/open-interest",
                                    {"category": "linear", "symbol": symbol,
-                                    "intervalTime": imap.get(period, "1h"),
+                                    "intervalTime": imap_bybit.get(period, "1h"),
                                     "limit": limit})
         if result:
-            return [{"sumOpenInterest": item.get("openInterest", 0)}
-                    for item in result.get("list", [])]
+            items = result.get("list", [])
+            if len(items) >= 2:
+                return [{"sumOpenInterest": float(item.get("openInterest", 0))}
+                        for item in items]
+
+        # ── 3. OKX direct (no proxy needed) ───────────────────────────────────
+        imap_okx = {"5m": "5m", "15m": "5m", "30m": "5m",   # OKX rubik min=5m
+                    "1h": "1H", "4h": "4H", "1d": "1D"}
+        okx_period = imap_okx.get(period, "1H")
+        okx_limit  = max(limit, 5)
+        inst_id = self._to_okx_instid(symbol)
+        data = await self._okx(
+            "/api/v5/rubik/stat/contracts/open-interest-volume",
+            {"instId": inst_id.replace("-USDT", "-USDT"), "period": okx_period, "limit": okx_limit}
+        )
+        if data and len(data) >= 2:
+            # data format: [[ts, oi, vol], ...]  newest first → reverse
+            rows = list(reversed(data))
+            return [{"sumOpenInterest": float(row[1])} for row in rows if len(row) >= 2]
+
         return []
 
     async def get_oi_change(self, symbol: str, days: int = 4) -> float:
-        # ✅ FIX #2: для новых/малых альтов "1d" даёт < 2 записей → fallback на "4h"
+        """OI изменение за N дней. Цепочка: 1d → 4h → 1h fallback."""
         history = await self.get_open_interest_history(symbol, "1d", days + 1)
         if not history or len(history) < 2:
-            # Fallback: берём 4h свечи (6 свечей = ~1 день), нормализуем к дням
-            logger.debug(f"[OI] {symbol}: '1d' вернул {len(history) if history else 0} записей, fallback → '4h'")
-            history_4h = await self.get_open_interest_history(symbol, "4h", (days + 1) * 6)
-            if not history_4h or len(history_4h) < 2:
-                logger.debug(f"[OI] {symbol}: '4h' тоже пустой → 0.0")
-                return 0.0
-            history = history_4h
+            logger.debug(f"[OI] {symbol}: '1d' пустой → fallback '4h'")
+            history = await self.get_open_interest_history(symbol, "4h", (days + 1) * 6)
+        if not history or len(history) < 2:
+            logger.debug(f"[OI] {symbol}: '4h' пустой → fallback '1h'")
+            history = await self.get_open_interest_history(symbol, "1h", 24)
+        if not history or len(history) < 2:
+            return 0.0
         old = float(history[0].get("sumOpenInterest", 0))
         new = float(history[-1].get("sumOpenInterest", 0))
         return round((new - old) / old * 100, 2) if old else 0.0
+
+    async def get_oi_short_term(self, symbol: str) -> Dict[str, float]:
+        """
+        Краткосрочные OI-изменения для усиления сигналов.
+        Возвращает {'oi_1h': %, 'oi_4h': %} — пригодны для Aegis-скора.
+        """
+        results = {"oi_1h": 0.0, "oi_4h": 0.0}
+        try:
+            h1 = await self.get_open_interest_history(symbol, "1h", 6)
+            if h1 and len(h1) >= 2:
+                old = float(h1[0].get("sumOpenInterest", 0))
+                new = float(h1[-1].get("sumOpenInterest", 0))
+                results["oi_1h"] = round((new - old) / old * 100, 2) if old else 0.0
+
+            h4 = await self.get_open_interest_history(symbol, "4h", 6)
+            if h4 and len(h4) >= 2:
+                old = float(h4[0].get("sumOpenInterest", 0))
+                new = float(h4[-1].get("sumOpenInterest", 0))
+                results["oi_4h"] = round((new - old) / old * 100, 2) if old else 0.0
+        except Exception as e:
+            logger.debug(f"[OI short-term] {symbol}: {e}")
+        return results
 
     # =========================================================================
     # LONG/SHORT RATIO
     # =========================================================================
 
     async def get_long_short_ratio(self, symbol: str, period: str = "1h") -> Optional[float]:
+        """
+        L/S ratio (% лонгов, 0-100): Binance(proxy) → Bybit → OKX.
+        Санитарный диапазон 10-90%, вне — возврат 50.0 (дефолт).
+        """
         await self._init_source()
+
+        # ── 1. Binance ────────────────────────────────────────────────────────
         if self._use_binance:
             d = await self._binance("/futures/data/topLongShortAccountRatio",
                                     {"symbol": symbol, "period": period, "limit": 1})
             if d and len(d) > 0:
-                return float(d[0].get("longAccount", 0))
+                raw = d[0].get("longAccount", 0)
+                val = float(raw) * 100 if float(raw) <= 1 else float(raw)
+                if 10 <= val <= 90:
+                    logger.debug(f"[LS] {symbol}: Binance → {val:.1f}%")
+                    return round(val, 1)
+
+        # ── 2. Bybit ─────────────────────────────────────────────────────────
+        imap = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h"}
         result = await self._bybit("/v5/market/account-ratio",
                                    {"category": "linear", "symbol": symbol,
-                                    "period": period, "limit": 1})
+                                    "period": imap.get(period, "1h"), "limit": 1})
         if result:
             items = result.get("list", [])
             if items:
                 buy = items[0].get("buyRatio")
-                return float(buy) * 100 if buy else 50.0
+                if buy:
+                    val = float(buy) * 100
+                    if 10 <= val <= 90:
+                        logger.debug(f"[LS] {symbol}: Bybit → {val:.1f}%")
+                        return round(val, 1)
+
+        # ── 3. OKX direct ─────────────────────────────────────────────────────
+        okx_period = {"5m": "5m", "15m": "15m", "30m": "30m",
+                      "1h": "1H", "4h": "4H"}.get(period, "1H")
+        inst_id = self._to_okx_instid(symbol)
+        data = await self._okx(
+            "/api/v5/rubik/stat/contracts/long-short-account-ratio-contract",
+            {"instId": inst_id, "period": okx_period, "limit": 1}
+        )
+        if data and len(data) > 0:
+            row = data[0]   # [ts, ratio_str]  ratio = longs/shorts
+            if len(row) >= 2:
+                try:
+                    ratio = float(row[1])
+                    pct = ratio / (1.0 + ratio) * 100
+                    if 10 <= pct <= 90:
+                        logger.debug(f"[LS] {symbol}: OKX → {pct:.1f}%")
+                        return round(pct, 1)
+                except (ValueError, ZeroDivisionError):
+                    pass
+
+        logger.debug(f"[LS] {symbol}: все источники None → default 50.0")
         return 50.0
 
     async def get_taker_buy_sell_ratio(self, symbol: str,
                                         period: str = "15m") -> Optional[float]:
         """
-        Получить Taker Buy/Sell Volume Ratio.
-        0.0 = все продают агрессивно, 1.0 = все покупают агрессивно.
+        Taker Buy/Sell ratio (0=продавцы, 1=покупатели): Binance→Bybit→OKX.
+        ИСПРАВЛЕНО: раньше работало ТОЛЬКО при _use_binance=True.
         """
         await self._init_source()
-        if not self._use_binance:
-            logger.debug(f"[TakerRatio] {symbol}: Binance недоступен, пропускаем")
-            return None
-        try:
+
+        # ── 1. Binance ────────────────────────────────────────────────────────
+        if self._use_binance:
             d = await self._binance("/futures/data/takerBuySellVolRatio",
                                     {"symbol": symbol, "period": period, "limit": 1})
             if d and len(d) > 0:
                 buy_vol  = float(d[0].get("buyVol",  0))
                 sell_vol = float(d[0].get("sellVol", 0))
                 total = buy_vol + sell_vol
-                ratio = buy_vol / total if total > 0 else None
-                logger.debug(f"[TakerRatio] {symbol}: buy={buy_vol:.0f} sell={sell_vol:.0f} → ratio={ratio}")
-                return ratio
-            logger.warning(f"[TakerRatio] {symbol}: пустой ответ API")
-            return None
-        except Exception as e:
-            logger.warning(f"[TakerRatio] {symbol}: ошибка — {type(e).__name__}: {e}")
-            return None
+                if total > 0:
+                    ratio = buy_vol / total
+                    logger.debug(f"[Taker] {symbol}: Binance buy={buy_vol:.0f} sell={sell_vol:.0f} → {ratio:.3f}")
+                    return ratio
+
+        # ── 2. Bybit — используем klines quote_volume как прокси delta ────────
+        # Bybit не даёт прямой taker ratio endpoint без auth, используем OKX
+        # (klines proxy уже есть в get_hourly_volume_profile)
+
+        # ── 3. OKX direct ─────────────────────────────────────────────────────
+        okx_period = {"5m": "5m", "15m": "5m", "30m": "5m",
+                      "1h": "1H", "4h": "4H"}.get(period, "5m")
+        inst_id = self._to_okx_instid(symbol)
+        data = await self._okx(
+            "/api/v5/rubik/stat/taker-volume",
+            {"instId": inst_id, "instType": "SWAP", "period": okx_period, "limit": 1}
+        )
+        if data and len(data) > 0:
+            row = data[0]   # [ts, sellVol, buyVol]
+            if len(row) >= 3:
+                try:
+                    sell_vol = float(row[1])
+                    buy_vol  = float(row[2])
+                    total    = buy_vol + sell_vol
+                    if total > 0:
+                        ratio = buy_vol / total
+                        logger.debug(f"[Taker] {symbol}: OKX buy={buy_vol:.0f} sell={sell_vol:.0f} → {ratio:.3f}")
+                        return ratio
+                except (ValueError, IndexError):
+                    pass
+
+        logger.debug(f"[Taker] {symbol}: все источники None")
+        return None
 
     async def get_liquidations(self, symbol: str,
                                 limit: int = 100) -> Optional[Dict]:
         """
-        Получить данные о ликвидациях за последние сделки.
-        Возвращает сумму в USD и доминирующую сторону.
+        Ликвидации за последний час: Binance(proxy) → Bybit.
+        ИСПРАВЛЕНО: добавлен startTime (без него Binance возвращает HTTP 400).
         """
         await self._init_source()
+        start_time_ms = int((time.time() - 3600) * 1000)   # последний час
+
+        # ── 1. Binance (исправлен startTime) ─────────────────────────────────
         if self._use_binance:
             try:
                 d = await self._binance("/fapi/v1/allForceOrders",
-                                        {"symbol": symbol, "limit": limit})
+                                        {"symbol": symbol,
+                                         "startTime": start_time_ms,
+                                         "limit": limit})
                 if d:
-                    long_liq = 0.0
-                    short_liq = 0.0
+                    long_liq = short_liq = 0.0
                     for order in d:
-                        qty = float(order.get("origQty", 0))
+                        qty   = float(order.get("origQty",  0))
                         price = float(order.get("avgPrice", 0))
-                        side = order.get("side", "").upper()
-                        usd = qty * price
-                        if side == "SELL":
-                            # SELL liquidation = LONG position liquidated
-                            long_liq += usd
-                        else:
-                            # BUY liquidation = SHORT position liquidated
-                            short_liq += usd
+                        side  = order.get("side", "").upper()
+                        usd   = qty * price
+                        if side == "SELL":   long_liq  += usd
+                        else:                short_liq += usd
                     total = long_liq + short_liq
-                    return {
-                        "total_usd": total,
-                        "long_liq_usd": long_liq,
-                        "short_liq_usd": short_liq,
-                        "dominant_side": "LONG" if long_liq > short_liq else "SHORT" if short_liq > long_liq else None
-                    }
-            except Exception:
-                pass
+                    if total > 0:
+                        return {
+                            "total_usd":   total,
+                            "long_liq_usd":  long_liq,
+                            "short_liq_usd": short_liq,
+                            "dominant_side": "LONG" if long_liq > short_liq
+                                             else "SHORT" if short_liq > long_liq else None
+                        }
+            except Exception as e:
+                logger.debug(f"[Liq] {symbol}: Binance error — {e}")
+
+        # ── 2. Bybit ─────────────────────────────────────────────────────────
+        try:
+            result = await self._bybit("/v5/market/recent-trade",
+                                       {"category": "linear", "symbol": symbol,
+                                        "limit": 200})
+            # Bybit не даёт endpoint ликвидаций без auth → возврат None
+        except Exception:
+            pass
+
         return None
 
     async def get_top_trader_position_ratio(self, symbol: str,
                                              period: str = "15m") -> Optional[float]:
         """
-        Получить Long/Short Position Ratio для топ-трейдеров.
+        Топ-трейдеры Long/Short Position Ratio: Binance(proxy) → Bybit → OKX.
         >1.5 = топы в лонгах, <0.8 = топы в шортах.
-        ✅ FIX #3: Bybit fallback через /v5/market/account-ratio если Binance недоступен.
         """
         await self._init_source()
-        if self._use_binance:
-            try:
-                d = await self._binance("/futures/data/topLongShortPositionRatio",
-                                        {"symbol": symbol, "period": period, "limit": 1})
-                if d and len(d) > 0:
-                    long_pos  = float(d[0].get("longPosition",  0))
-                    short_pos = float(d[0].get("shortPosition", 0))
-                    ratio = long_pos / short_pos if short_pos > 0 else None
-                    logger.debug(
-                        f"[TopTrader] {symbol}: Binance long={long_pos:.3f} short={short_pos:.3f} → ratio={ratio}"
-                    )
-                    return ratio
-                logger.warning(f"[TopTrader] {symbol}: Binance пустой ответ (d={d!r}), пробуем Bybit fallback")
-            except Exception as e:
-                logger.warning(f"[TopTrader] {symbol}: Binance ошибка — {type(e).__name__}: {e}, пробуем Bybit fallback")
 
-        # ✅ FIX #3: Bybit fallback — account-ratio даёт buyRatio всех аккаунтов
-        try:
-            imap = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h"}
-            result = await self._bybit("/v5/market/account-ratio",
-                                       {"category": "linear", "symbol": symbol,
-                                        "period": imap.get(period, "1h"), "limit": 1})
-            if result:
-                items = result.get("list", [])
-                if items:
-                    buy = items[0].get("buyRatio")
-                    if buy:
-                        buy_f = float(buy)
-                        # buyRatio из Bybit: доля 0-1, конвертируем в long/short ratio
-                        # ratio = longPct / shortPct = buy / (1 - buy)
-                        if 0 < buy_f < 1:
-                            ratio = buy_f / (1.0 - buy_f)
-                            logger.debug(f"[TopTrader] {symbol}: Bybit fallback buyRatio={buy_f:.3f} → ratio={ratio:.3f}")
-                            return round(ratio, 3)
-        except Exception as e:
-            logger.warning(f"[TopTrader] {symbol}: Bybit fallback ошибка — {type(e).__name__}: {e}")
+        # ── 1. Binance ────────────────────────────────────────────────────────
+        if self._use_binance:
+            d = await self._binance("/futures/data/topLongShortPositionRatio",
+                                    {"symbol": symbol, "period": period, "limit": 1})
+            if d and len(d) > 0:
+                long_pos  = float(d[0].get("longPosition",  0))
+                short_pos = float(d[0].get("shortPosition", 0))
+                if short_pos > 0:
+                    ratio = long_pos / short_pos
+                    logger.debug(f"[TopTrader] {symbol}: Binance → {ratio:.3f}")
+                    return round(ratio, 3)
+
+        # ── 2. Bybit (account-ratio как прокси) ──────────────────────────────
+        imap = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h"}
+        result = await self._bybit("/v5/market/account-ratio",
+                                   {"category": "linear", "symbol": symbol,
+                                    "period": imap.get(period, "1h"), "limit": 1})
+        if result:
+            items = result.get("list", [])
+            if items:
+                buy = items[0].get("buyRatio")
+                if buy:
+                    buy_f = float(buy)
+                    if 0 < buy_f < 1:
+                        ratio = buy_f / (1.0 - buy_f)
+                        logger.debug(f"[TopTrader] {symbol}: Bybit → {ratio:.3f}")
+                        return round(ratio, 3)
+
+        # ── 3. OKX direct — elite account ratio ───────────────────────────────
+        okx_period = {"5m": "5m", "15m": "5m", "30m": "5m",
+                      "1h": "1H", "4h": "4H"}.get(period, "5m")
+        inst_id = self._to_okx_instid(symbol)
+        data = await self._okx(
+            "/api/v5/rubik/stat/contracts/top-long-short-account-ratio",
+            {"instId": inst_id, "period": okx_period, "limit": 1}
+        )
+        if data and len(data) > 0:
+            row = data[0]   # [ts, ratio_str]
+            if len(row) >= 2:
+                try:
+                    ratio = float(row[1])
+                    if ratio > 0:
+                        logger.debug(f"[TopTrader] {symbol}: OKX elite → {ratio:.3f}")
+                        return round(ratio, 3)
+                except (ValueError, IndexError):
+                    pass
+
+        logger.debug(f"[TopTrader] {symbol}: все источники None")
         return None
 
     # =========================================================================
@@ -886,10 +1096,15 @@ class BinanceFuturesClient:
 
     async def get_complete_market_data(self, symbol: str) -> Optional[MarketData]:
         """
-        Полные рыночные данные.
-        v2.1: добавлены breakout поля из 15м свечей.
+        Полные рыночные данные v3.1.
+        Добавлено: dead symbol cache, OI short-term, тройной fallback.
         """
         try:
+            # ── Dead symbol cache ─────────────────────────────────────────────
+            if self._is_dead_symbol(symbol):
+                logger.debug(f"[Market] {symbol}: пропуск (dead symbol cache)")
+                return None
+
             await self._init_source()
 
             results = await asyncio.gather(
@@ -906,9 +1121,13 @@ class BinanceFuturesClient:
             price, funding, oi, ratio, ticker, klines_1h, klines_15m = results
 
             if isinstance(price, Exception) or not price:
+                self._mark_symbol_fail(symbol)
                 return None
             if isinstance(klines_1h, Exception) or not klines_1h or len(klines_1h) < 20:
+                self._mark_symbol_fail(symbol)
                 return None
+
+            self._mark_symbol_ok(symbol)   # сбрасываем счётчик фейлов
 
             funding   = None if isinstance(funding,   Exception) else funding
             oi        = None if isinstance(oi,        Exception) else oi
@@ -927,9 +1146,10 @@ class BinanceFuturesClient:
                 self.get_taker_buy_sell_ratio(symbol, "15m"),
                 self.get_liquidations(symbol, 100),
                 self.get_top_trader_position_ratio(symbol, "15m"),
+                self.get_oi_short_term(symbol),      # ← NEW: краткосрочный OI
                 return_exceptions=True
             )
-            taker_ratio, liq_data, top_trader_ls = realtime_results
+            taker_ratio, liq_data, top_trader_ls, oi_short = realtime_results
 
             # Обработка realtime метрик
             taker_buy_sell_ratio = None if isinstance(taker_ratio, Exception) else taker_ratio
@@ -973,6 +1193,9 @@ class BinanceFuturesClient:
                 if low_24h > 0:
                     pct_from_low  = (float(price) - low_24h) / low_24h  * 100
 
+            # ── Обработка oi_short ────────────────────────────────────────────
+            oi_st = {} if isinstance(oi_short, Exception) or not oi_short else oi_short
+
             return MarketData(
                 symbol=symbol,
                 price=float(price),
@@ -1003,6 +1226,8 @@ class BinanceFuturesClient:
                 recent_liquidations_usd=recent_liquidations_usd,
                 liq_side=liq_side,
                 top_trader_long_short_ratio=top_trader_long_short_ratio,
+                oi_change_1h=oi_st.get("oi_1h", 0.0),
+                oi_change_4h=oi_st.get("oi_4h", 0.0),
             )
         except Exception as e:
             print(f"Market data error {symbol}: {e}")
