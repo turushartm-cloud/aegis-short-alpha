@@ -344,10 +344,15 @@ class AegisSignalEngine:
         final_score = total_weighted  # веса = 1.0, raw_score 0-100
 
         if base_score > 0:
-            if base_score >= 65:
+            if base_score >= 70:
+                # Сильный базовый скор — Aegis добавляет бонус поверх
                 final_score = base_score + min(final_score * 0.15, 15)
+            elif base_score >= 58:
+                # Хороший базовый скор — base_score главный (70%), Aegis — фильтр
+                final_score = total_weighted * 0.30 + base_score * 0.70
             else:
-                final_score = final_score * 0.55 + base_score * 0.45
+                # Слабый базовый скор — Aegis компенсирует (50/50)
+                final_score = total_weighted * 0.50 + base_score * 0.50
 
         if final_score < self.min_score:
             cs_str = " | ".join(f"{k}={v.raw_score:.0f}" for k, v in components.items())

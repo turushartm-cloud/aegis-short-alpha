@@ -96,7 +96,7 @@ class Config:
     SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "240"))    # Long = медленнее
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "12"))
 
-    MIN_SCORE     = int(os.getenv("MIN_LONG_SCORE", "60"))   # Было 58 — fallback даёт ~42-52 без реальных детекторов
+    MIN_SCORE     = int(os.getenv("MIN_LONG_SCORE", "52"))   # Снижено с 60: новая blend-формула (70% base) даёт ~45-55 при base=58
     SL_BUFFER     = float(os.getenv("LONG_SL_BUFFER", "3.0")) # Long = больше SL
     LEVERAGE      = os.getenv("LONG_LEVERAGE", "5-20")
 
@@ -256,7 +256,7 @@ async def lifespan(app: FastAPI):
         print(f"⚠️ Binance init failed (continuing with Bybit fallback): {e}")
 
     # П2 FIX: BASE_SCORER получает мягкий порог — строгий порог только у AEGIS
-    _long_base_min = int(os.getenv("MIN_LONG_BASE_SCORE", "45"))
+    _long_base_min = int(os.getenv("MIN_LONG_BASE_SCORE", "50"))  # Снижено с 55: лонги в нейтральном рынке нужно ловить раньше
     state.scorer           = get_long_scorer(_long_base_min)
     state.pattern_detector = LongPatternDetector()
     
@@ -928,15 +928,42 @@ async def scan_market():
             )
             signal["tg_msg_id"] = tg_msg_id
 
-            # Aegis компоненты в TG
+            # Aegis компоненты в TG — человекочитаемый формат
             if signal.get("aegis_components"):
-                comp_str = " | ".join(
-                    f"{k[:4]}: {v:.0f}" for k, v in signal["aegis_components"].items()
-                )
+                comps = signal["aegis_components"]
+                grade    = signal.get("grade", "N/A")
+                strength = signal.get("strength", "N/A")
+                grade_emoji = {"A+": "💎", "A": "🥇", "B": "🥈", "C": "🥉", "D": "⚠️"}.get(grade, "📊")
+                strength_ru = {
+                    "ULTRA": "🚀 ЭКСТРЕМАЛЬНЫЙ", "STRONG": "🟢 СИЛЬНЫЙ",
+                    "MODERATE": "🟡 УМЕРЕННЫЙ", "WATCH": "👀 СЛАБЫЙ", "NOISE": "🔕 ШУМ"
+                }.get(str(strength), str(strength))
+
+                def bar(v): return "▓" * int(v/10) + "░" * (10 - int(v/10))
+
+                comp_names = {
+                    "z_volume":     ("📊 Объём/Z-скор", "дамп ниже VWAP → отскок вверх"),
+                    "oi_change":    ("📈 OI + L/S",     "шорты закрываются → сквиз"),
+                    "funding_rate": ("💸 Фандинг",      "шорты переплачивают → лонг-сквиз"),
+                    "smc_structure":("🏗 Структура",    "Spring / OB / CHoCH по SMC"),
+                    "delta_flow":   ("⚡ Дельта",       "агрессивные покупки"),
+                    "rsi_aux":      ("📉 RSI aux",      "RSI вспомогательный"),
+                }
+                lines = ""
+                for k, v in comps.items():
+                    name, desc = comp_names.get(k, (k, ""))
+                    score_val = int(v)
+                    lines += f"  {name}: <b>{score_val}</b>/100  {bar(score_val)}\n"
+                    lines += f"    <i>{desc}</i>\n"
+
+                auto_status = "🤖 В исполнении" if Config.AUTO_TRADING else "📋 Только уведомление"
                 await state.telegram.send_message(
-                    f"📊 <b>Aegis Components</b> — {signal['symbol']}\n"
-                    f"<code>{comp_str}</code>\n"
-                    f"Grade: {signal.get('grade','?')} | {signal.get('strength','?')}"
+                    f"{grade_emoji} <b>Aegis-анализ LONG — {signal['symbol']}</b>\n"
+                    f"Оценка: <b>{grade}</b> | Сила: {strength_ru}\n\n"
+                    f"{lines}\n"
+                    f"<i>ℹ️ Aegis-движок ищет капитуляцию продавцов + отрицательный фандинг + OI-сквиз.\n"
+                    f"Высокий компонент = сильное совпадение с условиями лонг-сквиза.</i>\n"
+                    f"🔄 Статус: {auto_status}"
                 )
 
             state.redis.save_signal(Config.BOT_TYPE, symbol, signal)

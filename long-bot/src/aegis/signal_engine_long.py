@@ -352,14 +352,23 @@ class AegisLongSignalEngine:
         final_score = total_weighted
 
         if base_score > 0:
-            if base_score >= 65:
+            if base_score >= 70:
+                # Сильный базовый скор — Aegis добавляет бонус поверх
                 final_score = base_score + min(final_score * 0.15, 15)
+            elif base_score >= 58:
+                # Хороший базовый скор — base_score является главным драйвером (70%)
+                # Aegis служит фильтром качества, а не вето
+                final_score = total_weighted * 0.30 + base_score * 0.70
             else:
-                final_score = final_score * 0.55 + base_score * 0.45
+                # Слабый базовый скор — Aegis должен компенсировать (50/50)
+                final_score = total_weighted * 0.50 + base_score * 0.50
 
-        if final_score < self.min_score or valid_components < self.MIN_COMPONENTS_VALID:
+        # Порог: используем min_score из конфига, но не ниже 45 для не-mean-reversion рынков
+        effective_min = min(self.min_score, 47.0)
+
+        if final_score < effective_min or valid_components < self.MIN_COMPONENTS_VALID:
             cs_str = " | ".join(f"{k}={v.raw_score:.0f}" for k, v in components.items())
-            logger.info(f"[AEGIS REJECT LONG] {symbol}: {final_score:.1f} < {self.min_score} | {cs_str}")
+            logger.info(f"[AEGIS REJECT LONG] {symbol}: {final_score:.1f} < {effective_min} | {cs_str}")
             return None
 
         strength = self._score_to_strength(final_score)

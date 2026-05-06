@@ -99,7 +99,7 @@ class Config:
     SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "180"))
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "12"))
 
-    MIN_SCORE     = int(os.getenv("MIN_SHORT_SCORE", "60"))  # Было 60 — fallback даёт ~45-55 без реальных детекторов
+    MIN_SCORE     = int(os.getenv("MIN_SHORT_SCORE", "55"))  # Снижено с 60: новая blend-формула (70% base) даёт ~55-65 при base=60
     SL_BUFFER     = float(os.getenv("SHORT_SL_BUFFER", "2.5"))
     LEVERAGE      = os.getenv("SHORT_LEVERAGE", "5-30")
 
@@ -967,16 +967,42 @@ async def scan_market():
             )
             signal["tg_msg_id"] = tg_msg_id
 
-            # Дополняем сигнал Aegis-информацией
+            # Дополняем сигнал Aegis-информацией (человекочитаемый формат)
             if signal.get("aegis_components"):
-                comp_str = " | ".join(
-                    f"{k[:4]}: {v:.0f}"
-                    for k, v in signal["aegis_components"].items()
-                )
+                comps = signal["aegis_components"]
+                grade   = signal.get("grade", "N/A")
+                strength = signal.get("strength", "N/A")
+                grade_emoji = {"A+": "💎", "A": "🥇", "B": "🥈", "C": "🥉", "D": "⚠️"}.get(grade, "📊")
+                strength_ru = {
+                    "ULTRA": "🚀 ЭКСТРЕМАЛЬНЫЙ", "STRONG": "⚡ СИЛЬНЫЙ",
+                    "MODERATE": "✅ УМЕРЕННЫЙ", "WATCH": "👀 СЛАБЫЙ", "NOISE": "🔕 ШУМ"
+                }.get(str(strength), str(strength))
+
+                def bar(v): return "▓" * int(v/10) + "░" * (10 - int(v/10))
+
+                comp_names = {
+                    "z_volume":     ("📊 Объём/Z-скор", "памп или дамп vs VWAP"),
+                    "oi_change":    ("📈 OI + L/S",     "открытый интерес и позиции толпы"),
+                    "funding_rate": ("💸 Фандинг",      "кто переплачивает за позицию"),
+                    "smc_structure":("🏗 Структура",    "CHoCH / OB / FVG по SMC"),
+                    "delta_flow":   ("⚡ Дельта",       "агрессивные покупки / продажи"),
+                    "rsi_aux":      ("📉 RSI aux",      "RSI как вспомогательный"),
+                }
+                lines = ""
+                for k, v in comps.items():
+                    name, desc = comp_names.get(k, (k, ""))
+                    score_val = int(v)
+                    lines += f"  {name}: <b>{score_val}</b>/100  {bar(score_val)}\n"
+                    lines += f"    <i>{desc}</i>\n"
+
+                auto_status = "🤖 В исполнении" if Config.AUTO_TRADING else "📋 Только уведомление"
                 await state.telegram.send_message(
-                    f"📊 <b>Aegis Components</b> — {signal['symbol']}\n"
-                    f"<code>{comp_str}</code>\n"
-                    f"Grade: {signal.get('grade','N/A')} | Strength: {signal.get('strength','N/A')}"
+                    f"{grade_emoji} <b>Aegis-анализ SHORT — {signal['symbol']}</b>\n"
+                    f"Оценка: <b>{grade}</b> | Сила: {strength_ru}\n\n"
+                    f"{lines}\n"
+                    f"<i>ℹ️ Это компоненты Aegis-движка — дополнительный фильтр качества после базового скора.\n"
+                    f"Чем выше каждый компонент, тем сильнее совпадение с шорт-условиями.</i>\n"
+                    f"🔄 Статус: {auto_status}"
                 )
 
             state.redis.save_signal(Config.BOT_TYPE, symbol, signal)
