@@ -19,9 +19,16 @@ FastAPI Application
 import os
 import asyncio
 import sys
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
+
+# Настройка логирования — INFO уровень для видимости fallback логов
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
