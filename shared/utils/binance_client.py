@@ -452,9 +452,11 @@ class BinanceFuturesClient:
             now - BinanceFuturesClient._binance_symbols_last_update > self.BINANCE_SYMBOLS_TTL):
             await self._load_binance_symbols()
         
-        # Если кэш всё ещё None (ошибка загрузки) — разрешаем запрос (fallback к 404)
+        # ✅ FIX: Если кэш всё ещё None (ошибка загрузки) — ЗАПРЕЩАЕМ запросы к Binance
+        # Возвращаем False чтобы сразу перейти к Bybit/OKX fallback
         if BinanceFuturesClient._binance_symbols_cache is None:
-            return True
+            logger.warning(f"[Whitelist] Кэш пустой — {symbol} не будет запрошен у Binance")
+            return False
             
         return symbol in BinanceFuturesClient._binance_symbols_cache
 
@@ -695,11 +697,22 @@ class BinanceFuturesClient:
     # =========================================================================
 
     async def get_open_interest(self, symbol: str) -> Optional[float]:
+        """
+        Текущий Open Interest: Binance(proxy) → Bybit.
+        
+        ✅ v3.2: Whitelist check — пропускаем Binance если символа нет
+        """
         await self._init_source()
+        
+        # ── 1. Binance (с whitelist проверкой) ───────────────────────────────
         if self._use_binance:
-            d = await self._binance("/fapi/v1/openInterest", {"symbol": symbol})
-            if d:
-                return float(d.get("openInterest", 0))
+            is_available = await self._is_binance_symbol_available(symbol)
+            if is_available:
+                d = await self._binance("/fapi/v1/openInterest", {"symbol": symbol})
+                if d:
+                    return float(d.get("openInterest", 0))
+            else:
+                logger.debug(f"[OI current] {symbol}: не на Binance → сразу к Bybit")
         result = await self._bybit("/v5/market/tickers",
                                    {"category": "linear", "symbol": symbol})
         if result:
@@ -728,10 +741,11 @@ class BinanceFuturesClient:
                                         {"symbol": symbol, "period": period, "limit": limit})
                 if d and len(d) >= 2:
                     return d
+                logger.debug(f"[OI] {symbol}: Binance вернул пусто/404 → fallback к Bybit/OKX")
             else:
                 logger.debug(f"[OI] {symbol}: не на Binance → сразу к Bybit/OKX")
 
-        # ── 2. Bybit ─────────────────────────────────────────────────────────
+        # ── 2. Bybit fallback ──────────────────────────────────────────────────
         imap_bybit = {"5m": "5min", "15m": "15min", "30m": "30min",
                       "1h": "1h", "4h": "4h", "1d": "1d"}
         result = await self._bybit("/v5/market/open-interest",
@@ -741,10 +755,11 @@ class BinanceFuturesClient:
         if result:
             items = result.get("list", [])
             if len(items) >= 2:
+                logger.debug(f"[OI] {symbol}: Bybit fallback ✅")
                 return [{"sumOpenInterest": float(item.get("openInterest", 0))}
                         for item in items]
 
-        # ── 3. OKX direct (no proxy needed) ───────────────────────────────────
+        # ── 3. OKX direct fallback ────────────────────────────────────────────
         imap_okx = {"5m": "5m", "15m": "5m", "30m": "5m",   # OKX rubik min=5m
                     "1h": "1H", "4h": "4H", "1d": "1D"}
         okx_period = imap_okx.get(period, "1H")
@@ -757,8 +772,10 @@ class BinanceFuturesClient:
         if data and len(data) >= 2:
             # data format: [[ts, oi, vol], ...]  newest first → reverse
             rows = list(reversed(data))
+            logger.debug(f"[OI] {symbol}: OKX fallback ✅")
             return [{"sumOpenInterest": float(row[1])} for row in rows if len(row) >= 2]
 
+        logger.debug(f"[OI] {symbol}: все источники пустые")
         return []
 
     async def get_oi_change(self, symbol: str, days: int = 4) -> float:
@@ -823,10 +840,11 @@ class BinanceFuturesClient:
                     if 10 <= val <= 90:
                         logger.debug(f"[LS] {symbol}: Binance → {val:.1f}%")
                         return round(val, 1)
+                logger.debug(f"[LS] {symbol}: Binance пусто/404 → fallback к Bybit/OKX")
             else:
                 logger.debug(f"[LS] {symbol}: не на Binance → сразу к Bybit/OKX")
 
-        # ── 2. Bybit ─────────────────────────────────────────────────────────
+        # ── 2. Bybit fallback ──────────────────────────────────────────────────
         imap = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h"}
         result = await self._bybit("/v5/market/account-ratio",
                                    {"category": "linear", "symbol": symbol,
@@ -888,6 +906,7 @@ class BinanceFuturesClient:
                         ratio = buy_vol / total
                         logger.debug(f"[Taker] {symbol}: Binance buy={buy_vol:.0f} sell={sell_vol:.0f} → {ratio:.3f}")
                         return ratio
+                logger.debug(f"[Taker] {symbol}: Binance пусто/404 → fallback к OKX")
             else:
                 logger.debug(f"[Taker] {symbol}: не на Binance → сразу к OKX")
 
@@ -925,46 +944,46 @@ class BinanceFuturesClient:
         """
         Ликвидации за последний час: Binance(proxy) → Bybit.
         ИСПРАВЛЕНО: добавлен startTime (без него Binance возвращает HTTP 400).
+        
+        ✅ v3.2: Whitelist check — пропускаем Binance если символа нет
         """
         await self._init_source()
         start_time_ms = int((time.time() - 3600) * 1000)   # последний час
 
-        # ── 1. Binance (исправлен startTime) ─────────────────────────────────
+        # ── 1. Binance (с whitelist проверкой) ───────────────────────────────
         if self._use_binance:
-            try:
-                d = await self._binance("/fapi/v1/allForceOrders",
-                                        {"symbol": symbol,
-                                         "startTime": start_time_ms,
-                                         "limit": limit})
-                if d:
-                    long_liq = short_liq = 0.0
-                    for order in d:
-                        qty   = float(order.get("origQty",  0))
-                        price = float(order.get("avgPrice", 0))
-                        side  = order.get("side", "").upper()
-                        usd   = qty * price
-                        if side == "SELL":   long_liq  += usd
-                        else:                short_liq += usd
-                    total = long_liq + short_liq
-                    if total > 0:
-                        return {
-                            "total_usd":   total,
-                            "long_liq_usd":  long_liq,
-                            "short_liq_usd": short_liq,
-                            "dominant_side": "LONG" if long_liq > short_liq
-                                             else "SHORT" if short_liq > long_liq else None
-                        }
-            except Exception as e:
-                logger.debug(f"[Liq] {symbol}: Binance error — {e}")
+            is_available = await self._is_binance_symbol_available(symbol)
+            if not is_available:
+                logger.debug(f"[Liq] {symbol}: не на Binance → сразу к Bybit")
+            else:
+                try:
+                    d = await self._binance("/fapi/v1/allForceOrders",
+                                            {"symbol": symbol,
+                                             "startTime": start_time_ms,
+                                             "limit": limit})
+                    if d:
+                        long_liq = short_liq = 0.0
+                        for order in d:
+                            qty   = float(order.get("origQty",  0))
+                            price = float(order.get("avgPrice", 0))
+                            side  = order.get("side", "").upper()
+                            usd   = qty * price
+                            if side == "SELL":   long_liq  += usd
+                            else:                short_liq += usd
+                        total = long_liq + short_liq
+                        if total > 0:
+                            return {
+                                "total_usd":   total,
+                                "long_liq_usd":  long_liq,
+                                "short_liq_usd": short_liq,
+                                "dominant_side": "LONG" if long_liq > short_liq
+                                                 else "SHORT" if short_liq > long_liq else None
+                            }
+                except Exception as e:
+                    logger.debug(f"[Liq] {symbol}: Binance error — {e}")
 
-        # ── 2. Bybit ─────────────────────────────────────────────────────────
-        try:
-            result = await self._bybit("/v5/market/recent-trade",
-                                       {"category": "linear", "symbol": symbol,
-                                        "limit": 200})
-            # Bybit не даёт endpoint ликвидаций без auth → возврат None
-        except Exception:
-            pass
+        # ── 2. Bybit (нет endpoint ликвидаций без auth) ─────────────────────
+        # Пропускаем — данные будут None
 
         return None
 

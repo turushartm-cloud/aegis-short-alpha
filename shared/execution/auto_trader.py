@@ -158,6 +158,7 @@ class AutoTrader:
             await self._tg(
                 f"⏸ <b>[{mode}]</b> <code>#{symbol}</code>: "
                 f"дневной лимит ({self.daily_pnl:.2f}% ≤ -{self.config.max_daily_risk}%)"
+                .replace('\n', '<br>')
             )
             return None
 
@@ -167,6 +168,7 @@ class AutoTrader:
             await self._tg(
                 f"⏸ <b>[{mode}]</b> <code>#{symbol}</code>: "
                 f"лимит сделок за день ({self.daily_trades}/{self.config.max_daily_trades})"
+                .replace('\n', '<br>')
             )
             return None
 
@@ -189,8 +191,8 @@ class AutoTrader:
                 if rr < self.config.min_rr_ratio:
                     print(f"{pfx} ⏸ SKIP — RR too low ({rr:.2f} < {self.config.min_rr_ratio})")
                     await self._tg(
-                        f"⏸ <b>[{mode}]</b> <code>#{symbol}</code>\n"
-                        f"RR слишком низкий: <b>{rr:.2f}</b> < {self.config.min_rr_ratio}\n"
+                        f"⏸ <b>[{mode}]</b> <code>#{symbol}</code><br>"
+                        f"RR слишком низкий: <b>{rr:.2f}</b> &lt; {self.config.min_rr_ratio}<br>"
                         f"Entry={entry_price} | TP1={tp1_price} | SL={stop_loss}"
                     )
                     return None
@@ -215,7 +217,7 @@ class AutoTrader:
         if n_pos >= self.config.max_positions:
             print(f"{pfx} ⏸ SKIP — max positions")
             await self._tg_reply(
-                f"⏸ <b>Биржа заполнена</b> ({n_pos}/{self.config.max_positions})\n"
+                f"⏸ <b>Биржа заполнена</b> ({n_pos}/{self.config.max_positions})<br>"
                 f"<b>#{symbol}</b> — сигнал пропущен", tg_msg_id
             )
             return None
@@ -314,10 +316,10 @@ class AutoTrader:
             code = self.bingx.last_error_code
             print(f"{pfx} ❌ ORDER FAILED — code={code} | {err}")
             await self._tg(
-                f"❌ <b>AutoTrader [{mode}] — ОРДЕР ОТКЛОНЁН</b>\n\n"
-                f"<code>#{symbol}</code> {direction.upper()}\n"
-                f"Score: {signal_score:.0f} | SL: {stop_loss}\n\n"
-                f"🔴 code={code}: <code>{err}</code>"
+                f"❌ <b>AutoTrader [{mode}] — ОРДЕР ОТКЛОНЁН</b><br><br>"
+                f"<code>#{symbol}</code> {direction.upper()}<br>"
+                f"Score: {signal_score:.0f} | SL: {stop_loss}<br><br>"
+                f"<pre>{err}</pre>"
             )
             return None
 
@@ -361,12 +363,12 @@ class AutoTrader:
 
         d_emoji    = "🟢" if direction == "long" else "🔴"
         notify_msg = (
-            f"🤖 <b>AUTO-TRADE [{mode}]</b>\n\n"
-            f"{d_emoji} <code>#{symbol}</code> {direction.upper()}\n"
-            f"📍 Entry: <b>{entry_price}</b>\n"
-            f"🛑 SL: <b>{stop_loss}</b>\n"
-            f"📊 Size: {order.size} | {leverage}x | {actual_risk*100:.3f}% risk\n"
-            f"🎯 Score: {signal_score:.0f} | RR: {self._last_rr:.2f}\n"
+            f"🤖 <b>AUTO-TRADE [{mode}]</b><br><br>"
+            f"{d_emoji} <code>#{symbol}</code> {direction.upper()}<br>"
+            f"📍 Entry: <b>{entry_price}</b><br>"
+            f"🛑 SL: <b>{stop_loss}</b><br>"
+            f"📊 Size: {order.size} | {leverage}x | {actual_risk*100:.3f}% risk<br>"
+            f"🎯 Score: {signal_score:.0f} | RR: {self._last_rr:.2f}<br>"
             f"🆔 OrderID: {order.order_id}"
         )
         await self._tg_reply(notify_msg, tg_msg_id)
