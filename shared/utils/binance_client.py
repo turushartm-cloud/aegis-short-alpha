@@ -1,5 +1,5 @@
 """
-Market Data Client v3.2 — Bybit (основной) + Binance через прокси
+Market Data Client v3.3 — Bybit (основной) + Binance через прокси
 
 ИЗМЕНЕНИЯ v2.1:
   ✅ get_all_symbols: default min_volume снижен 5M → 300K (было 50 монет, стало 150-200)
@@ -18,6 +18,10 @@ Market Data Client v3.2 — Bybit (основной) + Binance через про
   ✅ NEW: Binance whitelist cache — предотвращает 404 ошибки для несуществующих пар
        Проверка через /fapi/v1/exchangeInfo перед запросом OI/taker/LS
        Fallback: Binance → Bybit → OKX для пар которых нет на Binance
+
+ИЗМЕНЕНИЯ v3.3:
+  ✅ get_liquidations(): добавлены ТФ 30m, 4h, 1d (был только 1h)
+  ✅ Логирование fallback: debug → info (видно в консоли)
 """
 
 import os
@@ -741,9 +745,9 @@ class BinanceFuturesClient:
                                         {"symbol": symbol, "period": period, "limit": limit})
                 if d and len(d) >= 2:
                     return d
-                logger.debug(f"[OI] {symbol}: Binance вернул пусто/404 → fallback к Bybit/OKX")
+                logger.info(f"[OI] {symbol}: Binance вернул пусто/404 → fallback к Bybit/OKX")
             else:
-                logger.debug(f"[OI] {symbol}: не на Binance → сразу к Bybit/OKX")
+                logger.info(f"[OI] {symbol}: не на Binance → сразу к Bybit/OKX")
 
         # ── 2. Bybit fallback ──────────────────────────────────────────────────
         imap_bybit = {"5m": "5min", "15m": "15min", "30m": "30min",
@@ -755,7 +759,7 @@ class BinanceFuturesClient:
         if result:
             items = result.get("list", [])
             if len(items) >= 2:
-                logger.debug(f"[OI] {symbol}: Bybit fallback ✅")
+                logger.info(f"[OI] {symbol}: Bybit fallback ✅")
                 return [{"sumOpenInterest": float(item.get("openInterest", 0))}
                         for item in items]
 
@@ -772,10 +776,10 @@ class BinanceFuturesClient:
         if data and len(data) >= 2:
             # data format: [[ts, oi, vol], ...]  newest first → reverse
             rows = list(reversed(data))
-            logger.debug(f"[OI] {symbol}: OKX fallback ✅")
+            logger.info(f"[OI] {symbol}: OKX fallback ")
             return [{"sumOpenInterest": float(row[1])} for row in rows if len(row) >= 2]
 
-        logger.debug(f"[OI] {symbol}: все источники пустые")
+        logger.info(f"[OI] {symbol}: все источники пустые")
         return []
 
     async def get_oi_change(self, symbol: str, days: int = 4) -> float:
@@ -840,9 +844,9 @@ class BinanceFuturesClient:
                     if 10 <= val <= 90:
                         logger.debug(f"[LS] {symbol}: Binance → {val:.1f}%")
                         return round(val, 1)
-                logger.debug(f"[LS] {symbol}: Binance пусто/404 → fallback к Bybit/OKX")
+                logger.info(f"[LS] {symbol}: Binance пусто/404 → fallback к Bybit/OKX")
             else:
-                logger.debug(f"[LS] {symbol}: не на Binance → сразу к Bybit/OKX")
+                logger.info(f"[LS] {symbol}: не на Binance → сразу к Bybit/OKX")
 
         # ── 2. Bybit fallback ──────────────────────────────────────────────────
         imap = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h"}
@@ -906,9 +910,9 @@ class BinanceFuturesClient:
                         ratio = buy_vol / total
                         logger.debug(f"[Taker] {symbol}: Binance buy={buy_vol:.0f} sell={sell_vol:.0f} → {ratio:.3f}")
                         return ratio
-                logger.debug(f"[Taker] {symbol}: Binance пусто/404 → fallback к OKX")
+                logger.info(f"[Taker] {symbol}: Binance пусто/404 → fallback к OKX")
             else:
-                logger.debug(f"[Taker] {symbol}: не на Binance → сразу к OKX")
+                logger.info(f"[Taker] {symbol}: не на Binance → сразу к OKX")
 
         # ── 2. Bybit — используем klines quote_volume как прокси delta ────────
         # Bybit не даёт прямой taker ratio endpoint без auth, используем OKX
@@ -931,7 +935,7 @@ class BinanceFuturesClient:
                     total    = buy_vol + sell_vol
                     if total > 0:
                         ratio = buy_vol / total
-                        logger.debug(f"[Taker] {symbol}: OKX buy={buy_vol:.0f} sell={sell_vol:.0f} → {ratio:.3f}")
+                        logger.info(f"[Taker] {symbol}: OKX fallback ✅ buy={buy_vol:.0f} sell={sell_vol:.0f} → {ratio:.3f}")
                         return ratio
                 except (ValueError, IndexError):
                     pass
@@ -940,21 +944,27 @@ class BinanceFuturesClient:
         return None
 
     async def get_liquidations(self, symbol: str,
-                                limit: int = 100) -> Optional[Dict]:
+                                limit: int = 100,
+                                period: str = "1h") -> Optional[Dict]:
         """
-        Ликвидации за последний час: Binance(proxy) → Bybit.
-        ИСПРАВЛЕНО: добавлен startTime (без него Binance возвращает HTTP 400).
-        
+        Ликвидации: Binance(proxy) → Bybit.
+        Поддерживаемые period: 30m, 1h, 4h, 1d
+
         ✅ v3.2: Whitelist check — пропускаем Binance если символа нет
+        ✅ v3.3: Добавлены ТФ 30m, 4h, 1d
         """
         await self._init_source()
-        start_time_ms = int((time.time() - 3600) * 1000)   # последний час
+
+        # Маппинг period → секунды
+        period_seconds = {"30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
+        seconds = period_seconds.get(period, 3600)
+        start_time_ms = int((time.time() - seconds) * 1000)
 
         # ── 1. Binance (с whitelist проверкой) ───────────────────────────────
         if self._use_binance:
             is_available = await self._is_binance_symbol_available(symbol)
             if not is_available:
-                logger.debug(f"[Liq] {symbol}: не на Binance → сразу к Bybit")
+                logger.info(f"[Liq] {symbol}: не на Binance → сразу к Bybit")
             else:
                 try:
                     d = await self._binance("/fapi/v1/allForceOrders",
@@ -972,6 +982,7 @@ class BinanceFuturesClient:
                             else:                short_liq += usd
                         total = long_liq + short_liq
                         if total > 0:
+                            logger.info(f"[Liq] {symbol}: Binance ✅ total=${total:,.0f}")
                             return {
                                 "total_usd":   total,
                                 "long_liq_usd":  long_liq,
@@ -979,12 +990,45 @@ class BinanceFuturesClient:
                                 "dominant_side": "LONG" if long_liq > short_liq
                                                  else "SHORT" if short_liq > long_liq else None
                             }
+                        logger.info(f"[Liq] {symbol}: Binance пусто/404 → fallback к OKX")
                 except Exception as e:
-                    logger.debug(f"[Liq] {symbol}: Binance error — {e}")
+                    logger.info(f"[Liq] {symbol}: Binance error — {e} → fallback к OKX")
 
         # ── 2. Bybit (нет endpoint ликвидаций без auth) ─────────────────────
-        # Пропускаем — данные будут None
+        # Пропускаем — требуется API key
 
+        # ── 3. OKX direct fallback ─────────────────────────────────────────
+        # OKX: /api/v5/rubik/stat/liquidation-orders
+        # Формат: [[ts, longVol, shortVol, longPos, shortPos], ...]
+        okx_period = {"30m": "5m", "1h": "1H", "4h": "4H", "1d": "1D"}.get(period, "1H")
+        inst_id = self._to_okx_instid(symbol)
+        data = await self._okx(
+            "/api/v5/rubik/stat/liquidation-orders",
+            {"instId": inst_id, "instType": "SWAP", "mktType": "SWAP", "period": okx_period, "limit": limit}
+        )
+        if data and len(data) > 0:
+            long_liq = short_liq = 0.0
+            for row in data:
+                if len(row) >= 3:
+                    try:
+                        long_vol = float(row[1])  # longLiquidationVolume
+                        short_vol = float(row[2])  # shortLiquidationVolume
+                        long_liq += long_vol
+                        short_liq += short_vol
+                    except (ValueError, IndexError):
+                        continue
+            total = long_liq + short_liq
+            if total > 0:
+                logger.info(f"[Liq] {symbol}: OKX fallback ✅ total=${total:,.0f}")
+                return {
+                    "total_usd": total,
+                    "long_liq_usd": long_liq,
+                    "short_liq_usd": short_liq,
+                    "dominant_side": "LONG" if long_liq > short_liq
+                                     else "SHORT" if short_liq > long_liq else None
+                }
+
+        logger.info(f"[Liq] {symbol}: все источники пустые")
         return None
 
     async def get_top_trader_position_ratio(self, symbol: str,
