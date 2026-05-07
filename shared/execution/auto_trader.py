@@ -180,9 +180,15 @@ class AutoTrader:
                 sl_dist  = abs(entry_price - stop_loss)
                 tp1_dist = abs(tp1_price - entry_price)
                 rr = tp1_dist / sl_dist if sl_dist > 0 else 0
+                self._last_rr = round(rr, 2)  # ← FIX: was never assigned
 
                 if rr < self.config.min_rr_ratio:
                     print(f"{pfx} ⏸ SKIP — RR too low ({rr:.2f} < {self.config.min_rr_ratio})")
+                    await self._tg(
+                        f"⏸ <b>[{mode}]</b> <code>#{symbol}</code>\\n"
+                        f"RR слишком низкий: <b>{rr:.2f}</b> < {self.config.min_rr_ratio}\\n"
+                        f"Entry={entry_price} | TP1={tp1_price} | SL={stop_loss}"
+                    )
                     return None
                 print(f"{pfx} ✅ RR={rr:.2f} >= {self.config.min_rr_ratio}")
             except Exception as e:

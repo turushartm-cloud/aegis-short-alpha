@@ -300,6 +300,22 @@ class BinanceFuturesClient:
             logger.debug(f"[Bybit] ERROR | {endpoint} | {type(e).__name__}: {e}")
             return None
 
+    # Log deduplication: {(endpoint, symbol_key): last_logged_ts}
+    # Suppresses repeated 404/400 for same endpoint+symbol within LOG_SUPPRESS_TTL seconds
+    _log_suppress:     dict = {}
+    LOG_SUPPRESS_TTL:  int  = 300   # suppress identical error for 5 min
+
+    def _should_log_error(self, endpoint: str, params: dict) -> bool:
+        """Returns True if this error should be logged (not suppressed)."""
+        symbol = params.get("symbol", "") if params else ""
+        key = (endpoint, symbol)
+        now = time.time()
+        last = BinanceFuturesClient._log_suppress.get(key, 0)
+        if now - last < self.LOG_SUPPRESS_TTL:
+            return False
+        BinanceFuturesClient._log_suppress[key] = now
+        return True
+
     async def _binance(self, endpoint: str, params: Dict = None) -> Optional[Any]:
         await self._rate_limit()
         proxy = self._active_proxy or self._next_proxy()
@@ -314,10 +330,11 @@ class BinanceFuturesClient:
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                # ── Логируем HTTP-ошибки (раньше глотались молча) ──
-                logger.warning(
-                    f"[Binance] HTTP {resp.status} | {endpoint} | proxy={proxy} | params={params}"
-                )
+                # ── Логируем HTTP-ошибки с дедупликацией ────────────────────
+                if self._should_log_error(endpoint, params):
+                    logger.warning(
+                        f"[Binance] HTTP {resp.status} | {endpoint} | proxy={proxy} | params={params}"
+                    )
                 return None
         except asyncio.TimeoutError:
             logger.warning(f"[Binance] TIMEOUT | {endpoint} | proxy={proxy}")
