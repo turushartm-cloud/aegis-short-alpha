@@ -1000,8 +1000,9 @@ class BinanceFuturesClient:
         # ── 3. OKX direct fallback ─────────────────────────────────────────
         # OKX: /api/v5/rubik/stat/liquidation-orders
         # Формат: [[ts, longVol, shortVol, longPos, shortPos], ...]
+        # instId для perpetual: BTC-USDT-SWAP
         okx_period = {"30m": "5m", "1h": "1H", "4h": "4H", "1d": "1D"}.get(period, "1H")
-        inst_id = self._to_okx_instid(symbol)
+        inst_id = self._to_okx_instid(symbol) + "-SWAP"
         data = await self._okx(
             "/api/v5/rubik/stat/liquidation-orders",
             {"instId": inst_id, "instType": "SWAP", "mktType": "SWAP", "period": okx_period, "limit": limit}
