@@ -1,5 +1,5 @@
 """
-Market Data Client v2.1 — Bybit (основной) + Binance через прокси
+Market Data Client v3.2 — Bybit (основной) + Binance через прокси
 
 ИЗМЕНЕНИЯ v2.1:
   ✅ get_all_symbols: default min_volume снижен 5M → 300K (было 50 монет, стало 150-200)
@@ -13,6 +13,11 @@ Market Data Client v2.1 — Bybit (основной) + Binance через про
   ✅ get_breakout_data()   — быстрый метод только для breakout проверки
   ✅ get_volume_spike_ratio() — отдельный метод для volume spike
   ✅ _symbols_bybit: возвращает до MAX_WATCHLIST символов (не ограничено 200)
+
+ИЗМЕНЕНИЯ v3.2:
+  ✅ NEW: Binance whitelist cache — предотвращает 404 ошибки для несуществующих пар
+       Проверка через /fapi/v1/exchangeInfo перед запросом OI/taker/LS
+       Fallback: Binance → Bybit → OKX для пар которых нет на Binance
 """
 
 import os
@@ -178,6 +183,11 @@ class BinanceFuturesClient:
     _dead_symbols:    dict = {}
     DEAD_SYMBOL_TTL:  int  = 3600   # 1 час — потом перепроверяем
     DEAD_SYMBOL_HITS: int  = 3      # сколько подряд фейлов → мёртвый
+
+    # ✅ NEW: Binance whitelist cache — предотвращает 404 для несуществующих пар
+    _binance_symbols_cache:     Optional[set] = None
+    _binance_symbols_last_update: float = 0.0
+    BINANCE_SYMBOLS_TTL:        int   = 3600  # Обновляем whitelist каждый час
 
     def __init__(self, api_key=None, api_secret=None):
         self.api_key = api_key or os.getenv("BINANCE_API_KEY", "")
@@ -403,6 +413,50 @@ class BinanceFuturesClient:
 
     def _mark_symbol_ok(self, symbol: str):
         BinanceFuturesClient._dead_symbols.pop(symbol, None)
+
+    # =========================================================================
+    # ✅ NEW: BINANCE WHITELIST — предотвращает 404 для несуществующих пар
+    # =========================================================================
+
+    async def _load_binance_symbols(self) -> set:
+        """Загрузить список всех активных USDT фьючерсов с Binance."""
+        try:
+            session = await self._get_session()
+            async with session.get(
+                f"{self.BINANCE_URL}/fapi/v1/exchangeInfo",
+                timeout=aiohttp.ClientTimeout(total=10),
+                ssl=False
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    symbols = set()
+                    for s in data.get("symbols", []):
+                        # Только активные USDT фьючерсы
+                        if (s.get("status") == "TRADING" and 
+                            s.get("contractType") == "PERPETUAL" and
+                            s.get("quoteAsset") == "USDT"):
+                            symbols.add(s.get("symbol", ""))
+                    BinanceFuturesClient._binance_symbols_cache = symbols
+                    BinanceFuturesClient._binance_symbols_last_update = time.time()
+                    logger.debug(f"[Binance] Whitelist loaded: {len(symbols)} symbols")
+                    return symbols
+        except Exception as e:
+            logger.warning(f"[Binance] Failed to load whitelist: {e}")
+        return set()
+
+    async def _is_binance_symbol_available(self, symbol: str) -> bool:
+        """Проверить существует ли пара на Binance фьючерсах."""
+        # Если кэш устарел или пуст — обновляем
+        now = time.time()
+        if (BinanceFuturesClient._binance_symbols_cache is None or 
+            now - BinanceFuturesClient._binance_symbols_last_update > self.BINANCE_SYMBOLS_TTL):
+            await self._load_binance_symbols()
+        
+        # Если кэш всё ещё None (ошибка загрузки) — разрешаем запрос (fallback к 404)
+        if BinanceFuturesClient._binance_symbols_cache is None:
+            return True
+            
+        return symbol in BinanceFuturesClient._binance_symbols_cache
 
     async def _req(self, binance_ep: str, bybit_ep: str,
                    binance_params: Dict = None,
@@ -661,15 +715,21 @@ class BinanceFuturesClient:
         OI история: Binance(proxy) → Bybit → OKX(direct).
         Возвращает [{sumOpenInterest: float}, ...] — старый формат сохранён.
         Поддерживаемые period: 5m, 15m, 30m, 1h, 4h, 1d
+        
+        ✅ v3.2: Whitelist check — пропускаем Binance если символа нет на бирже
         """
         await self._init_source()
 
-        # ── 1. Binance via proxy ──────────────────────────────────────────────
+        # ── 1. Binance via proxy (с whitelist проверкой) ──────────────────────
         if self._use_binance:
-            d = await self._binance("/fapi/v1/openInterestHist",
-                                    {"symbol": symbol, "period": period, "limit": limit})
-            if d and len(d) >= 2:
-                return d
+            is_available = await self._is_binance_symbol_available(symbol)
+            if is_available:
+                d = await self._binance("/fapi/v1/openInterestHist",
+                                        {"symbol": symbol, "period": period, "limit": limit})
+                if d and len(d) >= 2:
+                    return d
+            else:
+                logger.debug(f"[OI] {symbol}: не на Binance → сразу к Bybit/OKX")
 
         # ── 2. Bybit ─────────────────────────────────────────────────────────
         imap_bybit = {"5m": "5min", "15m": "15min", "30m": "30min",
@@ -746,19 +806,25 @@ class BinanceFuturesClient:
         """
         L/S ratio (% лонгов, 0-100): Binance(proxy) → Bybit → OKX.
         Санитарный диапазон 10-90%, вне — возврат 50.0 (дефолт).
+        
+        ✅ v3.2: Whitelist check — пропускаем Binance если символа нет
         """
         await self._init_source()
 
-        # ── 1. Binance ────────────────────────────────────────────────────────
+        # ── 1. Binance (с whitelist проверкой) ────────────────────────────────
         if self._use_binance:
-            d = await self._binance("/futures/data/topLongShortAccountRatio",
-                                    {"symbol": symbol, "period": period, "limit": 1})
-            if d and len(d) > 0:
-                raw = d[0].get("longAccount", 0)
-                val = float(raw) * 100 if float(raw) <= 1 else float(raw)
-                if 10 <= val <= 90:
-                    logger.debug(f"[LS] {symbol}: Binance → {val:.1f}%")
-                    return round(val, 1)
+            is_available = await self._is_binance_symbol_available(symbol)
+            if is_available:
+                d = await self._binance("/futures/data/topLongShortAccountRatio",
+                                        {"symbol": symbol, "period": period, "limit": 1})
+                if d and len(d) > 0:
+                    raw = d[0].get("longAccount", 0)
+                    val = float(raw) * 100 if float(raw) <= 1 else float(raw)
+                    if 10 <= val <= 90:
+                        logger.debug(f"[LS] {symbol}: Binance → {val:.1f}%")
+                        return round(val, 1)
+            else:
+                logger.debug(f"[LS] {symbol}: не на Binance → сразу к Bybit/OKX")
 
         # ── 2. Bybit ─────────────────────────────────────────────────────────
         imap = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h"}
@@ -803,21 +869,27 @@ class BinanceFuturesClient:
         """
         Taker Buy/Sell ratio (0=продавцы, 1=покупатели): Binance→Bybit→OKX.
         ИСПРАВЛЕНО: раньше работало ТОЛЬКО при _use_binance=True.
+        
+        ✅ v3.2: Whitelist check — пропускаем Binance если символа нет
         """
         await self._init_source()
 
-        # ── 1. Binance ────────────────────────────────────────────────────────
+        # ── 1. Binance (с whitelist проверкой) ────────────────────────────────
         if self._use_binance:
-            d = await self._binance("/futures/data/takerBuySellVolRatio",
-                                    {"symbol": symbol, "period": period, "limit": 1})
-            if d and len(d) > 0:
-                buy_vol  = float(d[0].get("buyVol",  0))
-                sell_vol = float(d[0].get("sellVol", 0))
-                total = buy_vol + sell_vol
-                if total > 0:
-                    ratio = buy_vol / total
-                    logger.debug(f"[Taker] {symbol}: Binance buy={buy_vol:.0f} sell={sell_vol:.0f} → {ratio:.3f}")
-                    return ratio
+            is_available = await self._is_binance_symbol_available(symbol)
+            if is_available:
+                d = await self._binance("/futures/data/takerBuySellVolRatio",
+                                        {"symbol": symbol, "period": period, "limit": 1})
+                if d and len(d) > 0:
+                    buy_vol  = float(d[0].get("buyVol",  0))
+                    sell_vol = float(d[0].get("sellVol", 0))
+                    total = buy_vol + sell_vol
+                    if total > 0:
+                        ratio = buy_vol / total
+                        logger.debug(f"[Taker] {symbol}: Binance buy={buy_vol:.0f} sell={sell_vol:.0f} → {ratio:.3f}")
+                        return ratio
+            else:
+                logger.debug(f"[Taker] {symbol}: не на Binance → сразу к OKX")
 
         # ── 2. Bybit — используем klines quote_volume как прокси delta ────────
         # Bybit не даёт прямой taker ratio endpoint без auth, используем OKX

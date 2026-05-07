@@ -1,5 +1,5 @@
 """
-Auto Trader v3.0 — HARDENED ENTRY CONDITIONS
+Auto Trader v3.1 — HARDENED ENTRY CONDITIONS
 
 ИЗМЕНЕНИЯ v3.0:
   ✅ max_daily_risk: 5.0% → 3.0% (жёстче дневной лимит)
@@ -11,6 +11,10 @@ Auto Trader v3.0 — HARDENED ENTRY CONDITIONS
   ✅ max_positions: 20 → 12 (меньше одновременных позиций)
   ✅ Cooldown 30с между открытиями (антидубль)
   ✅ code=101209 RETRY: парсим фактический лимит → retry
+
+ИЗМЕНЕНИЯ v3.1:
+  ✅ min_rr_ratio: 1.5 → 1.0 (более гибкие входы для стратегий с близким TP1)
+  ✅ FIX: Telegram HTML parse error (экранирование newline)
 """
 
 import os
@@ -48,7 +52,7 @@ class TradeConfig:
     risk_per_trade:      float = 0.0004      # ✅ v3.0: было 0.0005 → -20%
     max_daily_risk:      float = 3.0         # ✅ v3.0: было 5.0% → жёстче
     max_daily_trades:    int   = 12          # ✅ v3.0: НОВЫЙ лимит сделок
-    min_rr_ratio:        float = 1.5         # ✅ v3.0: НОВЫЙ RR фильтр TP1/SL
+    min_rr_ratio:        float = 1.0         # ✅ v3.1: снижено с 1.5 → 1.0 для более гибких входов
     default_leverage:    int   = 20
     min_leverage:        int   = 5
     max_leverage:        int   = 50
@@ -185,8 +189,8 @@ class AutoTrader:
                 if rr < self.config.min_rr_ratio:
                     print(f"{pfx} ⏸ SKIP — RR too low ({rr:.2f} < {self.config.min_rr_ratio})")
                     await self._tg(
-                        f"⏸ <b>[{mode}]</b> <code>#{symbol}</code>\\n"
-                        f"RR слишком низкий: <b>{rr:.2f}</b> < {self.config.min_rr_ratio}\\n"
+                        f"⏸ <b>[{mode}]</b> <code>#{symbol}</code>\n"
+                        f"RR слишком низкий: <b>{rr:.2f}</b> < {self.config.min_rr_ratio}\n"
                         f"Entry={entry_price} | TP1={tp1_price} | SL={stop_loss}"
                     )
                     return None
