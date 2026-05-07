@@ -369,6 +369,9 @@ async def lifespan(app: FastAPI):
                     bingx_client=bingx, config=trade_cfg, telegram=state.telegram
                 )
                 print(f"✅ BingX {'DEMO' if Config.BINGX_DEMO else 'REAL'} AutoTrader")
+                if Config.BINGX_DEMO:
+                    print("⚠️  BINGX_DEMO_MODE=true — ордера идут на ДЕМО-счёт!")
+                    print("⚠️  Для реальной торговли: BINGX_DEMO_MODE=false")
             else:
                 print("❌ BingX connection failed")
         except Exception as e:
@@ -992,7 +995,16 @@ async def scan_market():
                     lines += f"  {name}: <b>{score_val}</b>/100  {bar(score_val)}\n"
                     lines += f"    <i>{desc}</i>\n"
 
-                auto_status = "🤖 В исполнении" if Config.AUTO_TRADING else "📋 Только уведомление"
+                demo_flag = " [DEMO]" if Config.BINGX_DEMO else " [REAL]"
+                if not Config.AUTO_TRADING:
+                    auto_status = "📋 Только уведомление"
+                elif exchange_full:
+                    auto_status = f"📊 TG-уведомление (биржа заполнена)"
+                elif state.is_paused:
+                    auto_status = "⏸ Бот на паузе"
+                else:
+                    auto_status = f"⏳ Открываем на BingX{demo_flag}..."
+
                 await state.telegram.send_message(
                     f"{grade_emoji} <b>Aegis-анализ LONG — {signal['symbol']}</b>\n"
                     f"Оценка: <b>{grade}</b> | Сила: {strength_ru}\n\n"
@@ -1004,17 +1016,35 @@ async def scan_market():
 
             state.redis.save_signal(Config.BOT_TYPE, symbol, signal)
 
+            trade_result = None
             if not exchange_full and Config.AUTO_TRADING and not state.is_paused:
                 if state.auto_trader:
                     try:
-                        await state.auto_trader.execute_signal(signal)
-                        active_count += 1
-                        exchange_full = active_count >= Config.MAX_POSITIONS
+                        trade_result = await state.auto_trader.execute_signal(signal)
+                        if trade_result:
+                            active_count += 1
+                            exchange_full = active_count >= Config.MAX_POSITIONS
                     except Exception as e:
                         print(f"AutoTrader error {symbol}: {e}")
                 new_signals += 1
             else:
                 tg_only_count += 1
+
+            # ── Итоговый статус после попытки открытия ────────────────────────
+            if Config.AUTO_TRADING and signal.get("aegis_components"):
+                demo_flag = " [DEMO]" if Config.BINGX_DEMO else " [REAL]"
+                if exchange_full and not trade_result:
+                    final_status = f"📊 TG-уведомление (биржа заполнена {active_count}/{Config.MAX_POSITIONS})"
+                elif trade_result:
+                    exchange_label = "BingX DEMO" if Config.BINGX_DEMO else "BingX REAL"
+                    final_status = f"✅ Открыта на {exchange_label}"
+                elif state.is_paused:
+                    final_status = "⏸ Бот на паузе — не открыта"
+                else:
+                    final_status = "⚠️ Виртуальная сделка (ошибка биржи или RR)"
+                await state.telegram.send_message(
+                    f"🔄 <b>#{symbol}</b> — итог: {final_status}"
+                )
 
             await asyncio.sleep(0.5)
 
