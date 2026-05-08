@@ -1,5 +1,5 @@
 """
-Market Data Client v3.3 — Bybit (основной) + Binance через прокси
+Market Data Client v3.4 — Bybit (основной) + Binance через прокси
 
 ИЗМЕНЕНИЯ v2.1:
   ✅ get_all_symbols: default min_volume снижен 5M → 300K (было 50 монет, стало 150-200)
@@ -22,6 +22,11 @@ Market Data Client v3.3 — Bybit (основной) + Binance через про
 ИЗМЕНЕНИЯ v3.3:
   ✅ get_liquidations(): добавлены ТФ 30m, 4h, 1d (был только 1h)
   ✅ Логирование fallback: debug → info (видно в консоли)
+
+ИЗМЕНЕНИЯ v3.4:
+  ✅ OKX errors: debug → info (видны ошибки OKX в логах)
+  ✅ Детальное логирование ликвидаций: запрос/ответ/парсинг ошибок
+  ✅ Явное логирование когда OKX вернул пустые данные или нулевые ликвидации
 """
 
 import os
@@ -383,13 +388,13 @@ class BinanceFuturesClient:
                     body = await resp.json()
                     if body.get("code") == "0":
                         return body.get("data")
-                    logger.debug(f"[OKX] {endpoint} | code={body.get('code')} msg={body.get('msg')}")
+                    logger.info(f"[OKX] {endpoint} | code={body.get('code')} msg={body.get('msg')}")
                 else:
-                    logger.debug(f"[OKX] HTTP {resp.status} | {endpoint}")
+                    logger.info(f"[OKX] HTTP {resp.status} | {endpoint}")
         except asyncio.TimeoutError:
-            logger.debug(f"[OKX] TIMEOUT | {endpoint}")
+            logger.info(f"[OKX] TIMEOUT | {endpoint}")
         except Exception as e:
-            logger.debug(f"[OKX] ERROR | {endpoint} | {type(e).__name__}: {e}")
+            logger.info(f"[OKX] ERROR | {endpoint} | {type(e).__name__}: {e}")
         return None
 
     # =========================================================================
@@ -947,11 +952,12 @@ class BinanceFuturesClient:
                                 limit: int = 100,
                                 period: str = "1h") -> Optional[Dict]:
         """
-        Ликвидации: Binance(proxy) → Bybit.
+        Ликвидации: Binance(proxy) → OKX.
         Поддерживаемые period: 30m, 1h, 4h, 1d
 
         ✅ v3.2: Whitelist check — пропускаем Binance если символа нет
         ✅ v3.3: Добавлены ТФ 30m, 4h, 1d
+        ✅ v3.4: Детальное логирование OKX + видимые ошибки OKX
         """
         await self._init_source()
 
@@ -1003,10 +1009,12 @@ class BinanceFuturesClient:
         # instId для perpetual: BTC-USDT-SWAP
         okx_period = {"30m": "5m", "1h": "1H", "4h": "4H", "1d": "1D"}.get(period, "1H")
         inst_id = self._to_okx_instid(symbol) + "-SWAP"
+        logger.info(f"[Liq] {symbol}: OKX запрос — instId={inst_id}, period={okx_period}")
         data = await self._okx(
             "/api/v5/rubik/stat/liquidation-orders",
             {"instId": inst_id, "instType": "SWAP", "mktType": "SWAP", "period": okx_period, "limit": limit}
         )
+        logger.info(f"[Liq] {symbol}: OKX ответ — data={data is not None}, len={len(data) if data else 0}")
         if data and len(data) > 0:
             long_liq = short_liq = 0.0
             for row in data:
@@ -1016,8 +1024,11 @@ class BinanceFuturesClient:
                         short_vol = float(row[2])  # shortLiquidationVolume
                         long_liq += long_vol
                         short_liq += short_vol
-                    except (ValueError, IndexError):
+                    except (ValueError, IndexError) as e:
+                        logger.warning(f"[Liq] {symbol}: ошибка парсинга row={row}, error={e}")
                         continue
+                else:
+                    logger.warning(f"[Liq] {symbol}: некорректная строка row={row}, len={len(row)}")
             total = long_liq + short_liq
             if total > 0:
                 logger.info(f"[Liq] {symbol}: OKX fallback ✅ total=${total:,.0f}")
@@ -1028,6 +1039,10 @@ class BinanceFuturesClient:
                     "dominant_side": "LONG" if long_liq > short_liq
                                      else "SHORT" if short_liq > long_liq else None
                 }
+            else:
+                logger.info(f"[Liq] {symbol}: OKX вернул данные но ликвидации=0 (long={long_liq}, short={short_liq})")
+        else:
+            logger.info(f"[Liq] {symbol}: OKX вернул пустой ответ")
 
         logger.info(f"[Liq] {symbol}: все источники пустые")
         return None

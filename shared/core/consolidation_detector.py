@@ -1,14 +1,16 @@
 """
-Consolidation Detector v1.0
+Consolidation Detector v1.1
 Находит зоны консолидации (range-bound markets) и блокирует входы в середине диапазона.
 
 Принцип:
   1. Находим зоны накопления/распределения (flat price action)
-  2. Блокируем сигналы если цена в середине диапазона (70% центра)
+  2. Блокируем сигналы если цена в середине диапазона (45-65% для LONG)
   3. Разрешаем входы только:
      - На пробое зоны (breakout)
      - На Spring (ложный пробой вниз для LONG)
      - На Upthrust (ложный пробой вверх для SHORT)
+
+✅ v1.1: Расширена зона для LONG — теперь 0-45% разрешено (было 0-35%)
 
 Использование:
     cd = ConsolidationDetector(lookback=20, max_range_pct=5.0)
@@ -26,6 +28,9 @@ Consolidation Detector v1.0
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import statistics
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -82,16 +87,20 @@ class ConsolidationResult:
         
         pos = self._price_position(price)
         
+        # ✅ v1.1: Расширенная зона для LONG (0-45% разрешено, 45-65% блок)
         if pos <= 0.15:
-            return "near_support"  # Хорошо для LONG
+            status = "near_support"  # Хорошо для LONG
         elif pos >= 0.85:
-            return "near_resistance"  # Хорошо для SHORT
-        elif 0.35 <= pos <= 0.65:
-            return "mid_range"  # БЛОКИРОВАТЬ
-        elif pos < 0.45:
-            return "lower_half"  # Осторожно LONG (0-45% для лучших входов)
+            status = "near_resistance"  # Хорошо для SHORT
+        elif pos >= 0.65:
+            status = "upper_half"  # Осторожно SHORT (65-85%)
+        elif pos >= 0.45:
+            status = "mid_range"  # БЛОКИРОВАТЬ (45-65%)
         else:
-            return "upper_half"  # Осторожно SHORT
+            status = "lower_half"  # Разрешено LONG (15-45%)
+        
+        logger.info(f"[CONSOLIDATION] pos={pos:.2%} → {status} (range={self.range_pct:.1f}%)")
+        return status
 
 
 class ConsolidationDetector:
