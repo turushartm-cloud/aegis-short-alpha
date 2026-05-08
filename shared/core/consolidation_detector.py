@@ -88,8 +88,8 @@ class ConsolidationResult:
             return "near_resistance"  # Хорошо для SHORT
         elif 0.35 <= pos <= 0.65:
             return "mid_range"  # БЛОКИРОВАТЬ
-        elif pos < 0.35:
-            return "lower_half"  # Осторожно LONG
+        elif pos < 0.45:
+            return "lower_half"  # Осторожно LONG (0-45% для лучших входов)
         else:
             return "upper_half"  # Осторожно SHORT
 
