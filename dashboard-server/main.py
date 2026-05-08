@@ -504,11 +504,11 @@ async def history(limit: int = 40):
     """History with 30-minute caching."""
     return _get_cached_history(limit)
 
-@app.post("/api/cache/invalidate")
+@app.api_route("/api/cache/invalidate", methods=["GET", "POST"])
 async def invalidate_cache():
     """Manually invalidate cache (for force refresh)."""
     cache.invalidate()
-    return {"status": "ok", "message": "Cache invalidated"}
+    return {"status": "ok", "message": "Cache invalidated", "timestamp": datetime.utcnow().isoformat()}
 
 @app.get("/api/cache/stats")
 async def cache_stats():
