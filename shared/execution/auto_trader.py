@@ -1,5 +1,5 @@
 """
-Auto Trader v3.1 — HARDENED ENTRY CONDITIONS
+Auto Trader v3.2 — HARDENED ENTRY CONDITIONS
 
 ИЗМЕНЕНИЯ v3.0:
   ✅ max_daily_risk: 5.0% → 3.0% (жёстче дневной лимит)
@@ -15,6 +15,9 @@ Auto Trader v3.1 — HARDENED ENTRY CONDITIONS
 ИЗМЕНЕНИЯ v3.1:
   ✅ min_rr_ratio: 1.5 → 1.0 (более гибкие входы для стратегий с близким TP1)
   ✅ FIX: Telegram HTML parse error — убраны <br>, используем \n
+
+ИЗМЕНЕНИЯ v3.2:
+  ✅ FIX: Telegram HTML escaping — экранируем &, <, > для избежания parse errors
 """
 
 import os
@@ -42,6 +45,19 @@ def _parse_max_notional_from_error(error_msg: str) -> Optional[float]:
         except Exception:
             pass
     return None
+
+
+def _escape_value(value: str) -> str:
+    """
+    Экранировать HTML спецсимволы в пользовательских значениях.
+    Использовать для symbol, error_msg и других внешних данных.
+    """
+    if not value or not isinstance(value, str):
+        return value
+    return (value
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
 
 
 @dataclass
@@ -155,8 +171,9 @@ class AutoTrader:
         self._check_daily_reset()
         if self.daily_pnl <= -self.config.max_daily_risk:
             print(f"{pfx} ⏸ SKIP — daily risk limit {self.daily_pnl:.2f}% <= -{self.config.max_daily_risk}%")
+            safe_symbol = _escape_value(symbol)
             await self._tg(
-                f"⏸ <b>[{mode}]</b> <code>#{symbol}</code>: "
+                f"⏸ <b>[{mode}]</b> <code>#{safe_symbol}</code>: "
                 f"дневной лимит ({self.daily_pnl:.2f}% ≤ -{self.config.max_daily_risk}%)"
             )
             return None
@@ -164,8 +181,9 @@ class AutoTrader:
         # ── 1c. Daily trade count limit ───────────────────────────────────────
         if self.daily_trades >= self.config.max_daily_trades:
             print(f"{pfx} ⏸ SKIP — daily trade limit ({self.daily_trades}/{self.config.max_daily_trades})")
+            safe_symbol = _escape_value(symbol)
             await self._tg(
-                f"⏸ <b>[{mode}]</b> <code>#{symbol}</code>: "
+                f"⏸ <b>[{mode}]</b> <code>#{safe_symbol}</code>: "
                 f"лимит сделок за день ({self.daily_trades}/{self.config.max_daily_trades})"
             )
             return None
@@ -188,8 +206,9 @@ class AutoTrader:
 
                 if rr < self.config.min_rr_ratio:
                     print(f"{pfx} ⏸ SKIP — RR too low ({rr:.2f} < {self.config.min_rr_ratio})")
+                    safe_symbol = _escape_value(symbol)
                     await self._tg(
-                        f"⏸ <b>[{mode}]</b> <code>#{symbol}</code>\n"
+                        f"⏸ <b>[{mode}]</b> <code>#{safe_symbol}</code>\n"
                         f"RR слишком низкий: <b>{rr:.2f}</b> < {self.config.min_rr_ratio}\n"
                         f"Entry={entry_price} | TP1={tp1_price} | SL={stop_loss}"
                     )
@@ -214,9 +233,10 @@ class AutoTrader:
 
         if n_pos >= self.config.max_positions:
             print(f"{pfx} ⏸ SKIP — max positions")
+            safe_symbol = _escape_value(symbol)
             await self._tg_reply(
                 f"⏸ <b>Биржа заполнена</b> ({n_pos}/{self.config.max_positions})\n"
-                f"<b>#{symbol}</b> — сигнал пропущен", tg_msg_id
+                f"<b>#{safe_symbol}</b> — сигнал пропущен", tg_msg_id
             )
             return None
 
@@ -313,11 +333,13 @@ class AutoTrader:
             err  = self.bingx.last_error or "unknown"
             code = self.bingx.last_error_code
             print(f"{pfx} ❌ ORDER FAILED — code={code} | {err}")
+            safe_symbol = _escape_value(symbol)
+            safe_err = _escape_value(err)
             await self._tg(
                 f"❌ <b>AutoTrader [{mode}] — ОРДЕР ОТКЛОНЁН</b>\n\n"
-                f"<code>#{symbol}</code> {direction.upper()}\n"
+                f"<code>#{safe_symbol}</code> {direction.upper()}\n"
                 f"Score: {signal_score:.0f} | SL: {stop_loss}\n\n"
-                f"<pre>{err}</pre>"
+                f"<pre>{safe_err}</pre>"
             )
             return None
 
@@ -360,9 +382,10 @@ class AutoTrader:
         print(f"✅ {pfx} Position opened [{mode}]! id={order.order_id}")
 
         d_emoji    = "🟢" if direction == "long" else "🔴"
+        safe_symbol = _escape_value(symbol)
         notify_msg = (
             f"🤖 <b>AUTO-TRADE [{mode}]</b>\n\n"
-            f"{d_emoji} <code>#{symbol}</code> {direction.upper()}\n"
+            f"{d_emoji} <code>#{safe_symbol}</code> {direction.upper()}\n"
             f"📍 Entry: <b>{entry_price}</b>\n"
             f"🛑 SL: <b>{stop_loss}</b>\n"
             f"📊 Size: {order.size} | {leverage}x | {actual_risk*100:.3f}% risk\n"
