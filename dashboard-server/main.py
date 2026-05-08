@@ -1,14 +1,22 @@
 """
-Aegis Dashboard Server v3.2
+Aegis Dashboard Server v3.3
+✅ 30-minute caching — reduces Redis load
+✅ Health-check before every request — detects disconnections
+✅ Auto-reconnect with exponential backoff
+✅ Connection pool for better performance
+
 Fixes based on actual Redis debug data:
   - position keys: both SYMBOL and SYM-BOL (BingX dash format)
   - today_stats null → calculate from all_trades filtered by today
   - mode from state["status"] field
   - virtual signals from state["active_signals"] or signals without order_id
 """
-import os, json
+import os
+import json
+import time
+import threading
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,32 +28,181 @@ try:
 except ImportError:
     REDIS_AVAILABLE = False
 
-LONG_REDIS_URL  = os.getenv("LONG_REDIS_URL",  "")
+# ── Config ────────────────────────────────────────────────────────────────
+LONG_REDIS_URL = os.getenv("LONG_REDIS_URL", "")
 SHORT_REDIS_URL = os.getenv("SHORT_REDIS_URL", "")
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL", "1800"))  # 30 min default
+MAX_RECONNECT_ATTEMPTS = 5
+RECONNECT_DELAY_BASE = 2  # seconds
 
-_rc: Dict[str, Optional[object]] = {"long": None, "short": None}
+# ── Connection Pool with Health Check & Auto-Reconnect ─────────────────────
+class RedisConnectionPool:
+    """
+    Connection pool with:
+    - Lazy connection (connect on first use)
+    - Health check before every operation
+    - Auto-reconnect with exponential backoff
+    - Thread-safe operations
+    """
 
-def _conn(url: str):
-    if not url or not REDIS_AVAILABLE:
+    def __init__(self, url: str, name: str):
+        self.url = url
+        self.name = name
+        self._conn: Optional[object] = None
+        self._lock = threading.Lock()
+        self._last_error: Optional[str] = None
+        self._reconnect_attempts = 0
+        self._last_successful_ping = 0.0
+
+    def _create_connection(self) -> Optional[object]:
+        """Create new Redis connection with connection pool settings."""
+        if not self.url or not REDIS_AVAILABLE:
+            return None
+        try:
+            # Use connection pool for better performance
+            conn = redis_lib.from_url(
+                self.url,
+                decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                max_connections=10,  # Pool size
+                health_check_interval=30,  # Auto health-check every 30s
+            )
+            conn.ping()
+            self._reconnect_attempts = 0
+            self._last_successful_ping = time.time()
+            print(f"✅ [{self.name}] Redis connected")
+            return conn
+        except Exception as e:
+            self._last_error = str(e)
+            print(f"❌ [{self.name}] Redis connect error: {e}")
+            return None
+
+    def _should_reconnect(self) -> bool:
+        """Check if we should attempt reconnect (exponential backoff)."""
+        if self._reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
+            return False
+        # Exponential backoff: 2s, 4s, 8s, 16s, 32s
+        delay = RECONNECT_DELAY_BASE * (2 ** self._reconnect_attempts)
+        time_since_error = time.time() - (self._last_successful_ping or 0)
+        return time_since_error > delay
+
+    def get_connection(self) -> Optional[object]:
+        """Get healthy connection (auto-reconnect if needed)."""
+        with self._lock:
+            # Test existing connection
+            if self._conn is not None:
+                try:
+                    self._conn.ping()
+                    self._last_successful_ping = time.time()
+                    return self._conn
+                except Exception as e:
+                    print(f"⚠️ [{self.name}] Redis ping failed: {e}")
+                    self._conn = None
+
+            # Try to reconnect if eligible
+            if self._conn is None:
+                if self._reconnect_attempts == 0 or self._should_reconnect():
+                    self._reconnect_attempts += 1
+                    self._conn = self._create_connection()
+
+            return self._conn
+
+    def health_check(self) -> Tuple[bool, str]:
+        """Explicit health check for monitoring."""
+        conn = self.get_connection()
+        if conn is None:
+            return False, self._last_error or "Not connected"
+        try:
+            conn.ping()
+            info = conn.info("server") if hasattr(conn, "info") else {}
+            version = info.get("redis_version", "unknown")
+            return True, f"OK (Redis v{version})"
+        except Exception as e:
+            return False, str(e)
+
+
+# Global connection pools
+_pools: Dict[str, RedisConnectionPool] = {
+    "long": RedisConnectionPool(LONG_REDIS_URL, "LONG"),
+    "short": RedisConnectionPool(SHORT_REDIS_URL, "SHORT"),
+}
+
+
+def rc(bot: str) -> Optional[object]:
+    """Get healthy Redis connection (with auto-reconnect)."""
+    pool = _pools.get(bot)
+    if not pool:
         return None
-    try:
-        c = redis_lib.from_url(url, decode_responses=True,
-                               socket_timeout=5, socket_connect_timeout=5)
-        c.ping()
-        return c
-    except Exception as e:
-        print(f"Redis connect error: {e}")
-        return None
+    return pool.get_connection()
 
-def rc(bot: str):
-    if _rc[bot] is None:
-        url = LONG_REDIS_URL if bot == "long" else SHORT_REDIS_URL
-        _rc[bot] = _conn(url)
-    return _rc[bot]
+
+def health_check(bot: str) -> Tuple[bool, str]:
+    """Check Redis health for specific bot."""
+    pool = _pools.get(bot)
+    if not pool:
+        return False, "Pool not found"
+    return pool.health_check()
+
+
+# ── Caching Layer ───────────────────────────────────────────────────────────
+class DataCache:
+    """Simple in-memory cache with TTL."""
+
+    def __init__(self, ttl_seconds: int = CACHE_TTL_SECONDS):
+        self.ttl = ttl_seconds
+        self._cache: Dict[str, Tuple[any, float]] = {}  # key -> (value, timestamp)
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[any]:
+        """Get cached value if not expired."""
+        with self._lock:
+            if key not in self._cache:
+                return None
+            value, timestamp = self._cache[key]
+            if time.time() - timestamp > self.ttl:
+                # Expired
+                del self._cache[key]
+                return None
+            return value
+
+    def set(self, key: str, value: any):
+        """Set cache value."""
+        with self._lock:
+            self._cache[key] = (value, time.time())
+
+    def invalidate(self, key: str = None):
+        """Invalidate cache (specific key or all)."""
+        with self._lock:
+            if key:
+                self._cache.pop(key, None)
+            else:
+                self._cache.clear()
+
+    def stats(self) -> Dict:
+        """Cache statistics."""
+        with self._lock:
+            now = time.time()
+            valid = sum(1 for _, ts in self._cache.values() if now - ts <= self.ttl)
+            expired = len(self._cache) - valid
+            return {
+                "total_keys": len(self._cache),
+                "valid": valid,
+                "expired": expired,
+                "ttl_seconds": self.ttl,
+            }
+
+
+# Global cache instance
+cache = DataCache()
+
 
 def jl(s):
-    try:   return json.loads(s) if s else None
-    except: return None
+    try:
+        return json.loads(s) if s else None
+    except:
+        return None
+
 
 def _normalize_symbol(key: str) -> str:
     """AIXBT-USDT → AIXBTUSDT"""
@@ -215,24 +372,20 @@ def _build_perf(bot: str) -> Dict:
         "version":       state.get("version", "?"),
     }
 
-# ── FastAPI ────────────────────────────────────────────────────────────────
-app = FastAPI(title="Aegis Dashboard API", version="3.2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_methods=["*"], allow_headers=["*"])
+# ── Cached Data Fetchers ───────────────────────────────────────────────────
+def _get_cached_overview():
+    """Get overview with caching."""
+    cache_key = "overview"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
 
-@app.get("/health")
-async def health():
-    lc, sc = rc("long"), rc("short")
-    return {"status": "ok", "long_redis": lc is not None,
-            "short_redis": sc is not None,
-            "time": datetime.utcnow().isoformat(), "version": "3.2.0"}
-
-@app.get("/api/overview")
-async def overview():
     lp = _build_perf("long")
     sp = _build_perf("short")
-    return {
+    result = {
         "long":  lp, "short": sp,
+        "cached_at": datetime.utcnow().isoformat(),
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "combined": {
             "total_pnl":    round(lp["total_pnl"] + sp["total_pnl"], 4),
             "daily_pnl":    round(lp["daily_pnl"]  + sp["daily_pnl"], 4),
@@ -247,9 +400,17 @@ async def overview():
             "total_trades": lp["total_trades"] + sp["total_trades"],
         }
     }
+    cache.set(cache_key, result)
+    return result
 
-@app.get("/api/positions")
-async def positions():
+
+def _get_cached_positions():
+    """Get positions with caching."""
+    cache_key = "positions"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
     lc, sc = rc("long"), rc("short")
     lreal  = _get_positions(lc, "long")
     sreal  = _get_positions(sc, "short")
@@ -268,20 +429,91 @@ async def positions():
     virt = ([s for s in lsigs if not s.get("order_id")] +
             [s for s in ssigs if not s.get("order_id")])
 
-    return {
+    result = {
         "real": sorted(real, key=lambda x: x.get("timestamp",""), reverse=True),
         "virtual": sorted(virt, key=lambda x: x.get("timestamp",""), reverse=True),
+        "cached_at": datetime.utcnow().isoformat(),
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
     }
+    cache.set(cache_key, result)
+    return result
 
-@app.get("/api/history")
-async def history(limit: int = 40):
+
+def _get_cached_history(limit: int = 40):
+    """Get history with caching."""
+    cache_key = f"history:{limit}"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
     lc, sc = rc("long"), rc("short")
     lh = _get_history(lc, "long",  max(limit, 200))
     sh = _get_history(sc, "short", max(limit, 200))
     combined = sorted(lh + sh,
         key=lambda x: x.get("closed_at") or x.get("close_time") or x.get("timestamp") or "",
         reverse=True)
-    return {"trades": combined[:limit], "total": len(combined)}
+
+    result = {
+        "trades": combined[:limit],
+        "total": len(combined),
+        "cached_at": datetime.utcnow().isoformat(),
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+    }
+    cache.set(cache_key, result)
+    return result
+
+
+# ── FastAPI ────────────────────────────────────────────────────────────────
+app = FastAPI(title="Aegis Dashboard API", version="3.3.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/health")
+async def health():
+    """Enhanced health check with Redis status and cache stats."""
+    long_ok, long_msg = health_check("long")
+    short_ok, short_msg = health_check("short")
+
+    # Force reconnect check
+    lc = rc("long")
+    sc = rc("short")
+
+    return {
+        "status": "ok" if (long_ok or short_ok) else "degraded",
+        "version": "3.3.0",
+        "time": datetime.utcnow().isoformat(),
+        "redis": {
+            "long": {"connected": long_ok, "message": long_msg},
+            "short": {"connected": short_ok, "message": short_msg},
+        },
+        "cache": cache.stats(),
+    }
+
+@app.get("/api/overview")
+async def overview():
+    """Overview with 30-minute caching."""
+    return _get_cached_overview()
+
+@app.get("/api/positions")
+async def positions():
+    """Positions with 30-minute caching."""
+    return _get_cached_positions()
+
+@app.get("/api/history")
+async def history(limit: int = 40):
+    """History with 30-minute caching."""
+    return _get_cached_history(limit)
+
+@app.post("/api/cache/invalidate")
+async def invalidate_cache():
+    """Manually invalidate cache (for force refresh)."""
+    cache.invalidate()
+    return {"status": "ok", "message": "Cache invalidated"}
+
+@app.get("/api/cache/stats")
+async def cache_stats():
+    """Cache statistics."""
+    return cache.stats()
 
 @app.get("/api/debug/{bot}")
 async def debug(bot: str):
