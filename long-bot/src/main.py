@@ -1038,15 +1038,19 @@ async def scan_market():
                 tg_only_count += 1
 
             # ── Итоговый статус после попытки открытия ────────────────────────
-            if Config.AUTO_TRADING and signal.get("aegis_components"):
+            if signal.get("aegis_components"):
                 demo_flag = " [DEMO]" if Config.BINGX_DEMO else " [REAL]"
                 if exchange_full and not trade_result:
                     final_status = f"📊 TG-уведомление (биржа заполнена {active_count}/{Config.MAX_POSITIONS})"
                 elif trade_result:
                     exchange_label = "BingX DEMO" if Config.BINGX_DEMO else "BingX REAL"
                     final_status = f"✅ Открыта на {exchange_label}"
-                elif state.is_paused:
-                    final_status = "⏸ Бот на паузе — не открыта"
+                elif not Config.AUTO_TRADING or state.is_paused or state.auto_trader is None:
+                    final_status = f"✅ Позиция открыта (ВИРТУАЛЬНО) без исполнения на бирже BingX{demo_flag}"
+                    if state.redis:
+                        saved = state.redis.save_virtual_position(Config.BOT_TYPE, symbol, signal)
+                        if saved:
+                            print(f"✅ Virtual position saved: {symbol}")
                 else:
                     final_status = "⚠️ Виртуальная сделка (ошибка биржи или RR)"
                 await state.telegram.send_message(

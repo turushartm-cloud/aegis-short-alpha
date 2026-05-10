@@ -381,6 +381,7 @@ class AutoTrader:
 
         print(f"✅ {pfx} Position opened [{mode}]! id={order.order_id}")
 
+        exchange_label = "BingX DEMO" if self.config.demo_mode else "BingX REAL"
         d_emoji    = "🟢" if direction == "long" else "🔴"
         safe_symbol = _escape_value(symbol)
         notify_msg = (
@@ -390,7 +391,8 @@ class AutoTrader:
             f"🛑 SL: <b>{stop_loss}</b>\n"
             f"📊 Size: {order.size} | {leverage}x | {actual_risk*100:.3f}% risk\n"
             f"🎯 Score: {signal_score:.0f} | RR: {self._last_rr:.2f}\n"
-            f"🆔 OrderID: {order.order_id}"
+            f"🆔 OrderID: {order.order_id}\n"
+            f"✅ Позиция открыта на бирже {exchange_label}"
         )
         await self._tg_reply(notify_msg, tg_msg_id)
         return position_data
