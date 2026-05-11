@@ -33,7 +33,7 @@ class UpstashRedisClient:
         self.TTL = {
             "signal": 86400,        # 24 часа для сигналов
             "position": 604800,     # 7 дней для подтвержденных позиций
-            "position_unconfirmed": 60,  # 🆕 60 сек для НЕподтвержденных позиций
+            "position_unconfirmed": 1800,  # ✅ FIX: 30 мин (было 60s — вызывало авто-экспири и "1m" сделки)
             "state": 3600,          # 1 час для состояния
             "stats": 2592000,       # 30 дней для статистики
             "cache": 300            # 5 минут для кэша API
@@ -70,7 +70,7 @@ class UpstashRedisClient:
             
             # 🆕 Логирование TTL для дебага
             if not confirmed:
-                print(f"⏱️ [Redis] {symbol}: TTL=60s (unconfirmed), will auto-expire if not confirmed")
+                print(f"⏱️ [Redis] {symbol}: TTL=30min (unconfirmed), will auto-expire if not confirmed")
             
             return True
         except Exception as e:

@@ -271,6 +271,27 @@ def _get_signals(c, bot: str) -> List[Dict]:
         print(f"_get_signals({bot}): {e}")
         return []
 
+# ── Virtual Positions (HASH: {bot}:virtual_positions) ────────────────────
+def _get_virtual_positions_count(c, bot: str) -> int:
+    """✅ FIX: Читаем реальный HASH virtual_positions, не signals без order_id.
+    Возвращает количество активных виртуальных позиций (outcome=None)."""
+    if not c: return 0
+    try:
+        data = c.hgetall(f"{bot}:virtual_positions")
+        if not data: return 0
+        count = 0
+        for val in data.values():
+            try:
+                pos = json.loads(val)
+                if pos.get("outcome") is None:  # только открытые
+                    count += 1
+            except Exception:
+                continue
+        return count
+    except Exception as e:
+        print(f"_get_virtual_positions_count({bot}): {e}")
+        return 0
+
 # ── History ────────────────────────────────────────────────────────────────
 def _get_history(c, bot: str, limit: int = 9999) -> List[Dict]:
     if not c: return []
@@ -346,6 +367,9 @@ def _build_perf(bot: str) -> Dict:
                          if _normalize_symbol(s.get("symbol","")) not in pos_syms]
     total_real = len(real_pos) + len(real_sigs_deduped)
 
+    # ✅ FIX: Читаем реальный HASH virtual_positions (было: signals без order_id — неверно)
+    virtual_count = _get_virtual_positions_count(c, bot)
+
     # Also check state["daily_signals"] for today's signal count
     daily_sigs = state.get("daily_signals", {})
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -362,7 +386,7 @@ def _build_perf(bot: str) -> Dict:
         "losses_today":  ds["losses"],
         "trades_today":  ds["trades"],
         "open_exchange": total_real,
-        "open_virtual":  len(virt_sigs),
+        "open_virtual":  virtual_count,  # ✅ FIX: из {bot}:virtual_positions HASH
         "total_trades":  len(history),
         "mode":          _parse_mode(state),
         "min_score":     state.get("min_score", 60),

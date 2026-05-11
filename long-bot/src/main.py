@@ -1215,6 +1215,9 @@ async def status():
 async def trigger_scan(bg: BackgroundTasks):
     if not state.is_running: raise HTTPException(503, "Not running")
     if state.is_paused:      raise HTTPException(503, "Paused")
+    # ✅ FIX: не запускаем если скан уже идёт (процессный флаг)
+    if getattr(state, '_scan_running', False):
+        return {"message": "Scan already running", "skipped": True}
     bg.add_task(scan_market)
     return {"message": "Scan triggered"}
 

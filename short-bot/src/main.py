@@ -1268,6 +1268,9 @@ async def trigger_scan(background_tasks: BackgroundTasks):
         raise HTTPException(503, "Bot not running")
     if state.is_paused:
         raise HTTPException(503, "Bot is paused")
+    # ✅ FIX: не запускаем если скан уже идёт (процессный флаг)
+    if getattr(state, '_scan_running', False):
+        return {"message": "Scan already running", "skipped": True}
     background_tasks.add_task(scan_market)
     return {"message": "Scan triggered", "timestamp": datetime.utcnow().isoformat()}
 
