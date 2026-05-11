@@ -513,10 +513,20 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
     """
     log_prefix = f"🟢 [{symbol}]"
     try:
+        # ✅ FIX: Skip-list — пропускаем символы без данных (записаны в Redis на 24ч)
+        if state.redis and state.redis.client.exists(f"skip:nodata:{symbol}"):
+            return None
+
         md = await state.binance.get_complete_market_data(symbol)
         if not md:
             if verbose:
                 print(f"{log_prefix} ❌ Нет market data от Binance")
+            # ✅ FIX: Записываем в skip-list на 24 часа
+            try:
+                if state.redis:
+                    state.redis.client.setex(f"skip:nodata:{symbol}", 86400, "1")
+            except Exception:
+                pass
             return None
 
         # ── BTC фильтр для LONG (критичный) ─────────────────────────
