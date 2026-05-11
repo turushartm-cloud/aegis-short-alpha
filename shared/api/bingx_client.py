@@ -437,6 +437,95 @@ class BingXClient:
             print(f"❌ BingX error: {e}")
             return False
 
+    # =========================================================================
+    # UPDATE STOP LOSS — отменить старый SL + выставить новый
+    # =========================================================================
+
+    async def update_stop_loss(self, symbol: str, position_side: str,
+                                new_sl: float, direction: str) -> bool:
+        """
+        Обновить стоп-лосс на бирже:
+        1. Получить все открытые ордера по символу
+        2. Отменить все STOP_MARKET ордера для нужной стороны позиции
+        3. Выставить новый STOP_MARKET ордер
+
+        ✅ FIX: Метод отсутствовал → SL обновлялся только в Redis, не на бирже
+        """
+        pfx = f"[BingX][update_sl][{symbol}][{position_side}]"
+        try:
+            # ── 1. Получаем открытые ордера ───────────────────────────────────
+            open_orders_result = await self._make_request(
+                "GET", "/openApi/swap/v2/trade/openOrders",
+                params={"symbol": symbol}
+            )
+            open_orders = []
+            if open_orders_result and open_orders_result.get("code") == 0:
+                data = open_orders_result.get("data", {})
+                open_orders = data.get("orders", [])
+            print(f"{pfx} Открытых ордеров: {len(open_orders)}")
+
+            # ── 2. Отменяем все STOP_MARKET ордера нужной стороны ────────────
+            cancelled = 0
+            for order in open_orders:
+                o_type = order.get("type", "")
+                o_side = order.get("positionSide", "")
+                o_id   = order.get("orderId", "")
+                if o_type in ("STOP_MARKET", "STOP") and o_side == position_side and o_id:
+                    cancel_result = await self._make_request(
+                        "DELETE", "/openApi/swap/v2/trade/order",
+                        body={"symbol": symbol, "orderId": str(o_id)}
+                    )
+                    if cancel_result and cancel_result.get("code") == 0:
+                        cancelled += 1
+                        print(f"{pfx} Отменён SL ордер id={o_id}")
+                    else:
+                        print(f"{pfx} ⚠️ Не удалось отменить ордер id={o_id}: {self.last_error}")
+
+            print(f"{pfx} Отменено SL ордеров: {cancelled}")
+
+            # ── 3. Выставляем новый STOP_MARKET ──────────────────────────────
+            rounded_sl   = await self._round_price(symbol, new_sl)
+            close_side   = "SELL" if direction == "long" else "BUY"
+
+            # Получаем размер позиции для quantity
+            positions = await self.get_positions(symbol)
+            pos_size  = 0.0
+            for p in positions:
+                clean_sym = p.symbol.replace("-", "")
+                if clean_sym == symbol.replace("-", "") and p.position_side == position_side:
+                    pos_size = abs(p.size)
+                    break
+
+            if pos_size <= 0:
+                print(f"{pfx} ❌ Размер позиции = 0 — невозможно выставить SL")
+                return False
+
+            rounded_qty = await self._round_qty(symbol, pos_size)
+
+            body = {
+                "symbol":       symbol,
+                "side":         close_side,
+                "positionSide": position_side,
+                "type":         "STOP_MARKET",
+                "quantity":     str(rounded_qty),
+                "stopPrice":    str(rounded_sl),
+                "workingType":  "MARK_PRICE",
+            }
+            result = await self._make_request("POST", "/openApi/swap/v2/trade/order", body=body)
+            if result and result.get("code") == 0:
+                order_id = result.get("data", {}).get("order", {}).get("orderId", "?")
+                print(f"{pfx} ✅ Новый SL выставлен: {rounded_sl} | orderId={order_id}")
+                return True
+            else:
+                print(f"{pfx} ❌ Не удалось выставить SL: {self.last_error}")
+                return False
+
+        except Exception as e:
+            import traceback
+            print(f"{pfx} ❌ Exception: {e}")
+            traceback.print_exc()
+            return False
+
 
 _bingx_client = None
 
