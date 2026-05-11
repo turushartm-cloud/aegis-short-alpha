@@ -505,7 +505,9 @@ class PositionTracker:
                 break
 
     # =========================================================================
-    # TRAILING — активируется ТОЛЬКО после BE (после TP2)
+    # =========================================================================
+    # BE + MICROTRAIL — MicroTrail является ЕДИНСТВЕННЫМ механизмом трейлинга
+    # Price-based trailing ОТКЛЮЧЁН — конфликтовал с MicroTrail
     # =========================================================================
 
     async def _check_trailing(self, signal: Dict, price: float):
@@ -513,17 +515,13 @@ class PositionTracker:
         entry           = _f(signal.get("entry_price", 0))
         direction       = signal.get("direction", "long")
         current_sl      = _f(signal.get("stop_loss", 0))
-        trailing_active = signal.get("trailing_active", False)
-        be_done         = signal.get("be_done", False)    # TP1 → BE (entry) выставлен
-        be2_done        = signal.get("be2_done", False)   # TP2 → BE+0.2% выставлен
+        be_done         = signal.get("be_done", False)
+        be2_done        = signal.get("be2_done", False)
         taken_tps       = signal.get("taken_tps", [])
         taken_count     = len(taken_tps)
 
         if not entry or not current_sl:
             return
-
-        if be_done:
-            trailing_active = True  # трейлинг активен после BE
 
         if direction == "long":
             profit_pct = (price - entry) / entry
@@ -531,43 +529,41 @@ class PositionTracker:
             # ── Шаг 1: TP1 взят → SL в точку входа (breakeven) ─────────────
             if not be_done and taken_count >= 1:
                 new_sl = entry * (1 + self.BREAKEVEN_BUFFER_TP1)  # = entry
-                if new_sl > current_sl * 1.0001:  # SL реально движется вверх
+                if new_sl > current_sl * 1.0001:
                     print(f"[PT][LONG][{symbol}] 🔒 BE-TP1 → entry | "
-                          f"SL: {current_sl:.6f} → {new_sl:.6f}")
+                          f"SL: {current_sl:.6f} → {new_sl:.6f} | profit={profit_pct*100:+.2f}%")
                     await self._move_sl(signal, current_sl, new_sl, "BE после TP1")
                     signal["be_done"]         = True
                     signal["trailing_active"] = True
-                    current_sl = new_sl
                     return
                 else:
-                    # SL уже на уровне entry или выше — просто помечаем
                     signal["be_done"] = True
                     signal["trailing_active"] = True
                     self._save(symbol, signal)
+                    print(f"[PT][LONG][{symbol}] 🔒 BE-TP1 помечен (SL уже на уровне entry)")
 
             # ── Шаг 2: TP2 взят → SL в entry + 0.2% ────────────────────────
             if be_done and not be2_done and taken_count >= 2:
-                new_sl = entry * (1 + self.BREAKEVEN_BUFFER_TP2)  # entry + 0.2%
+                new_sl = entry * (1 + self.BREAKEVEN_BUFFER_TP2)
                 if new_sl > current_sl * 1.0001:
                     print(f"[PT][LONG][{symbol}] 🔒 BE2-TP2 → entry+0.2% | "
-                          f"SL: {current_sl:.6f} → {new_sl:.6f}")
+                          f"SL: {current_sl:.6f} → {new_sl:.6f} | profit={profit_pct*100:+.2f}%")
                     await self._move_sl(signal, current_sl, new_sl, "BE+0.2% после TP2")
                     signal["be2_done"] = True
-                    current_sl = new_sl
                     return
                 else:
                     signal["be2_done"] = True
                     self._save(symbol, signal)
+                    print(f"[PT][LONG][{symbol}] 🔒 BE2-TP2 помечен (SL уже выше entry+0.2%)")
 
-            # ── Трейлинг после BE ────────────────────────────────────────────
-            if trailing_active and profit_pct > self.long_trail_threshold:
-                new_sl = price * (1 - self.TRAIL_DISTANCE)
-                if new_sl > current_sl * 1.003:
-                    self._log(symbol, direction,
-                              f"📈 TRAIL SL MOVE | "
-                              f"{current_sl:.6f} → {new_sl:.6f} | "
-                              f"цена={price:.6f} profit={profit_pct*100:+.2f}%")
-                    await self._move_sl(signal, current_sl, new_sl, "трейлинг")
+            # ── Price-based trailing ОТКЛЮЧЁН ────────────────────────────────
+            # MicroTrail (on_tp_taken) — единственный механизм движения SL после TP
+            # Логируем текущее состояние для мониторинга
+            mode = "BE✅" if be_done else "ACTIVE"
+            micro = self.micro_trailing.get_summary(symbol)
+            micro_str = f"MicroStep#{micro['steps_taken']}" if micro else "MicroTrail-"
+            print(f"[PT][LONG][{symbol}] 📊 {mode} | {micro_str} | "
+                  f"SL={current_sl:.6f} | цена={price:.6f} | profit={profit_pct*100:+.2f}%")
 
         else:  # SHORT
             profit_pct = (entry - price) / entry
@@ -575,43 +571,40 @@ class PositionTracker:
             # ── Шаг 1: TP1 взят → SL в точку входа (breakeven) ─────────────
             if not be_done and taken_count >= 1:
                 new_sl = entry * (1 - self.BREAKEVEN_BUFFER_TP1)  # = entry
-                if new_sl < current_sl * 0.9999:  # SL реально движется вниз
+                if new_sl < current_sl * 0.9999:
                     print(f"[PT][SHORT][{symbol}] 🔒 BE-TP1 → entry | "
-                          f"SL: {current_sl:.6f} → {new_sl:.6f}")
+                          f"SL: {current_sl:.6f} → {new_sl:.6f} | profit={profit_pct*100:+.2f}%")
                     await self._move_sl(signal, current_sl, new_sl, "BE после TP1")
                     signal["be_done"]         = True
                     signal["trailing_active"] = True
-                    current_sl = new_sl
                     return
                 else:
                     signal["be_done"] = True
                     signal["trailing_active"] = True
                     self._save(symbol, signal)
+                    print(f"[PT][SHORT][{symbol}] 🔒 BE-TP1 помечен (SL уже на уровне entry)")
 
             # ── Шаг 2: TP2 взят → SL в entry - 0.2% ────────────────────────
             if be_done and not be2_done and taken_count >= 2:
-                new_sl = entry * (1 - self.BREAKEVEN_BUFFER_TP2)  # entry - 0.2%
+                new_sl = entry * (1 - self.BREAKEVEN_BUFFER_TP2)
                 if new_sl < current_sl * 0.9999:
                     print(f"[PT][SHORT][{symbol}] 🔒 BE2-TP2 → entry-0.2% | "
-                          f"SL: {current_sl:.6f} → {new_sl:.6f}")
+                          f"SL: {current_sl:.6f} → {new_sl:.6f} | profit={profit_pct*100:+.2f}%")
                     await self._move_sl(signal, current_sl, new_sl, "BE-0.2% после TP2")
                     signal["be2_done"] = True
-                    current_sl = new_sl
                     return
                 else:
                     signal["be2_done"] = True
                     self._save(symbol, signal)
+                    print(f"[PT][SHORT][{symbol}] 🔒 BE2-TP2 помечен (SL уже ниже entry-0.2%)")
 
-            # ── Трейлинг после BE ────────────────────────────────────────────
-            trail_threshold = self.short_trail_threshold
-            if trailing_active and profit_pct > trail_threshold:
-                new_sl = price * (1 + self.TRAIL_DISTANCE)
-                if new_sl < current_sl * 0.997:
-                    self._log(symbol, direction,
-                              f"📈 TRAIL SL MOVE | "
-                              f"{current_sl:.6f} → {new_sl:.6f} | "
-                              f"цена={price:.6f} profit={profit_pct*100:+.2f}%")
-                    await self._move_sl(signal, current_sl, new_sl, "трейлинг")
+            # ── Price-based trailing ОТКЛЮЧЁН ────────────────────────────────
+            # MicroTrail (on_tp_taken) — единственный механизм движения SL после TP
+            mode = "BE✅" if be_done else "ACTIVE"
+            micro = self.micro_trailing.get_summary(symbol)
+            micro_str = f"MicroStep#{micro['steps_taken']}" if micro else "MicroTrail-"
+            print(f"[PT][SHORT][{symbol}] 📊 {mode} | {micro_str} | "
+                  f"SL={current_sl:.6f} | цена={price:.6f} | profit={profit_pct*100:+.2f}%")
 
     async def _move_sl(self, signal: Dict, old_sl: float, new_sl: float, move_type: str):
         """
