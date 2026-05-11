@@ -897,10 +897,13 @@ class BinanceFuturesClient:
     async def get_taker_buy_sell_ratio(self, symbol: str,
                                         period: str = "15m") -> Optional[float]:
         """
-        Taker Buy/Sell ratio (0=продавцы, 1=покупатели): Binance→Bybit→OKX.
-        ИСПРАВЛЕНО: раньше работало ТОЛЬКО при _use_binance=True.
-        
-        ✅ v3.2: Whitelist check — пропускаем Binance если символа нет
+        Taker Buy/Sell ratio (0=продавцы, 1=покупатели).
+        Цепочка: Binance(proxy) → Bybit account-ratio (прокси) → None.
+
+        ✅ FIX: Добавлен Bybit fallback через account-ratio.
+        Bybit не публикует taker volume публично, но account-ratio
+        (доля покупателей по счетам) коррелирует с taker direction.
+        Нормализован в тот же диапазон 0–1.
         """
         await self._init_source()
 
@@ -918,25 +921,35 @@ class BinanceFuturesClient:
                         ratio = buy_vol / total
                         logger.debug(f"[Taker] {symbol}: Binance buy={buy_vol:.0f} sell={sell_vol:.0f} → {ratio:.3f}")
                         return ratio
-                logger.info(f"[Taker] {symbol}: Binance пусто/404 → нет доступного fallback")
-            else:
-                logger.info(f"[Taker] {symbol}: не на Binance → нет данных")
+                logger.info(f"[Taker] {symbol}: Binance пусто/404 → Bybit fallback")
 
-        # ── 2. OKX / Bybit — нет публичного endpoint для Taker volume ────────
-        # OKX /api/v5/rubik/stat/taker-volume — приватный Rubik API (требует авторизацию)
-        # Bybit требует auth для taker ratio
-        # → Возвращаем None если Binance недоступен
+        # ── 2. Bybit account-ratio как прокси для taker direction ─────────────
+        # buyRatio = доля аккаунтов в лонге. Коррелирует с taker buy pressure.
+        imap = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h"}
+        result = await self._bybit("/v5/market/account-ratio",
+                                   {"category": "linear", "symbol": symbol,
+                                    "period": imap.get(period, "15min"), "limit": 1})
+        if result:
+            items = result.get("list", [])
+            if items:
+                buy = items[0].get("buyRatio")
+                if buy is not None:
+                    val = float(buy)  # уже 0–1
+                    if 0.0 < val < 1.0:
+                        logger.info(f"[Taker] {symbol}: Bybit account-ratio proxy → {val:.3f}")
+                        return round(val, 3)
 
-        logger.info(f"[Taker] {symbol}: все источники пустые (нет публичного API)")
+        logger.info(f"[Taker] {symbol}: все источники пустые → None")
         return None
 
     async def get_liquidations(self, symbol: str,
                                 limit: int = 100,
                                 period: str = "1h") -> Optional[Dict]:
         """
-        Ликвидации: Binance(proxy) → OKX.
+        Ликвидации: Binance(proxy) → Bybit → OKX.
         Поддерживаемые period: 30m, 1h, 4h, 1d
 
+        ✅ FIX: Добавлен Bybit как шаг 2 (/v5/market/liquidation — публичный)
         ✅ v3.2: Whitelist check — пропускаем Binance если символа нет
         ✅ v3.3: Добавлены ТФ 30m, 4h, 1d
         ✅ v3.4: Детальное логирование OKX + видимые ошибки OKX
@@ -982,8 +995,44 @@ class BinanceFuturesClient:
                 except Exception as e:
                     logger.info(f"[Liq] {symbol}: Binance error — {e} → fallback к OKX")
 
-        # ── 2. Bybit (нет endpoint ликвидаций без auth) ─────────────────────
-        # Пропускаем — требуется API key
+        # ── 2. Bybit liquidation (публичный endpoint, не требует auth) ─────────
+        # GET /v5/market/liquidation?category=linear&symbol=BTCUSDT&limit=200
+        # side=Buy  → ликвидация лонга (лонгист получил маржин-колл)
+        # side=Sell → ликвидация шорта
+        try:
+            bybit_result = await self._bybit("/v5/market/liquidation",
+                                             {"category": "linear", "symbol": symbol, "limit": "200"})
+            if bybit_result:
+                items = bybit_result.get("list", [])
+                if items:
+                    long_liq = short_liq = 0.0
+                    cutoff_ms = int((time.time() - seconds) * 1000)
+                    for item in items:
+                        try:
+                            ts  = int(item.get("updatedTime", 0))
+                            if ts < cutoff_ms:
+                                continue
+                            sz    = float(item.get("size",  0))
+                            price = float(item.get("price", 0))
+                            side  = item.get("side", "")
+                            usd   = sz * price
+                            if side == "Buy":    long_liq  += usd   # Buy закрывает SHORT позицию (ликв. шорта)
+                            elif side == "Sell": short_liq += usd   # Sell закрывает LONG позицию (ликв. лонга)
+                        except (ValueError, TypeError):
+                            continue
+                    total = long_liq + short_liq
+                    if total > 0:
+                        logger.info(f"[Liq] {symbol}: Bybit ✅ total=${total:,.0f} (long=${long_liq:,.0f}, short=${short_liq:,.0f})")
+                        return {
+                            "total_usd":     total,
+                            "long_liq_usd":  long_liq,
+                            "short_liq_usd": short_liq,
+                            "dominant_side": "LONG" if long_liq > short_liq
+                                             else "SHORT" if short_liq > long_liq else None
+                        }
+                    logger.info(f"[Liq] {symbol}: Bybit вернул данные но ликвидации=0 в период {period} → OKX")
+        except Exception as e:
+            logger.info(f"[Liq] {symbol}: Bybit error — {e} → OKX")
 
         # ── 3. OKX direct fallback ─────────────────────────────────────────
         # OKX Public API: /public/liquidation-orders
