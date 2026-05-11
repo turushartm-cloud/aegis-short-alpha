@@ -35,6 +35,11 @@ def fmt_price(price: float) -> str:
     else:               return f"${price:,.12f}"
 
 
+def _esc(text: str) -> str:
+    """✅ FIX: Escape HTML special chars to prevent Telegram parse errors (e.g. <0.001)."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 # ============================================================================
 # TELEGRAM BOT
 # ============================================================================
@@ -258,14 +263,14 @@ class TelegramBot:
             pct = abs(self._calc_pct(entry, tp_price))
             tp_lines += f"   TP{i}: <b>{fmt_price(tp_price)}</b>  (+{pct:.1f}%)  [{tp_weight}%]\n"
 
-        ind_lines = "\n".join(f"   {k}: <b>{v}</b>" for k, v in indicators.items())
+        ind_lines = "\n".join(f"   {_esc(k)}: <b>{_esc(v)}</b>" for k, v in indicators.items())
 
         # ✅ #SYMBOL для удобного поиска в Telegram
         return (
             f"\n{emoji} <b>LONG SIGNAL | {strength}</b>\n"
             f"<b>Score: {score:.0f}%</b>\n\n"
-            f"<b>💎 SYMBOL:</b> <b>#{symbol}</b>\n"
-            f"<b>📊 Pattern:</b> {pattern}\n\n"
+            f"<b>💎 SYMBOL:</b> <b>#{_esc(symbol)}</b>\n"
+            f"<b>📊 Pattern:</b> {_esc(pattern)}\n\n"
             f"<b>📈 INDICATORS:</b>\n{ind_lines}\n\n"
             f"<b>🎯 LEVELS:</b>\n"
             f"   Entry: <b>{fmt_price(entry)}</b>\n"
@@ -299,17 +304,17 @@ class TelegramBot:
             pct = abs(self._calc_pct(entry, tp_price))
             tp_lines += f"   TP{i}: <b>{fmt_price(tp_price)}</b>  (+{pct:.1f}%)  [{tp_weight}%]\n"
 
-        ind_lines = "\n".join(f"   {k}: <b>{v}</b>" for k, v in indicators.items())
+        ind_lines = "\n".join(f"   {_esc(k)}: <b>{_esc(v)}</b>" for k, v in indicators.items())
 
         return (
             f"\n{emoji} <b>SHORT SIGNAL | {strength}</b>\n"
             f"<b>Score: {score:.0f}%</b>\n\n"
-            f"<b>💎 SYMBOL:</b> <b>#{symbol}</b>\n"
-            f"<b>📊 Pattern:</b> {pattern}\n\n"
+            f"<b>💎 SYMBOL:</b> <b>#{_esc(symbol)}</b>\n"
+            f"<b>📊 Pattern:</b> {_esc(pattern)}\n\n"
             f"<b>📈 INDICATORS:</b>\n{ind_lines}\n\n"
             f"<b>🎯 LEVELS:</b>\n"
             f"   Entry: <b>{fmt_price(entry)}</b>\n"
-            f"   Stop:  <b>{fmt_price(stop_loss)}</b>  (+{abs(sl_pct):.2f}%)\n"
+            f"   Stop:  <b>{fmt_price(stop_loss)}</b>  (⬆️ {abs(sl_pct):.2f}% above entry)\n"
             f"{tp_lines}\n"
             f"<b>⚡ Leverage:</b> {leverage}x\n"
             f"<b>💰 Risk:</b> {risk}\n"

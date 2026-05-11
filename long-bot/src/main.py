@@ -17,6 +17,7 @@ FastAPI Application
 """
 
 import os
+import re
 import asyncio
 import sys
 import logging
@@ -239,7 +240,12 @@ async def _build_combined_watchlist(binance_client, min_vol: float, max_count: i
 
     both    = list(bybit_syms & binance_syms)
     only_one = [s for s in (bybit_syms | binance_syms) if s not in set(both)]
-    result  = (both + only_one)[:max_count]
+    combined = (both + only_one)[:max_count]
+    # ✅ FIX: Reject garbage symbols (Chinese chars, non-ASCII, malformed)
+    _VALID_SYM = re.compile(r'^[A-Z0-9]{2,20}USDT$')
+    result = [s for s in combined if _VALID_SYM.match(s)]
+    if len(result) < len(combined):
+        print(f"⚠️ Filtered {len(combined) - len(result)} invalid symbols from watchlist")
     print(f"📊 Watchlist: {len(result)} symbols")
     return result
 
@@ -911,6 +917,24 @@ async def scan_market():
     if state.is_paused:
         return
 
+    # ✅ FIX: Prevent concurrent/duplicate scans (process-level guard)
+    if getattr(state, '_scan_running', False):
+        print(f"⏳ [{Config.BOT_TYPE}] Scan already running. Skipping duplicate.")
+        return
+    state._scan_running = True
+
+    # ✅ FIX: Redis distributed lock (cross-restart protection)
+    lock_key = f"scan_lock:{Config.BOT_TYPE}"
+    _lock_held = False
+    try:
+        _lock_held = bool(state.redis.client.set(lock_key, 1, nx=True, ex=300))
+        if not _lock_held:
+            print(f"⏳ [{Config.BOT_TYPE}] Redis scan lock held. Skipping.")
+            state._scan_running = False
+            return
+    except Exception as e:
+        print(f"⚠️ Redis lock error: {e} — proceeding without distributed lock")
+
     print(f"\n🔍 {Config.BOT_NAME} scan at {datetime.utcnow().strftime('%H:%M:%S UTC')}")
     print(f"📊 {len(state.watchlist)} symbols | Score≥{Config.MIN_SCORE}")
 
@@ -922,6 +946,11 @@ async def scan_market():
             await state.telegram.send_message(
                 f"⛔ <b>CIRCUIT BREAKER</b>\n{reason}\n\nИспользуйте /reset"
             )
+            # ✅ FIX: Release locks on early return
+            state._scan_running = False
+            if _lock_held:
+                try: state.redis.client.delete(lock_key)
+                except Exception: pass
             return
 
     # BTC data (главный фильтр для Long)
@@ -958,8 +987,28 @@ async def scan_market():
 
             # BTC correlation adj
             signal["score"] = round(signal["score"] + btc_adj, 1)
+            # ✅ FIX: Cap score at 100.0 (prevents overflow display like 110.5)
+            signal["score"] = min(signal["score"], 100.0)
             if signal["score"] < Config.MIN_SCORE:
                 continue
+
+            # ✅ FIX: RR pre-check BEFORE Telegram — don't alert on signals we won't trade
+            _MIN_RR = 1.0  # matches AutoTrader TradeConfig.min_rr_ratio
+            _tp_list = signal.get("take_profits", [])
+            if _tp_list:
+                _tp1_raw = _tp_list[0]
+                try:
+                    if isinstance(_tp1_raw, (list, tuple)):   _tp1 = float(_tp1_raw[0])
+                    elif isinstance(_tp1_raw, dict):          _tp1 = float(_tp1_raw.get("price", 0))
+                    else:                                      _tp1 = float(_tp1_raw)
+                    _sl_dist  = abs(signal["entry_price"] - signal["stop_loss"])
+                    _tp1_dist = abs(_tp1 - signal["entry_price"])
+                    _rr = _tp1_dist / _sl_dist if _sl_dist > 0 else 0
+                    if _rr < _MIN_RR:
+                        print(f"⏸ [{signal['symbol']}][LONG] RR={_rr:.2f} < {_MIN_RR} — pre-filtered before Telegram")
+                        continue
+                except Exception as _rr_err:
+                    print(f"⚠️ RR pre-check error {signal['symbol']}: {_rr_err}")
 
             # Telegram сигнал
             tg_msg_id = await state.telegram.send_signal(
@@ -1073,6 +1122,14 @@ async def scan_market():
     })
     print(f"✅ Scan done. New: {new_signals} | TG-only: {tg_only_count} | "
           f"Exchange: {active_count}/{Config.MAX_POSITIONS}")
+
+    # ✅ FIX: Release distributed lock
+    state._scan_running = False
+    if _lock_held:
+        try:
+            state.redis.client.delete(lock_key)
+        except Exception:
+            pass
 
 
 async def background_scanner():
