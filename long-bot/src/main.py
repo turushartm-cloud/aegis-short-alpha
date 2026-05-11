@@ -144,6 +144,12 @@ class Config:
     MIN_VOLUME_USDT = int(os.getenv("MIN_VOLUME_USDT", "300000"))
     MAX_WATCHLIST   = int(os.getenv("MAX_WATCHLIST", "150"))
 
+    # ✅ Постоянный блэклист — символы которые всегда пропускаем
+    # Формат ENV: SYMBOL_BLACKLIST=GIGAUSDT,LUNAUSDT,我踏马来了USDT
+    SYMBOL_BLACKLIST: set = set(
+        s.strip().upper() for s in os.getenv("SYMBOL_BLACKLIST", "").split(",") if s.strip()
+    )
+
     MAX_DAILY_TRADES  = int(os.getenv("MAX_DAILY_TRADES_LONG", "10"))  # v3.0
     SIGNAL_TTL_HOURS  = 24
     TRAIL_ACTIVATION  = float(os.getenv("LONG_TRAIL_ACTIVATION", "0.015"))  # +1.5%
@@ -246,6 +252,11 @@ async def _build_combined_watchlist(binance_client, min_vol: float, max_count: i
     result = [s for s in combined if _VALID_SYM.match(s)]
     if len(result) < len(combined):
         print(f"⚠️ Filtered {len(combined) - len(result)} invalid symbols from watchlist")
+    # ✅ FIX: ENV-блэклист (SYMBOL_BLACKLIST=GIGAUSDT,LUNAUSDT,...)
+    if Config.SYMBOL_BLACKLIST:
+        before = len(result)
+        result = [s for s in result if s not in Config.SYMBOL_BLACKLIST]
+        print(f"🚫 ENV blacklist filtered {before - len(result)} symbols")
     print(f"📊 Watchlist: {len(result)} symbols")
     return result
 
@@ -513,7 +524,11 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
     """
     log_prefix = f"🟢 [{symbol}]"
     try:
-        # ✅ FIX: Skip-list — пропускаем символы без данных (записаны в Redis на 24ч)
+        # ✅ FIX: Проверяем оба уровня блэклиста
+        # Уровень 1: вечный Redis-блэклист (символ промахнулся 3+ раз)
+        if state.redis and state.redis.client.exists(f"blacklist:{symbol}"):
+            return None
+        # Уровень 2: 24-часовой skip (временный промах)
         if state.redis and state.redis.client.exists(f"skip:nodata:{symbol}"):
             return None
 
@@ -521,10 +536,18 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         if not md:
             if verbose:
                 print(f"{log_prefix} ❌ Нет market data от Binance")
-            # ✅ FIX: Записываем в skip-list на 24 часа
+            # ✅ FIX: Счётчик промахов → вечный бан после 3 раз
             try:
                 if state.redis:
-                    state.redis.client.setex(f"skip:nodata:{symbol}", 86400, "1")
+                    count_key = f"nodata_count:{symbol}"
+                    count = state.redis.client.incr(count_key)
+                    state.redis.client.expire(count_key, 86400 * 30)
+                    if count >= 3:
+                        state.redis.client.set(f"blacklist:{symbol}", f"nodata:{count}")
+                        state.redis.client.delete(count_key)
+                        print(f"🚫 [{symbol}] Добавлен в постоянный блэклист ({count} промахов)")
+                    else:
+                        state.redis.client.setex(f"skip:nodata:{symbol}", 86400, "1")
             except Exception:
                 pass
             return None
@@ -1230,6 +1253,32 @@ async def trigger_scan(bg: BackgroundTasks):
         return {"message": "Scan already running", "skipped": True}
     bg.add_task(scan_market)
     return {"message": "Scan triggered"}
+
+@app.get("/api/blacklist")
+async def get_blacklist():
+    """Просмотр постоянного блэклиста символов без данных."""
+    try:
+        keys = state.redis.client.keys("blacklist:*")
+        bl = {k.replace("blacklist:", ""): state.redis.client.get(k) for k in keys}
+        skip_keys = state.redis.client.keys("skip:nodata:*")
+        skip = [k.replace("skip:nodata:", "") for k in skip_keys]
+        return {"permanent_blacklist": bl, "count": len(bl),
+                "temp_skip_24h": skip, "temp_count": len(skip),
+                "env_blacklist": list(Config.SYMBOL_BLACKLIST)}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.delete("/api/blacklist/{symbol}")
+async def remove_from_blacklist(symbol: str):
+    """Убрать символ из постоянного блэклиста (если данные появились)."""
+    symbol = symbol.upper()
+    try:
+        state.redis.client.delete(f"blacklist:{symbol}")
+        state.redis.client.delete(f"skip:nodata:{symbol}")
+        state.redis.client.delete(f"nodata_count:{symbol}")
+        return {"message": f"{symbol} удалён из блэклиста"}
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/api/signals")
 async def get_signals():
