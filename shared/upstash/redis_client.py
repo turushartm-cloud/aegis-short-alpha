@@ -30,13 +30,15 @@ class UpstashRedisClient:
         )
         
         # TTL для разных типов данных (в секундах)
+        # ✅ POSITION_TTL_DAYS можно задать в ENV (дефолт: 1 день)
+        _pos_days = int(os.getenv("POSITION_TTL_DAYS", "1"))
         self.TTL = {
-            "signal": 86400,        # 24 часа для сигналов
-            "position": 604800,     # 7 дней для подтвержденных позиций
-            "position_unconfirmed": 1800,  # ✅ FIX: 30 мин (было 60s — вызывало авто-экспири и "1m" сделки)
-            "state": 3600,          # 1 час для состояния
-            "stats": 2592000,       # 30 дней для статистики
-            "cache": 300            # 5 минут для кэша API
+            "signal": 86400,
+            "position": _pos_days * 86400,        # дефолт 1 день (было 7)
+            "position_unconfirmed": 1800,          # 30 мин — не менять
+            "state": 3600,
+            "stats": 2592000,
+            "cache": 300
         }
     
     def health_check(self) -> bool:
