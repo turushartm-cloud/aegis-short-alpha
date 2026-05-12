@@ -250,8 +250,10 @@ async def _build_combined_watchlist(binance_client, min_vol: float, max_count: i
     # ✅ FIX: Reject garbage symbols (Chinese chars, non-ASCII, malformed)
     _VALID_SYM = re.compile(r'^[A-Z0-9]{2,20}USDT$')
     result = [s for s in combined if _VALID_SYM.match(s)]
+    # ✅ FIX БАГ 3: Дедупликация — сохраняет порядок, убирает дубликаты
+    result = list(dict.fromkeys(result))
     if len(result) < len(combined):
-        print(f"⚠️ Filtered {len(combined) - len(result)} invalid symbols from watchlist")
+        print(f"⚠️ Filtered {len(combined) - len(result)} invalid/duplicate symbols from watchlist")
     # ✅ FIX: ENV-блэклист (SYMBOL_BLACKLIST=GIGAUSDT,LUNAUSDT,...)
     if Config.SYMBOL_BLACKLIST:
         before = len(result)
@@ -1009,12 +1011,33 @@ async def scan_market():
 
     new_signals = tg_only_count = 0
 
+    # ✅ FIX БАГ 5: Параллельный pre-fetch
+    _SCAN_SEM = asyncio.Semaphore(int(os.getenv("SCAN_CONCURRENCY", "8")))
+    _FRESH = object()
+
+    async def _prefetch(sym: str):
+        async with _SCAN_SEM:
+            try:
+                if _is_fresh(state.redis.get_signals(Config.BOT_TYPE, sym, limit=1)):
+                    return sym, _FRESH
+                sig = await scan_symbol(sym, _btc_cache_1h)
+                return sym, sig
+            except Exception as _pfe:
+                print(f"⚠️ Prefetch {sym}: {_pfe}")
+                return sym, None
+
+    _t0 = datetime.utcnow()
+    _prefetch_results = await asyncio.gather(*[_prefetch(s) for s in state.watchlist])
+    _dt = (datetime.utcnow() - _t0).total_seconds()
+    print(f"⚡ Parallel fetch: {len(state.watchlist)} symbols in {_dt:.1f}s")
+    _prefetch_map = dict(_prefetch_results)
+
     for symbol in state.watchlist:
         try:
-            if _is_fresh(state.redis.get_signals(Config.BOT_TYPE, symbol, limit=1)):
+            _fetched = _prefetch_map.get(symbol)
+            if _fetched is _FRESH:
                 continue
-
-            signal = await scan_symbol(symbol, _btc_cache_1h)
+            signal = _fetched
             if not signal:
                 continue
 
