@@ -17,7 +17,7 @@ pandas==2.2.3
 python-dotenv==1.0.1
 
 # ── Utilities ─────────────────────────────────────────────────────────
-python-dateutil==2.9.0
--e 
-# ── WebSocket (OKX Liquidation Feed) ────────────────────────────────
+python-dateutil==2.9.0.post0
+
+# ── WebSocket (OKX Liquidation Feed) ─────────────────────────────────
 websockets==12.0
