@@ -78,6 +78,7 @@ from core.position_tracker import PositionTracker
 from core.realtime_scorer import get_realtime_scorer
 from core.consolidation_detector import ConsolidationDetector, filter_mid_range
 from bot.telegram import TelegramBot, TelegramCommandHandler
+from utils.okx_liquidation_ws import OKXLiquidationFeed
 
 # ── Aegis Long modules ──
 from aegis.signal_engine_long import AegisLongSignalEngine, SignalStrengthLong
@@ -192,6 +193,7 @@ class BotState:
         self.dump_detector:       Optional[DumpExhaustionDetector]  = None
         self.wyckoff_detector:    Optional[WyckoffAccumulationDetector] = None
         self.bsl_scanner:         Optional[BSLScanner]              = None
+        self.okx_ws_feed:         Optional[OKXLiquidationFeed]       = None
         self.oi_analyzer:         Optional[OIAnalyzerLong]          = None
         self.fear_greed_index: Optional[int] = None   # 🆕 0-100
         self.btc_change_1h:    Optional[float] = None  # ✅ FIX #5: кешируем BTC 1h для delta scorer
@@ -281,6 +283,12 @@ async def lifespan(app: FastAPI):
         await state.binance._init_source()
     except Exception as e:
         print(f"⚠️ Binance init failed (continuing with Bybit fallback): {e}")
+
+    # ── OKX WebSocket Liquidation Feed ──────────────────────────────────
+    state.binance.set_redis(state.redis)
+    state.okx_ws_feed = OKXLiquidationFeed(redis_client=state.redis)
+    await state.okx_ws_feed.start()
+    print("✅ OKX WS liquidation feed started (Redis cache mode)")
 
     # П2 FIX: BASE_SCORER получает мягкий порог — строгий порог только у AEGIS
     _long_base_min = int(os.getenv("MIN_LONG_BASE_SCORE", "50"))  # Снижено с 55: лонги в нейтральном рынке нужно ловить раньше
@@ -444,6 +452,7 @@ async def lifespan(app: FastAPI):
     yield
 
     state.is_running = False
+    if state.okx_ws_feed: await state.okx_ws_feed.stop()
     if state.binance: await state.binance.close()
     if state.auto_trader: await state.auto_trader.bingx.close()
     print("👋 Aegis Long stopped")

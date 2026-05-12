@@ -80,6 +80,7 @@ from core.short_filter import get_short_filter, get_short_tp_config
 from core.realtime_scorer import get_realtime_scorer
 from core.consolidation_detector import ConsolidationDetector, filter_mid_range
 from bot.telegram import TelegramBot, TelegramCommandHandler
+from utils.okx_liquidation_ws import OKXLiquidationFeed
 
 # ── Aegis modules (NEW) ──
 from aegis.signal_engine import AegisSignalEngine, SignalStrength
@@ -196,6 +197,7 @@ class BotState:
         self.oi_analyzer:     Optional[OIAnalyzer]         = None
         self.liq_mapper:      Optional[LiquidationMapper]  = None
         self.delta_analyzer:  Optional[DeltaAnalyzer]      = None
+        self.okx_ws_feed:     Optional[OKXLiquidationFeed] = None
 
         # Metrics
         self.coinglass        = None
@@ -289,6 +291,14 @@ async def lifespan(app: FastAPI):
         await state.binance._init_source()
     except Exception as e:
         print(f"⚠️ Binance init failed (Bybit fallback): {e}")
+
+    # ── OKX WebSocket Liquidation Feed ──────────────────────────────────
+    # REST /api/v5/public/liquidation-orders мёртв с 2023.
+    # WS стрим пишет ликвидации в Redis: okx:liq:{symbol} TTL=300s
+    state.binance.set_redis(state.redis)   # привязываем Redis к binance client
+    state.okx_ws_feed = OKXLiquidationFeed(redis_client=state.redis)
+    await state.okx_ws_feed.start()
+    print("✅ OKX WS liquidation feed started (Redis cache mode)")
 
     # ── Existing scorer + patterns ──
     # BASE_SCORER получает мягкий порог (50) — строгий порог у AEGIS (65)
@@ -456,6 +466,8 @@ async def lifespan(app: FastAPI):
     yield
 
     state.is_running = False
+    if state.okx_ws_feed:
+        await state.okx_ws_feed.stop()
     if state.binance:
         await state.binance.close()
     if state.auto_trader:
