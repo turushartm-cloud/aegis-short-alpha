@@ -1059,7 +1059,8 @@ class BinanceFuturesClient:
         logger.debug(f"[Liq] {symbol}: OKX запрос — instId={inst_id}")
         data = await self._okx(
             "/api/v5/public/liquidation-orders",
-            {"instType": "SWAP", "instId": inst_id, "state": "filled", "limit": str(limit)}
+            {"instType": "SWAP", "instId": inst_id, "limit": str(limit)}
+            # ✅ FIX: Убран state=filled — вызывал HTTP 400. OKX принимает без него.
         )
         if data and len(data) > 0:
             long_liq = short_liq = 0.0

@@ -160,6 +160,7 @@ class TelegramBot:
         Отправить сообщение.
         ✅ Возвращает message_id (int) при успехе, None при ошибке.
         ✅ reply_to_message_id — привязка к исходному сообщению сигнала.
+        ✅ FIX: Обработка 429 Too Many Requests — ждём retry_after и повторяем.
         """
         try:
             payload: Dict = {
@@ -172,21 +173,35 @@ class TelegramBot:
                 payload["message_thread_id"] = int(self.topic_id)
             if reply_to_message_id:
                 payload["reply_to_message_id"]       = reply_to_message_id
-                payload["allow_sending_without_reply"] = True   # не фейлить если оригинал удалён
+                payload["allow_sending_without_reply"] = True
 
             session = await self._get_session()
-            async with session.post(
-                f"{self.base_url}/sendMessage",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    msg_id = data.get("result", {}).get("message_id")
-                    return msg_id  # ← возвращаем message_id!
-                error_text = await resp.text()
-                print(f"Telegram API error: {resp.status} — {error_text[:120]}")
-                return None
+            for _attempt in range(3):  # макс 3 попытки
+                async with session.post(
+                    f"{self.base_url}/sendMessage",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        msg_id = data.get("result", {}).get("message_id")
+                        return msg_id
+
+                    # ✅ FIX: 429 Too Many Requests — ждём и повторяем
+                    if resp.status == 429:
+                        try:
+                            err_data = await resp.json()
+                            wait_sec = err_data.get("parameters", {}).get("retry_after", 30)
+                        except Exception:
+                            wait_sec = 30
+                        print(f"⏳ Telegram 429 — ждём {wait_sec}s (попытка {_attempt+1}/3)")
+                        await asyncio.sleep(wait_sec + 1)
+                        continue  # повтор
+
+                    error_text = await resp.text()
+                    print(f"Telegram API error: {resp.status} — {error_text[:120]}")
+                    return None
+            return None
         except Exception as e:
             print(f"Error sending Telegram message: {e}")
             return None
