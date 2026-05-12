@@ -107,6 +107,7 @@ class MarketData:
     # Источник: get_oi_short_term() — цепочка Binance→Bybit→OKX
     # oi_1h > +5% при росте цены = позиции накапливаются (лонгисты входят)
     # oi_1h < -5% при падении цены = позиции закрываются (капитуляция)
+    oi_change_30m:        float = 0.0  # ✅ NEW: 30m OI change
     oi_change_1h:         float = 0.0
     oi_change_4h:         float = 0.0
     # >0.6 = агрессивные покупки (бычье давление), <0.4 = агрессивные продажи
@@ -313,7 +314,11 @@ class BinanceFuturesClient:
                         BinanceFuturesClient._bybit_blocked_at = time.time()
                         print("⛔ Bybit geo-blocked (403). Falling back to Binance proxy.")
                     return None
-                logger.warning(f"[Bybit] HTTP {resp.status} | {endpoint} | params={params}")
+                # Suppress 404 for liquidation endpoint (normal when no recent liq activity)
+                if resp.status == 404 and "liquidation" in endpoint:
+                    logger.debug(f"[Bybit] 404 {endpoint} | {params.get('symbol','')} — нет активных ликвидаций")
+                else:
+                    logger.warning(f"[Bybit] HTTP {resp.status} | {endpoint} | params={params}")
                 return None
         except asyncio.TimeoutError:
             logger.warning(f"[Bybit] TIMEOUT | {endpoint}")
@@ -767,7 +772,7 @@ class BinanceFuturesClient:
         if result:
             items = result.get("list", [])
             if len(items) >= 2:
-                logger.info(f"[OI] {symbol}: Bybit fallback ✅")
+                logger.debug(f"[OI] {symbol}: Bybit fallback ✅")
                 return [{"sumOpenInterest": float(item.get("openInterest", 0))}
                         for item in items]
 
@@ -808,10 +813,18 @@ class BinanceFuturesClient:
     async def get_oi_short_term(self, symbol: str) -> Dict[str, float]:
         """
         Краткосрочные OI-изменения для усиления сигналов.
-        Возвращает {'oi_1h': %, 'oi_4h': %} — пригодны для Aegis-скора.
+        Возвращает {'oi_30m': %, 'oi_1h': %, 'oi_4h': %} — пригодны для Aegis-скора.
+        ✅ Добавлен 30m таймфрейм по запросу.
         """
-        results = {"oi_1h": 0.0, "oi_4h": 0.0}
+        results = {"oi_30m": 0.0, "oi_1h": 0.0, "oi_4h": 0.0}
         try:
+            # 30m — последние 2 свечи = изменение за 30 мин
+            h30 = await self.get_open_interest_history(symbol, "30m", 4)
+            if h30 and len(h30) >= 2:
+                old = float(h30[0].get("sumOpenInterest", 0))
+                new = float(h30[-1].get("sumOpenInterest", 0))
+                results["oi_30m"] = round((new - old) / old * 100, 2) if old else 0.0
+
             h1 = await self.get_open_interest_history(symbol, "1h", 6)
             if h1 and len(h1) >= 2:
                 old = float(h1[0].get("sumOpenInterest", 0))
@@ -936,7 +949,7 @@ class BinanceFuturesClient:
                 if buy is not None:
                     val = float(buy)  # уже 0–1
                     if 0.0 < val < 1.0:
-                        logger.info(f"[Taker] {symbol}: Bybit account-ratio proxy → {val:.3f}")
+                        logger.debug(f"[Taker] {symbol}: Bybit account-ratio proxy → {val:.3f}")
                         return round(val, 3)
 
         logger.info(f"[Taker] {symbol}: все источники пустые → None")
@@ -1000,8 +1013,12 @@ class BinanceFuturesClient:
         # side=Buy  → ликвидация лонга (лонгист получил маржин-колл)
         # side=Sell → ликвидация шорта
         try:
+            # ✅ FIX БАГ 1: Добавлен startTime — без него Bybit возвращает 404
+            # когда нет ТЕКУЩИХ форсированных ликвидаций в эту секунду
+            _start_ms = str(int((time.time() - seconds) * 1000))
             bybit_result = await self._bybit("/v5/market/liquidation",
-                                             {"category": "linear", "symbol": symbol, "limit": "200"})
+                                             {"category": "linear", "symbol": symbol,
+                                              "limit": "200", "startTime": _start_ms})
             if bybit_result:
                 items = bybit_result.get("list", [])
                 if items:
@@ -1035,17 +1052,15 @@ class BinanceFuturesClient:
             logger.info(f"[Liq] {symbol}: Bybit error — {e} → OKX")
 
         # ── 3. OKX direct fallback ─────────────────────────────────────────
-        # OKX Public API: /public/liquidation-orders
-        # Docs: https://www.okx.com/docs-v5/en/#public-data-rest-api-get-liquidation-orders
-        # Формат ответа: [{"sz": "...", "bkPx": "...", "side": "sell"/"buy", ...}, ...]
-        # side="sell" = ликвидация лонга, side="buy" = ликвидация шорта
+        # ── 3. OKX /api/v5/public/liquidation-orders ──────────────────────────
+        # ✅ FIX БАГ 2: Было /public/liquidation-orders → 404.
+        # Правильный путь: /api/v5/public/liquidation-orders
         inst_id = self._to_okx_instid(symbol) + "-SWAP"
-        logger.info(f"[Liq] {symbol}: OKX запрос — instId={inst_id}, state=filled")
+        logger.debug(f"[Liq] {symbol}: OKX запрос — instId={inst_id}")
         data = await self._okx(
-            "/public/liquidation-orders",
+            "/api/v5/public/liquidation-orders",
             {"instType": "SWAP", "instId": inst_id, "state": "filled", "limit": str(limit)}
         )
-        logger.info(f"[Liq] {symbol}: OKX ответ — data={data is not None}, len={len(data) if data else 0}")
         if data and len(data) > 0:
             long_liq = short_liq = 0.0
             for order in data:
@@ -1074,9 +1089,9 @@ class BinanceFuturesClient:
             else:
                 logger.info(f"[Liq] {symbol}: OKX вернул данные но ликвидации=0")
         else:
-            logger.info(f"[Liq] {symbol}: OKX вернул пустой ответ")
+            logger.debug(f"[Liq] {symbol}: OKX вернул пустой ответ")
 
-        logger.info(f"[Liq] {symbol}: все источники пустые")
+        logger.debug(f"[Liq] {symbol}: все источники пустые")
         return None
 
     async def get_top_trader_position_ratio(self, symbol: str,
@@ -1426,6 +1441,7 @@ class BinanceFuturesClient:
                 recent_liquidations_usd=recent_liquidations_usd,
                 liq_side=liq_side,
                 top_trader_long_short_ratio=top_trader_long_short_ratio,
+                oi_change_30m=oi_st.get("oi_30m", 0.0),
                 oi_change_1h=oi_st.get("oi_1h", 0.0),
                 oi_change_4h=oi_st.get("oi_4h", 0.0),
             )

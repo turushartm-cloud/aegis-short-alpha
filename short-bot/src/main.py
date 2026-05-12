@@ -256,8 +256,10 @@ async def _build_combined_watchlist(binance_client, min_vol: float, max_count: i
     # ✅ FIX: Reject garbage symbols (Chinese chars, non-ASCII, malformed)
     _VALID_SYM = re.compile(r'^[A-Z0-9]{2,20}USDT$')
     result = [s for s in combined if _VALID_SYM.match(s)]
+    # ✅ FIX БАГ 3: Дедупликация — сохраняет порядок, убирает дубликаты
+    result = list(dict.fromkeys(result))
     if len(result) < len(combined):
-        print(f"⚠️ Filtered {len(combined) - len(result)} invalid symbols from watchlist")
+        print(f"⚠️ Filtered {len(combined) - len(result)} invalid/duplicate symbols from watchlist")
     # ✅ FIX: ENV-блэклист (SYMBOL_BLACKLIST=GIGAUSDT,LUNAUSDT,...)
     if Config.SYMBOL_BLACKLIST:
         before = len(result)
@@ -631,7 +633,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 f"rsi={md.rsi_1h:.1f} | funding={md.funding_rate:.4f}% | "
                 f"acc_funding={md.funding_accumulated:.4f}% | "
                 f"L/S={md.long_short_ratio:.1f}% | "
-                f"OI_4d={md.oi_change_4d:.1f}% | OI_1h={getattr(md,'oi_change_1h',0.0):+.1f}% | OI_4h={getattr(md,'oi_change_4h',0.0):+.1f}% | "
+                f"OI_4d={md.oi_change_4d:.1f}% | OI_30m={getattr(md,'oi_change_30m',0.0):+.1f}% | OI_1h={getattr(md,'oi_change_1h',0.0):+.1f}% | OI_4h={getattr(md,'oi_change_4h',0.0):+.1f}% | "
                 f"vol_spike={getattr(md,'volume_spike_ratio',1.0):.2f}x | "
                 f"atr={getattr(md,'atr_14_pct',0.5):.2f}% | "
                 f"top_trader={'%.2f' % top_trader_val if top_trader_val is not None else '⚠️ None'} | "
@@ -1044,12 +1046,35 @@ async def scan_market():
         "low_score": 0,
     }
 
+    # ✅ FIX БАГ 5: Параллельный pre-fetch — сокращает скан с ~5 мин до ~30с
+    # SCAN_CONCURRENCY=8 означает 8 символов одновременно (по умолчанию)
+    _SCAN_SEM = asyncio.Semaphore(int(os.getenv("SCAN_CONCURRENCY", "8")))
+    _FRESH = object()  # sentinel: символ свежий, пропускаем
+
+    async def _prefetch(sym: str):
+        async with _SCAN_SEM:
+            try:
+                if _is_fresh(state.redis.get_signals(Config.BOT_TYPE, sym, limit=1)):
+                    return sym, _FRESH
+                sig = await scan_symbol(sym, _btc_cache_1h)
+                return sym, sig
+            except Exception as _pfe:
+                print(f"⚠️ Prefetch {sym}: {_pfe}")
+                return sym, None
+
+    _t0 = datetime.utcnow()
+    _prefetch_tasks = [_prefetch(s) for s in state.watchlist]
+    _prefetch_results = await asyncio.gather(*_prefetch_tasks)
+    _dt = (datetime.utcnow() - _t0).total_seconds()
+    print(f"⚡ Parallel fetch: {len(state.watchlist)} symbols in {_dt:.1f}s")
+    _prefetch_map = dict(_prefetch_results)
+
     for symbol in state.watchlist:
         try:
-            if _is_fresh(state.redis.get_signals(Config.BOT_TYPE, symbol, limit=1)):
+            _fetched = _prefetch_map.get(symbol)
+            if _fetched is _FRESH:
                 continue
-
-            signal = await scan_symbol(symbol, _btc_cache_1h)
+            signal = _fetched
             if not signal:
                 rejected_count += 1
                 continue
