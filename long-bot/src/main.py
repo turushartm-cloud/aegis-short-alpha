@@ -156,7 +156,8 @@ class Config:
     TRAIL_ACTIVATION  = float(os.getenv("LONG_TRAIL_ACTIVATION", "0.015"))  # +1.5%
 
     # BTC correlation thresholds (Long = позитивная корреляция)
-    BTC_BLOCK_THRESHOLD  = float(os.getenv("BTC_BLOCK_THRESHOLD", "-3.0"))  # Блок LONG при BTC -3%/h
+    BTC_BLOCK_THRESHOLD  = float(os.getenv("BTC_BLOCK_THRESHOLD", "-1.5"))  # ✅ FIX: было -3.0 (слишком мягко) → -1.5
+    BTC_4H_BLOCK         = float(os.getenv("BTC_4H_BLOCK_THRESHOLD", "-2.0"))  # Блок LONG если BTC 4H < -2%
 
 
 # ============================================================================
@@ -508,6 +509,21 @@ async def _get_btc_change() -> Optional[float]:
     try:
         btc = await state.binance.get_complete_market_data("BTCUSDT")
         return getattr(btc, "price_change_1h", 0) if btc else None
+    except Exception:
+        return None
+
+
+async def _get_btc_change_4h() -> Optional[float]:
+    """BTC 4H изменение — трендовый фильтр для Long (не открываем лонги в даунтренде)
+    Берём последние 4 часовые свечи из get_ohlcv и считаем изменение закрытия.
+    """
+    try:
+        ohlcv = await state.binance.get_klines("BTCUSDT", interval="1h", limit=5)
+        if ohlcv and len(ohlcv) >= 5:
+            open_price  = ohlcv[-5].close  # 4 часа назад
+            close_price = ohlcv[-1].close  # сейчас
+            return round((close_price - open_price) / open_price * 100, 2)
+        return None
     except Exception:
         return None
 
@@ -999,6 +1015,14 @@ async def scan_market():
 
     # BTC data (главный фильтр для Long)
     _btc_cache_1h: Optional[float] = await _get_btc_change()
+    _btc_cache_4h: Optional[float] = await _get_btc_change_4h()
+    # ✅ BTC 4H тренд-блок: не открываем лонги если BTC в даунтренде на 4H
+    if _btc_cache_4h is not None and Config.ENABLE_BTC_FILTER:
+        if _btc_cache_4h <= Config.BTC_4H_BLOCK:
+            print(f"🔴 [BTC_4H_FILTER] BTC 4H {_btc_cache_4h:.1f}% <= {Config.BTC_4H_BLOCK}% — блокируем ВСЕ LONG на этот скан")
+            _btc_cache_1h = Config.BTC_BLOCK_THRESHOLD - 1  # Force block 1H filter too
+        else:
+            print(f"📊 [BTC_4H_FILTER] BTC 4H {_btc_cache_4h:+.1f}% — OK для LONG")
     # ✅ FIX #5: сохраняем в state для delta scorer
     state.btc_change_1h = _btc_cache_1h
 
@@ -1058,7 +1082,7 @@ async def scan_market():
                 continue
 
             # ✅ FIX: RR pre-check BEFORE Telegram — don't alert on signals we won't trade
-            _MIN_RR = 1.0  # matches AutoTrader TradeConfig.min_rr_ratio
+            _MIN_RR = float(os.getenv("MIN_RR_RATIO", "1.2"))  # ✅ FIX: was hardcoded 1.0 → ENV MIN_RR_RATIO=1.2
             _tp_list = signal.get("take_profits", [])
             if _tp_list:
                 _tp1_raw = _tp_list[0]

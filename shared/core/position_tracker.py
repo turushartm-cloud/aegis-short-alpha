@@ -48,6 +48,7 @@ class PositionTracker:
     # ── Двухступенчатый безубыток ─────────────────────────────────────────────
     # Шаг 1: После TP1 → SL в точку входа (breakeven = 0%)
     # Шаг 2: После TP2 → SL в entry + 0.2% (гарантированная небольшая прибыль)
+    BREAKEVEN_AFTER_TP   = 1      # ✅ FIX: After which TP to move SL to BE (was missing → AttributeError)
     BREAKEVEN_BUFFER_TP1 = 0.000  # SL = entry (ровно точка входа)
     BREAKEVEN_BUFFER_TP2 = 0.002  # SL = entry + 0.2% после TP2
 
@@ -631,10 +632,13 @@ class PositionTracker:
                         position_exists = True
                         break
                 if not position_exists:
-                    print(f"⚠️  [PT] _move_sl: позиция {symbol} не найдена на бирже — возможно закрыта. Пропускаем обновление SL.")
-                    # Удаляем из Redis тоже
-                    self.redis.delete(f"{self.bot_type}:signal:{symbol}")
-                    return
+                    # ✅ FIX Bug2: Логируем что вернул BingX для дебага
+                    returned_syms = [p.symbol for p in all_positions[:10]]
+                    print(f"⚠️  [PT] _move_sl: позиция {symbol} не найдена на бирже. "
+                          f"BingX вернул {len(all_positions)} позиций: {returned_syms}")
+                    # ✅ FIX: НЕ удаляем Redis — позиция могла быть временно не видна (DEMO lag)
+                    # Продолжаем обновление Redis и Telegram (только биржу пропускаем)
+                    print(f"⚠️  [PT] _move_sl: Обновляем только Redis + Telegram для {symbol}")
             except Exception as e:
                 print(f"⚠️  [PT] _move_sl: ошибка проверки позиции {symbol}: {e}")
 

@@ -169,7 +169,7 @@ class WyckoffAccumulationDetector:
         if len(ohlcv) < 10 or not resistance_level:
             return None
 
-        recent = ohlcv[-20:]
+        recent = ohlcv[-7:]  # ✅ FIX: was -20 (SOS must be very recent, not 20 candles ago)
         vols = [getattr(c, 'volume', 0) or getattr(c, 'quote_volume', 0) for c in recent]
         avg_vol = sum(vols) / len(vols) if vols else 1
 
@@ -178,7 +178,7 @@ class WyckoffAccumulationDetector:
                 vol = getattr(c, 'volume', 0) or getattr(c, 'quote_volume', 0)
                 vol_ratio = vol / avg_vol if avg_vol > 0 else 1
 
-                if vol_ratio > 1.3:  # Пробой на объёме = SOS
+                if vol_ratio > 1.5:  # ✅ FIX: was 1.3 (too many false positives). Пробой на объёме = SOS
                     # Проверяем LPS — откат к пробитому уровню без обновления лоу
                     lps_found = False
                     for j in range(i + 1, len(recent)):
@@ -258,7 +258,9 @@ class WyckoffAccumulationDetector:
                 meta.update(spring)
 
             # ── Фаза D: SOS + LPS ────────────────────────────────────────
-            sos = self._detect_sos_lps(ohlcv, resistance * 0.97)
+            # ✅ FIX: Только ищем SOS если цена НЕ уже в верхних 30% диапазона
+            # (если цена наверху — SOS уже давно прошёл, мы опоздали)
+            sos = self._detect_sos_lps(ohlcv, resistance) if range_position < 0.70 else None  # ✅ FIX: was resistance*0.97 (too easy to trigger)
             if sos and sos["score"] > score:
                 phase = "D"
                 event = sos["event"]
