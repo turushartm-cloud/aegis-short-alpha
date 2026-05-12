@@ -211,6 +211,7 @@ class BinanceFuturesClient:
         use_binance_env  = os.getenv("USE_BINANCE", "false").lower()
         self._try_binance = use_binance_env == "true"
         self._use_binance = False
+        self._okx_redis   = None   # Устанавливается ботом: client.set_redis(redis)
 
         proxy_env = os.getenv("PROXY_LIST", "")
         self._proxies     = [p.strip() for p in proxy_env.split(",") if p.strip()]
@@ -237,6 +238,10 @@ class BinanceFuturesClient:
         if elapsed < self.min_request_interval:
             await asyncio.sleep(self.min_request_interval - elapsed)
         self.last_request_time = time.time()
+
+    def set_redis(self, redis_client):
+        """Привязываем Redis для чтения OKX WS кеша ликвидаций."""
+        self._okx_redis = redis_client
 
     async def close(self):
         if self.session and not self.session.closed:
@@ -1051,46 +1056,23 @@ class BinanceFuturesClient:
         except Exception as e:
             logger.info(f"[Liq] {symbol}: Bybit error — {e} → OKX")
 
-        # ── 3. OKX direct fallback ─────────────────────────────────────────
-        # ── 3. OKX /api/v5/public/liquidation-orders ──────────────────────────
-        # ✅ FIX БАГ 2: Было /public/liquidation-orders → 404.
-        # Правильный путь: /api/v5/public/liquidation-orders
-        inst_id = self._to_okx_instid(symbol) + "-SWAP"
-        logger.debug(f"[Liq] {symbol}: OKX запрос — instId={inst_id}")
-        data = await self._okx(
-            "/api/v5/public/liquidation-orders",
-            {"instType": "SWAP", "instId": inst_id, "limit": str(limit)}
-            # ✅ FIX: Убран state=filled — вызывал HTTP 400. OKX принимает без него.
-        )
-        if data and len(data) > 0:
-            long_liq = short_liq = 0.0
-            for order in data:
-                try:
-                    sz = float(order.get("sz", 0))      # размер позиции
-                    bk_px = float(order.get("bkPx", 0))  # bankruptcy price
-                    side = order.get("side", "")       # sell=long liquidated, buy=short liquidated
-                    usd = sz * bk_px
-                    if side == "sell":
-                        long_liq += usd
-                    elif side == "buy":
-                        short_liq += usd
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"[Liq] {symbol}: ошибка парсинга order={order}, error={e}")
-                    continue
-            total = long_liq + short_liq
-            if total > 0:
-                logger.info(f"[Liq] {symbol}: OKX fallback ✅ total=${total:,.0f} (long=${long_liq:,.0f}, short=${short_liq:,.0f})")
-                return {
-                    "total_usd": total,
-                    "long_liq_usd": long_liq,
-                    "short_liq_usd": short_liq,
-                    "dominant_side": "LONG" if long_liq > short_liq
-                                     else "SHORT" if short_liq > long_liq else None
-                }
-            else:
-                logger.info(f"[Liq] {symbol}: OKX вернул данные но ликвидации=0")
-        else:
-            logger.debug(f"[Liq] {symbol}: OKX вернул пустой ответ")
+        # ── 3. OKX WebSocket кеш (Redis) ─────────────────────────────────
+        # REST /api/v5/public/liquidation-orders удалён OKX в 2023 → 400.
+        # Вместо REST используем WebSocket feed → данные в Redis okx:liq:{symbol}
+        # OKXLiquidationFeed пишет данные при каждой реальной ликвидации.
+        # Если WS ещё не подключён или для этой пары нет данных → пропускаем.
+        try:
+            from utils.okx_liquidation_ws import get_okx_liq_from_redis
+            # redis_client нужен из внешнего state — передаём через self._okx_redis если задан
+            _redis = getattr(self, "_okx_redis", None)
+            if _redis:
+                okx_cached = get_okx_liq_from_redis(_redis, symbol)
+                if okx_cached:
+                    total = okx_cached["total_usd"]
+                    logger.info(f"[Liq] {symbol}: OKX WS cache ✅ total=${total:,.0f}")
+                    return okx_cached
+        except Exception as e:
+            logger.debug(f"[Liq] {symbol}: OKX cache error — {e}")
 
         logger.debug(f"[Liq] {symbol}: все источники пустые")
         return None
