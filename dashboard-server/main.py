@@ -367,8 +367,9 @@ def _build_perf(bot: str) -> Dict:
                          if _normalize_symbol(s.get("symbol","")) not in pos_syms]
     total_real = len(real_pos) + len(real_sigs_deduped)
 
-    # ✅ FIX: Читаем реальный HASH virtual_positions (было: signals без order_id — неверно)
-    virtual_count = _get_virtual_positions_count(c, bot)
+    # ✅ FIX: Используем тот же источник что и вкладка Virtual Signals
+    # virt_sigs = signals без order_id (не HASH который пустой)
+    virtual_count = len(virt_sigs)
 
     # Also check state["daily_signals"] for today's signal count
     daily_sigs = state.get("daily_signals", {})
@@ -493,8 +494,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/health")
+@app.head("/health")
 async def health():
-    """Enhanced health check with Redis status and cache stats."""
+    """Enhanced health check with Redis status and cache stats.
+    ✅ HEAD поддерживается для UptimeRobot и других мониторингов.
+    """
     long_ok, long_msg = health_check("long")
     short_ok, short_msg = health_check("short")
 
@@ -514,8 +518,11 @@ async def health():
     }
 
 @app.get("/api/overview")
+@app.head("/api/overview")
 async def overview():
-    """Overview with 30-minute caching."""
+    """Overview with 30-minute caching.
+    ✅ HEAD поддерживается для UptimeRobot.
+    """
     return _get_cached_overview()
 
 @app.get("/api/positions")
@@ -578,6 +585,12 @@ async def serve_dashboard():
         with open(html_path) as f:
             return f.read()
     return "<h1>index.html not found</h1>"
+
+@app.head("/")
+async def serve_dashboard_head():
+    """✅ HEAD для UptimeRobot — возвращает 200 без тела."""
+    from fastapi.responses import Response
+    return Response(status_code=200)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0",
