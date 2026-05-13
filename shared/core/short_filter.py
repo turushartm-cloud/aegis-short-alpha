@@ -262,6 +262,7 @@ def get_short_tp_config(
     funding_rate: float,
     pattern_name: Optional[str],
     btc_trend: Optional[str],   # "up" | "down" | "sideways"
+    atr_pct: float = 0.0,       # ✅ v19: ATR как % цены для адаптивного RR
 ) -> tuple:
     """
     Выбрать оптимальный TP профиль для SHORT в зависимости от контекста.
@@ -269,6 +270,20 @@ def get_short_tp_config(
     Returns:
         (tp_levels, tp_weights)
     """
+    # ✅ v19: Адаптивный RR под волатильность
+    # При высоком ATR (>3%) TP уровни шире — иначе spike закрывает их преждевременно
+    if atr_pct >= 3.0:
+        # Масштабируем все уровни на ATR множитель
+        _mult = min(atr_pct / 2.0, 2.5)  # макс 2.5x
+        def _scale(levels):
+            return [round(l * _mult, 2) for l in levels]
+        base_lvls = _scale(SHORT_TP_LEVELS_STANDARD)
+        return base_lvls, SHORT_TP_WEIGHTS_STANDARD
+    elif atr_pct >= 2.0:
+        _mult = 1.3
+        base_lvls = [round(l * _mult, 2) for l in SHORT_TP_LEVELS_STANDARD]
+        return base_lvls, SHORT_TP_WEIGHTS_CONSERVATIVE
+
     # Высокий фандинг = торопимся выйти
     if funding_rate >= 0.10:
         return SHORT_TP_LEVELS_CONSERVATIVE, SHORT_TP_WEIGHTS_FAST_EXIT

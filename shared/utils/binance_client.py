@@ -427,13 +427,13 @@ class BinanceFuturesClient:
                     body = await resp.json()
                     if body.get("code") == "0":
                         return body.get("data")
-                    logger.debug(f"[OKX] {endpoint} | code={body.get('code')} msg={body.get('msg')}")
+                    logger.info(f"[OKX] {endpoint} | code={body.get('code')} msg={body.get('msg')}")
                 else:
-                    logger.debug(f"[OKX] HTTP {resp.status} | {endpoint}")
+                    logger.info(f"[OKX] HTTP {resp.status} | {endpoint}")
         except asyncio.TimeoutError:
-            logger.debug(f"[OKX] TIMEOUT | {endpoint}")
+            logger.info(f"[OKX] TIMEOUT | {endpoint}")
         except Exception as e:
-            logger.debug(f"[OKX] ERROR | {endpoint} | {type(e).__name__}: {e}")
+            logger.info(f"[OKX] ERROR | {endpoint} | {type(e).__name__}: {e}")
         return None
 
     # =========================================================================

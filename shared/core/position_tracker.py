@@ -370,22 +370,9 @@ class PositionTracker:
                 # 🆕 NEW: Проверяем только подтвержденные позиции (confirmed=True)
                 confirmed = sig.get('confirmed', False)
                 if not confirmed:
-                    # Позиция не подтверждена — проверяем возраст.
-                    # Если > 30 мин → мёртвая запись, удаляем из Redis.
-                    _ts = sig.get('timestamp', '')
-                    _age_min = 9999
-                    if _ts:
-                        try:
-                            _dt = datetime.fromisoformat(_ts.replace('Z', '+00:00'))
-                            _age_min = (datetime.utcnow() - _dt.replace(tzinfo=None)).total_seconds() / 60
-                        except Exception:
-                            pass
-                    if _age_min > 30:
-                        print(f"[ZOMBIE-AUTO-CLEAN] {symbol}: confirmed=False, возраст={_age_min:.0f}м > 30м → удаляем")
-                        self.redis.remove_position(self.bot_type, symbol)
-                        self.micro_trailing.remove(symbol)
-                    else:
-                        print(f"[ZOMBIE-SKIP] {symbol}: confirmed=False, возраст={_age_min:.0f}м < 30м — ждём подтверждения")
+                    # Позиция не подтверждена биржей - не проверяем ее статус
+                    # (экономим API запросы, не создаем ложных zombie)
+                    print(f"[ZOMBIE-SKIP] {symbol}: не подтверждена на бирже (confirmed=False), пропускаем проверку")
                     continue
 
                 pos_side = 'LONG' if direction == 'long' else 'SHORT'
