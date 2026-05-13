@@ -145,40 +145,6 @@ class MarketStructureResult:
     has_ob_1d:     bool = False
 
 
-    # ── Pivot Points (Floor Pivots от Previous Day) ───────────────────────────
-    if r.pdh > 0 and r.pdl > 0 and r.pdc > 0:
-        H, L, C = r.pdh, r.pdl, r.pdc
-        pp = (H + L + C) / 3
-        r.pivot_pp = round(pp, 8)
-        r.pivot_r1 = round(2 * pp - L, 8)
-        r.pivot_r2 = round(pp + (H - L), 8)
-        r.pivot_r3 = round(H + 2 * (pp - L), 8)
-        r.pivot_s1 = round(2 * pp - H, 8)
-        r.pivot_s2 = round(pp - (H - L), 8)
-        r.pivot_s3 = round(L - 2 * (H - pp), 8)
-
-    # ── CME / Weekend GAP ────────────────────────────────────────────────────
-    if r.has_1d and len(klines_1d) >= 4:
-        # ✅ v19 CME GAP: точный фильтр — ищем разрыв между пятничной и воскресной свечой
-        # CME (Chicago Mercantile Exchange) закрыт Пт 21:00 UTC → Вс 22:00 UTC
-        # Разрыв значим если появился в воскресенье/понедельник — первая торговая сессия
-        from datetime import datetime as _dt, timezone as _tz
-        for i in range(len(klines_1d) - 1, max(0, len(klines_1d) - 8), -1):
-            prev_c = klines_1d[i - 1]
-            curr_c = klines_1d[i]
-            if prev_c.close <= 0:
-                continue
-            gap_pct = (curr_c.open - prev_c.close) / prev_c.close * 100
-            # Порог: для BTC/ETH CME gap обычно >0.3%, для альтов >0.5%
-            if abs(gap_pct) >= 0.3:
-                r.cme_gap_pct  = round(gap_pct, 3)
-                r.has_cme_gap  = True
-                r.cme_gap_dir  = "up" if gap_pct > 0 else "down"
-                if gap_pct > 0:
-                    r.cme_gap_low, r.cme_gap_high = prev_c.close, curr_c.open
-                else:
-                    r.cme_gap_low, r.cme_gap_high = curr_c.open, prev_c.close
-                break
 
     # ── Ключевые уровни (для вывода) ─────────────────────────────────────────
     key_levels: List[Tuple[float, str]] = field(default_factory=list)
@@ -487,6 +453,35 @@ def compute_market_structure(
         r.has_ob_1d = bear_ob_d or bull_ob_d
 
     # ── Ключевые уровни (для логов) ───────────────────────────────────────────
+    # ── Pivot Points (Floor Pivots от Previous Day) ────────────────────────────────
+    if r.pdh > 0 and r.pdl > 0 and r.pdc > 0:
+        H, L, C = r.pdh, r.pdl, r.pdc
+        pp = (H + L + C) / 3
+        r.pivot_pp = round(pp, 8)
+        r.pivot_r1 = round(2 * pp - L, 8)
+        r.pivot_r2 = round(pp + (H - L), 8)
+        r.pivot_r3 = round(H + 2 * (pp - L), 8)
+        r.pivot_s1 = round(2 * pp - H, 8)
+        r.pivot_s2 = round(pp - (H - L), 8)
+        r.pivot_s3 = round(L - 2 * (H - pp), 8)
+
+    # ── CME / Session GAP ────────────────────────────────────────────
+    if r.has_1d and len(klines_1d) >= 4:
+        for _i in range(len(klines_1d) - 1, max(0, len(klines_1d) - 8), -1):
+            _pc = klines_1d[_i - 1]
+            _cc = klines_1d[_i]
+            if _pc.close > 0:
+                _gap = (_cc.open - _pc.close) / _pc.close * 100
+                if abs(_gap) >= 0.3:
+                    r.cme_gap_pct = round(_gap, 3)
+                    r.has_cme_gap = True
+                    r.cme_gap_dir = "up" if _gap > 0 else "down"
+                    if _gap > 0:
+                        r.cme_gap_low, r.cme_gap_high = _pc.close, _cc.open
+                    else:
+                        r.cme_gap_low, r.cme_gap_high = _cc.open, _pc.close
+                    break
+
     levels: List[Tuple[float, str]] = []
     if r.pdh:      levels.append((r.pdh, "PDH"))
     if r.pdl:      levels.append((r.pdl, "PDL"))
