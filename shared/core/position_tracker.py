@@ -76,6 +76,7 @@ class PositionTracker:
         self.micro_trailing = get_micro_trailing()
         
         self._running    = False
+        self._scan_lock  = None   # asyncio.Lock — set on first use (event loop needed)
 
     async def run(self):
         self._running = True
@@ -97,6 +98,16 @@ class PositionTracker:
 
     async def _scan_all(self):
         try:
+            # ✅ FIX v17: asyncio.Lock prevents duplicate PT processing
+            if self._scan_lock is None:
+                import asyncio as _aio
+                self._scan_lock = _aio.Lock()
+            if self._scan_lock.locked():
+                await asyncio.sleep(5)
+                continue
+            async with self._scan_lock:
+              pass  # acquired — proceed with scan below
+
             signals = self.redis.get_active_signals(self.bot_type)
         except Exception as e:
             print(f"[PositionTracker] redis error: {e}")

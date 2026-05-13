@@ -106,7 +106,7 @@ class Config:
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "12"))
 
     MIN_SCORE     = int(os.getenv("MIN_LONG_SCORE", "52"))   # Снижено с 60: новая blend-формула (70% base) даёт ~45-55 при base=58
-    SL_BUFFER     = float(os.getenv("LONG_SL_BUFFER", "3.0")) # Long = больше SL
+    SL_BUFFER     = float(os.getenv("LONG_SL_BUFFER", "2.5"))  # ✅ FIX v17: 3.0→2.5% (TP1 теперь выше)
     LEVERAGE      = os.getenv("LONG_LEVERAGE", "5-20")
 
     # LONG TP: меньше фиксируем рано (ждём движения)
@@ -1069,7 +1069,7 @@ async def scan_market():
     new_signals = tg_only_count = 0
 
     # ✅ FIX БАГ 5: Параллельный pre-fetch
-    _SCAN_SEM = asyncio.Semaphore(int(os.getenv("SCAN_CONCURRENCY", "8")))
+    _SCAN_SEM = asyncio.Semaphore(int(os.getenv("SCAN_CONCURRENCY", "12")))  # ✅ FIX v17: 8→12
     _FRESH = object()
 
     async def _prefetch(sym: str):

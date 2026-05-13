@@ -160,8 +160,18 @@ class LiquidationZoneDetector:
             liquidations_data = await self._fetch_coinglass_liq(symbol)
         
         if not liquidations_data:
-            # Симуляция для тестов (в реальности использовать реальные данные)
-            liquidations_data = self._simulate_liquidations(current_price)
+            # ✅ FIX v17: нет реальных данных → возвращаем пустой анализ
+            # _simulate_liquidations удалена — фейковые данные искажали SL/TP
+            return LiquidationAnalysis(
+                symbol=symbol,
+                current_price=current_price,
+                clusters=[],
+                nearest_above=None,
+                nearest_below=None,
+                strongest_above=None,
+                strongest_below=None,
+                long_liq_dominance=0.5,
+            )
         
         # Кластеризуем
         clusters = self._cluster_liquidations(
@@ -274,29 +284,8 @@ class LiquidationZoneDetector:
             return []
     
     def _simulate_liquidations(self, current_price: float) -> List[Dict]:
-        """Симуляция данных ликвидаций для тестирования"""
-        # В реальности удалить эту функцию и использовать только реальные данные
-        liquidations = []
-        
-        # Создаём фейковые ликвидации выше и ниже цены
-        for i in range(10):
-            # Ликвидации лонгов выше цены (для шортов)
-            price_up = current_price * (1 + 0.02 + i * 0.01)
-            liquidations.append({
-                "price": price_up,
-                "volume": 500_000 + i * 100_000,
-                "side": "long",
-            })
-            
-            # Ликвидации шортов ниже цены (для лонгов)
-            price_down = current_price * (1 - 0.02 - i * 0.01)
-            liquidations.append({
-                "price": price_down,
-                "volume": 600_000 + i * 80_000,
-                "side": "short",
-            })
-        
-        return liquidations
+        """✅ FIX v17: метод оставлен для совместимости, но возвращает [] (без фейковых данных)"""
+        return []
     
     def clear_cache(self):
         """Очищает кеш"""

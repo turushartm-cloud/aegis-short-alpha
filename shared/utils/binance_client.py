@@ -308,7 +308,7 @@ class BinanceFuturesClient:
 
     _bybit_blocked: bool = False       # class-level flag: Bybit geo-blocked
     _bybit_blocked_at: float = 0.0     # timestamp when blocked (for retry)
-    BYBIT_RETRY_INTERVAL: int = 1800   # retry Bybit every 30 min
+    BYBIT_RETRY_INTERVAL: int = 300    # ✅ FIX v17: retry Bybit every 5 min (было 30 мин)
 
     async def _bybit(self, endpoint: str, params: Dict = None) -> Optional[Any]:
         await self._rate_limit()
@@ -325,7 +325,7 @@ class BinanceFuturesClient:
             async with session.get(
                 f"{self.BYBIT_URL}{endpoint}",
                 params=params or {},
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=15)  # ✅ FIX v17: 10→15s
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()

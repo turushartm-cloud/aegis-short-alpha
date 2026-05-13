@@ -1,3 +1,4 @@
+import os
 """
 Auto Trader v3.2 — HARDENED ENTRY CONDITIONS
 
@@ -300,7 +301,13 @@ class AutoTrader:
         print(f"{pfx} 📐 risk={actual_risk*100:.3f}% | notional=${notional:,.0f} | "
               f"size={size:.6f} | leverage={leverage}x")
 
-        # ── 8. BingX params ───────────────────────────────────────────────────
+        # ── # ✅ FIX v17: BingX notional cap before order
+        _bingx_max = float(os.environ.get("BINGX_MAX_NOTIONAL", "5000"))
+        if notional > _bingx_max:
+            size = _bingx_max / entry_price
+            notional = size * entry_price
+            print(f"{pfx} CAP notional -> ${_bingx_max:,.0f}")
+        # 8. BingX params
         side          = "BUY"  if direction == "long"  else "SELL"
         position_side = "LONG" if direction == "long"  else "SHORT"
 

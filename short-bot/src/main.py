@@ -109,7 +109,7 @@ class Config:
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "12"))
 
     MIN_SCORE     = int(os.getenv("MIN_SHORT_SCORE", "55"))  # Снижено с 60: новая blend-формула (70% base) даёт ~55-65 при base=60
-    SL_BUFFER     = float(os.getenv("SHORT_SL_BUFFER", "2.5"))
+    SL_BUFFER     = float(os.getenv("SHORT_SL_BUFFER", "2.0"))  # ✅ FIX v17: 2.5→2.0% для RR≥1.5
     LEVERAGE      = os.getenv("SHORT_LEVERAGE", "5-30")
 
     # TP Config
@@ -1110,7 +1110,7 @@ async def scan_market():
 
     # ✅ FIX БАГ 5: Параллельный pre-fetch — сокращает скан с ~5 мин до ~30с
     # SCAN_CONCURRENCY=8 означает 8 символов одновременно (по умолчанию)
-    _SCAN_SEM = asyncio.Semaphore(int(os.getenv("SCAN_CONCURRENCY", "8")))
+    _SCAN_SEM = asyncio.Semaphore(int(os.getenv("SCAN_CONCURRENCY", "12")))  # ✅ FIX v17: 8→12
     _FRESH = object()  # sentinel: символ свежий, пропускаем
 
     async def _prefetch(sym: str):
