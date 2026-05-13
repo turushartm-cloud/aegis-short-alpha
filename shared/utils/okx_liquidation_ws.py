@@ -29,7 +29,7 @@ logger = logging.getLogger("aegis.okx_ws")
 
 # Exponential backoff delays (секунды)
 RECONNECT_DELAYS = [1, 2, 4, 8, 15, 30, 60]
-PING_INTERVAL    = 15    # ✅ FIX: было 25s → OKX отключался с 4004 (no data 30s). 15s надёжнее.
+PING_INTERVAL    = 20    # 20s ping — баланс между нагрузкой и keepalive (< 30s OKX таймаут)
 PONG_TIMEOUT     = 10    # Если нет ответа через 10s → reconnect
 LIQ_TTL_SECONDS  = 300   # Redis TTL для накопленных ликвидаций (5 мин)
 LIQ_WINDOW_MS    = 3_600_000  # Окно накопления: 1 час

@@ -690,8 +690,8 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
 
         base_result = state.scorer.calculate_score(
             rsi_1h=md.rsi_1h or 50,
-            funding_current=md.funding_rate / 100,
-            funding_accumulated=md.funding_accumulated / 100,
+            funding_current=md.funding_rate,       # ✅ FIX: already in %, no /100
+            funding_accumulated=md.funding_accumulated,  # ✅ FIX: already in %
             long_ratio=md.long_short_ratio,
             oi_change_4d=md.oi_change_4d,
             price_change_4d=p4d,
@@ -737,6 +737,25 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         if verbose and fg_reason:
             print(f"{log_prefix} {fg_reason}")
 
+        # ── PARABOLIC MOMENTUM BLOCKER ──────────────────────────────────────
+        # Ракету не шортим: OI_4d > 40% + price_4d > 30% + volume_spike > 3x
+        _oi4d     = getattr(md, "oi_change_4d", 0.0)
+        _vol_sp   = getattr(md, "volume_spike_ratio", 1.0)
+        _price4d  = 0.0
+        try:
+            _price4d = abs(md.price_change_24h) * 4
+        except Exception:
+            pass
+        if _oi4d > 40.0 and _price4d > 30.0 and _vol_sp > 3.0:
+            if verbose:
+                print(f"{log_prefix} 🚫 [PARABOLIC BLOCK] OI_4d={_oi4d:.1f}% price_4d≈{_price4d:.1f}% spike={_vol_sp:.1f}x — ракету не шортим")
+            return None
+        # Более мягкий вариант: OI_4d > 60% или price_4d > 50% в одиночку
+        if _oi4d > 60.0 or _price4d > 50.0:
+            if verbose:
+                print(f"{log_prefix} 🚫 [PARABOLIC BLOCK] Экстремальный импульс OI={_oi4d:.1f}% price4d≈{_price4d:.1f}% — блок")
+            return None
+
         price      = md.price
         base_score = effective_score
         
@@ -753,6 +772,13 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                         print(f"{log_prefix} 🏗 [MS] {' | '.join(_ms_reasons[:3])}")
             except Exception as _ms_e:
                 pass  # MS bonus не критичен
+
+        # ── CASCADE SIGNAL Bonus (4H Fractal Raid → 1H SNR → 15M FVG) ──────
+        _cas = getattr(md, "cascade_signal", None)
+        if _cas is not None and _cas.has_signal and _cas.direction == "short":
+            base_score = max(0, min(100, base_score + _cas.score_bonus))
+            if verbose:
+                print(f"{log_prefix} 🎯 [CASCADE SHORT] +{_cas.score_bonus}: {_cas.description[:80]}")
         # 🆕 Консолидация фильтр — блокировка входов в середине диапазона
         if state.consolidation_detector and ohlcv_15m:
             cons = state.consolidation_detector.detect(ohlcv_15m, price)
@@ -1307,7 +1333,13 @@ async def _daily_report_task():
             try:
                 # Используем Redis-историю (те же данные что и /daily_rep)
                 # PerformanceTracker хранит данные только в RAM и обнуляется при рестарте
-                await state.telegram.cmd_daily_report("", state.telegram.chat_id)
+                # ✅ FIX: cmd_daily_report на TelegramCommandHandler, не TelegramBot
+                if hasattr(state.telegram, "cmd_daily_report"):
+                    await state.telegram.cmd_daily_report("", state.telegram.chat_id)
+                elif state.telegram_handler and hasattr(state.telegram_handler, "cmd_daily_report"):
+                    await state.telegram_handler.cmd_daily_report("", state.telegram.chat_id)
+                else:
+                    await state.telegram._send_daily_report() if hasattr(state.telegram, "_send_daily_report") else None
                 print("✅ Daily report sent (Redis-based)")
             except Exception as e:
                 print(f"Daily report error: {e}")

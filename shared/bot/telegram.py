@@ -329,7 +329,7 @@ class TelegramBot:
             f"<b>📈 INDICATORS:</b>\n{ind_lines}\n\n"
             f"<b>🎯 LEVELS:</b>\n"
             f"   Entry: <b>{fmt_price(entry)}</b>\n"
-            f"   Stop:  <b>{fmt_price(stop_loss)}</b>  (⬆️ {abs(sl_pct):.2f}% above entry)\n"
+            f"   Stop:  <b>{fmt_price(stop_loss)}</b>  (⬇️ -{abs(sl_pct):.2f}% risk)\n"  # ✅ FIX: SHORT SL выше entry = риск
             f"{tp_lines}\n"
             f"<b>⚡ Leverage:</b> {leverage}x\n"
             f"<b>💰 Risk:</b> {risk}\n"

@@ -334,6 +334,14 @@ def compute_market_structure(
             r.pdl = prev_day.low
             r.pdc = prev_day.close
 
+            # ✅ FIX: Если цена далеко выше PDH (>5%), монета в параболе
+            # Помечаем как parabolic чтобы скорер мог блокировать SHORT
+            if price > 0 and r.pdh > 0 and price > r.pdh * 1.05:
+                # Пересчитываем PDH от последних 3 дней для актуальности
+                recent_days = klines_1d[-3:]
+                r.pdh = max(c.high for c in recent_days)
+                r.pdl = min(c.low for c in recent_days)
+
             # CRT Daily = prev day range
             r.crt_1d_high = prev_day.high
             r.crt_1d_low  = prev_day.low
@@ -611,3 +619,253 @@ def format_ms_summary(ms: MarketStructureResult) -> str:
     if ms.poc_4h:
         parts.append(f"POC4H={ms.poc_4h:.4f}")
     return " | ".join(parts) if parts else "no structure data"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CASCADE STRATEGY: 4H Fractal Raid → 1H SNR → 15M FVG
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class CascadeSignal:
+    """
+    Каскадный сигнал: 4H Fractal Raid → 1H SNR → 15M FVG
+    
+    Логика:
+    1. 4H Fractal Raid — цена пробивает ключевой фрактальный уровень на 4H
+       (stop hunt: ликвидация стопов под swing low / над swing high)
+    2. 1H SNR zone — формируется зона Support/Resistance после рейда на 1H
+       (новый уровень = место откуда начался манипулятивный выход)
+    3. 15M FVG — цена входит в Fair Value Gap на 15m внутри SNR-зоны
+       (точный вход с минимальным риском)
+    
+    Daily FVG manipulation:
+    - Daily FVG = дисбаланс на дневном графике (незакрытый gap)
+    - Манипуляция = цена "заходит" в Daily FVG чтобы забрать ликвидность
+    - После манипуляции → возврат → вход от 1H FVG внутри дневного диапазона
+    """
+    # Наличие сигнала
+    has_signal:        bool  = False
+    direction:         str   = "none"   # "long" | "short" | "none"
+    confidence:        float = 0.0      # 0.0 - 1.0
+    score_bonus:       int   = 0        # бонус к BASE_SCORER
+
+    # 4H Fractal Raid
+    fractal_4h_raided: bool  = False
+    fractal_4h_level:  float = 0.0     # уровень пробитого фрактала
+    fractal_4h_side:   str   = "none"  # "high" | "low"
+
+    # 1H SNR Zone
+    snr_zone_high:     float = 0.0
+    snr_zone_low:      float = 0.0
+    price_in_snr:      bool  = False
+
+    # 15M FVG Entry
+    fvg_15m_high:      float = 0.0
+    fvg_15m_low:       float = 0.0
+    price_in_fvg_15m:  bool  = False
+
+    # Daily FVG manipulation
+    daily_fvg_raid:    bool  = False   # цена вошла в Daily FVG
+    daily_fvg_high:    float = 0.0
+    daily_fvg_low:     float = 0.0
+
+    description:       str   = ""
+
+
+def detect_cascade_signal(
+    price:       float,
+    klines_15m:  list,
+    klines_1h:   list,
+    klines_4h:   list,
+    klines_1d:   list,
+    ms:          MarketStructureResult,
+) -> CascadeSignal:
+    """
+    Детектирует каскадный сигнал типа 4H Fractal Raid → 1H SNR → 15M FVG.
+    
+    Вызывается из get_complete_market_data() если данные 4H и 15m доступны.
+    Возвращает CascadeSignal с бонусом к скору если паттерн найден.
+    """
+    result = CascadeSignal()
+    if not (klines_4h and klines_1h and klines_15m):
+        return result
+    if len(klines_4h) < 8 or len(klines_1h) < 12 or len(klines_15m) < 20:
+        return result
+
+    # ── 1. 4H Fractal Raid ────────────────────────────────────────────────────
+    # Фрактал = локальный экстремум (5-свечной: свеча[i] выше/ниже двух соседей)
+    def _fractal_highs(candles):
+        highs = []
+        for i in range(2, len(candles) - 2):
+            if (candles[i].high > candles[i-1].high and
+                candles[i].high > candles[i-2].high and
+                candles[i].high > candles[i+1].high and
+                candles[i].high > candles[i+2].high):
+                highs.append((i, candles[i].high))
+        return highs
+
+    def _fractal_lows(candles):
+        lows = []
+        for i in range(2, len(candles) - 2):
+            if (candles[i].low < candles[i-1].low and
+                candles[i].low < candles[i-2].low and
+                candles[i].low < candles[i+1].low and
+                candles[i].low < candles[i+2].low):
+                lows.append((i, candles[i].low))
+        return lows
+
+    # Ищем последний 4H фрактал который был пробит последними 2-3 свечами
+    fractal_raid_short = False
+    fractal_raid_long  = False
+    fractal_level      = 0.0
+    fractal_side       = "none"
+
+    recent_4h = klines_4h[-12:]  # последние 12 свечей 4H = 2 дня
+    frac_highs = _fractal_highs(recent_4h)
+    frac_lows  = _fractal_lows(recent_4h)
+
+    # BULLISH raid: цена пробила фрактальный лоу но последняя свеча закрылась выше
+    if frac_lows:
+        last_frac_low_idx, last_frac_low = frac_lows[-1]
+        last_candle = recent_4h[-1]
+        # Рейд = last candle low < fractal low, но close > fractal low (возврат)
+        if last_candle.low < last_frac_low and last_candle.close > last_frac_low:
+            fractal_raid_long = True
+            fractal_level     = last_frac_low
+            fractal_side      = "low"
+
+    # BEARISH raid: пробой фрактального хая с возвратом вниз
+    if frac_highs:
+        last_frac_high_idx, last_frac_high = frac_highs[-1]
+        last_candle = recent_4h[-1]
+        if last_candle.high > last_frac_high and last_candle.close < last_frac_high:
+            fractal_raid_short = True
+            fractal_level      = last_frac_high
+            fractal_side       = "high"
+
+    result.fractal_4h_raided = fractal_raid_long or fractal_raid_short
+    result.fractal_4h_level  = fractal_level
+    result.fractal_4h_side   = fractal_side
+
+    # Если нет фрактального рейда — каскада нет
+    if not result.fractal_4h_raided:
+        return result
+
+    direction = "long" if fractal_raid_long else "short"
+
+    # ── 2. 1H SNR Zone ────────────────────────────────────────────────────────
+    # SNR формируется от уровня где начался рейд (origin candle на 1H)
+    # Ищем 1H свечу которая "запустила" движение через фрактал
+    snr_high = snr_low = 0.0
+    recent_1h = klines_1h[-8:]  # последние 8 часов
+
+    if direction == "long":
+        # Ищем последнюю медвежью 1H свечу с большим телом (манипуляция вниз)
+        for candle in reversed(recent_1h[:-1]):
+            if candle.close < candle.open:  # медвежья
+                body = abs(candle.open - candle.close)
+                if body / candle.open > 0.005:  # тело > 0.5%
+                    snr_high = candle.open
+                    snr_low  = candle.close
+                    break
+    else:
+        # BEARISH: последняя бычья 1H свеча (манипуляция вверх)
+        for candle in reversed(recent_1h[:-1]):
+            if candle.close > candle.open:  # бычья
+                body = abs(candle.close - candle.open)
+                if body / candle.open > 0.005:
+                    snr_low  = candle.open
+                    snr_high = candle.close
+                    break
+
+    result.snr_zone_high = snr_high
+    result.snr_zone_low  = snr_low
+
+    # Проверяем что цена сейчас в SNR zone (±1%)
+    if snr_high > 0 and snr_low > 0:
+        result.price_in_snr = (snr_low * 0.99 <= price <= snr_high * 1.01)
+
+    # ── 3. 15M FVG внутри SNR ────────────────────────────────────────────────
+    fvg_15m_high = fvg_15m_low = 0.0
+    recent_15m = klines_15m[-20:]
+    for i in range(len(recent_15m) - 2):
+        if direction == "long":
+            # Бычий FVG: high[i+2] < low[i] — разрыв снизу (цена упала быстро)
+            if recent_15m[i + 2].low > recent_15m[i].high:
+                g_low  = recent_15m[i].high
+                g_high = recent_15m[i + 2].low
+                # FVG должен быть в зоне SNR или ниже
+                if g_high > 0 and (snr_low == 0 or g_low <= snr_high * 1.01):
+                    fvg_15m_low  = g_low
+                    fvg_15m_high = g_high
+        else:
+            # Медвежий FVG: low[i] > high[i+2]
+            if recent_15m[i].low > recent_15m[i + 2].high:
+                g_low  = recent_15m[i + 2].high
+                g_high = recent_15m[i].low
+                if g_high > 0 and (snr_high == 0 or g_high >= snr_low * 0.99):
+                    fvg_15m_low  = g_low
+                    fvg_15m_high = g_high
+
+    result.fvg_15m_high   = fvg_15m_high
+    result.fvg_15m_low    = fvg_15m_low
+    result.price_in_fvg_15m = (
+        fvg_15m_low > 0 and
+        fvg_15m_low * 0.998 <= price <= fvg_15m_high * 1.002
+    )
+
+    # ── 4. Daily FVG Manipulation ─────────────────────────────────────────────
+    # Проверяем что цена зашла в Daily FVG (Daily FVG из ms.fvg_bearish_1d / fvg_bullish_1d)
+    daily_fvg_raid = False
+    daily_fvg_high = daily_fvg_low = 0.0
+    if direction == "long" and ms.fvg_bullish_1d:
+        fl, fh = ms.fvg_bullish_1d
+        if fl <= price <= fh:
+            daily_fvg_raid = True
+            daily_fvg_low  = fl
+            daily_fvg_high = fh
+    elif direction == "short" and ms.fvg_bearish_1d:
+        fl, fh = ms.fvg_bearish_1d
+        if fl <= price <= fh:
+            daily_fvg_raid = True
+            daily_fvg_low  = fl
+            daily_fvg_high = fh
+
+    result.daily_fvg_raid  = daily_fvg_raid
+    result.daily_fvg_high  = daily_fvg_high
+    result.daily_fvg_low   = daily_fvg_low
+
+    # ── 5. Итоговый сигнал и бонус ────────────────────────────────────────────
+    score = 0
+    parts = []
+
+    if result.fractal_4h_raided:
+        score += 8
+        parts.append(f"4H Fractal Raid {fractal_side.upper()} @ {fractal_level:.4f}")
+
+    if result.price_in_snr:
+        score += 8
+        parts.append(f"In 1H SNR Zone {snr_low:.4f}–{snr_high:.4f}")
+    elif snr_high > 0:
+        score += 3
+        parts.append(f"SNR formed {snr_low:.4f}–{snr_high:.4f}")
+
+    if result.price_in_fvg_15m:
+        score += 12
+        parts.append(f"In 15M FVG {fvg_15m_low:.4f}–{fvg_15m_high:.4f} 🎯")
+    elif fvg_15m_high > 0:
+        score += 5
+        parts.append(f"15M FVG nearby {fvg_15m_low:.4f}–{fvg_15m_high:.4f}")
+
+    if daily_fvg_raid:
+        score += 6
+        parts.append(f"Daily FVG manipulation {daily_fvg_low:.4f}–{daily_fvg_high:.4f}")
+
+    if score > 0:
+        result.has_signal    = True
+        result.direction     = direction
+        result.confidence    = min(score / 34.0, 1.0)
+        result.score_bonus   = score
+        result.description   = " | ".join(parts)
+
+    return result

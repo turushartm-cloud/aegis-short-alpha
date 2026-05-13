@@ -705,8 +705,8 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
 
         base_result = state.scorer.calculate_score(
             rsi_1h=md.rsi_1h or 50,
-            funding_current=md.funding_rate / 100,
-            funding_accumulated=md.funding_accumulated / 100,
+            funding_current=md.funding_rate,       # ✅ FIX: already in %, no /100
+            funding_accumulated=md.funding_accumulated,  # ✅ FIX: already in %
             long_ratio=md.long_short_ratio,
             oi_change_4d=md.oi_change_4d,
             price_change_4d=p4d,
@@ -772,6 +772,13 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             except Exception as _ms_e:
                 pass  # MS bonus не критичен
         
+
+        # ── CASCADE SIGNAL Bonus (4H Fractal Raid → 1H SNR → 15M FVG) ──────
+        _cas = getattr(md, "cascade_signal", None)
+        if _cas is not None and _cas.has_signal and _cas.direction == "long":
+            base_score = max(0, min(100, base_score + _cas.score_bonus))
+            if verbose:
+                print(f"{log_prefix} 🎯 [CASCADE LONG] +{_cas.score_bonus}: {_cas.description[:80]}")
         # 🆕 Консолидация фильтр — блокировка входов в середине диапазона
         if state.consolidation_detector and ohlcv_15m:
             cons = state.consolidation_detector.detect(ohlcv_15m, price)
@@ -1099,7 +1106,7 @@ async def scan_market():
                 continue
 
             # ✅ FIX: RR pre-check BEFORE Telegram — don't alert on signals we won't trade
-            _MIN_RR = float(os.getenv("MIN_RR_RATIO", "1.2"))  # ✅ FIX: was hardcoded 1.0 → ENV MIN_RR_RATIO=1.2
+            _MIN_RR = float(os.getenv("MIN_RR_RATIO", "1.0"))  # ✅ FIX: 1.2 было слишком жёстким → 1.0  # ✅ FIX: was hardcoded 1.0 → ENV MIN_RR_RATIO=1.2
             _tp_list = signal.get("take_profits", [])
             if _tp_list:
                 _tp1_raw = _tp_list[0]
@@ -1273,7 +1280,13 @@ async def _daily_report_task():
         if state.is_running and state.telegram:
             try:
                 # Redis-история — не обнуляется при рестарте (как /daily_rep)
-                await state.telegram.cmd_daily_report("", state.telegram.chat_id)
+                # ✅ FIX: cmd_daily_report на TelegramCommandHandler, не TelegramBot
+                if hasattr(state.telegram, "cmd_daily_report"):
+                    await state.telegram.cmd_daily_report("", state.telegram.chat_id)
+                elif state.telegram_handler and hasattr(state.telegram_handler, "cmd_daily_report"):
+                    await state.telegram_handler.cmd_daily_report("", state.telegram.chat_id)
+                else:
+                    await state.telegram._send_daily_report() if hasattr(state.telegram, "_send_daily_report") else None
                 print("✅ Daily report sent (Redis-based)")
             except Exception as e:
                 print(f"Daily report error: {e}")

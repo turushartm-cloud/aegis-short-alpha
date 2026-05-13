@@ -43,7 +43,8 @@ from datetime import datetime
 # ── Market Structure Analysis ─────────────────────────────────────────────
 try:
     from .market_structure import (
-        MarketStructureResult, compute_market_structure
+        MarketStructureResult, compute_market_structure,
+        CascadeSignal, detect_cascade_signal
     )
     _MS_AVAILABLE = True
 except ImportError:
@@ -136,6 +137,8 @@ class MarketData:
     # ── Market Structure (v4.0) ───────────────────────────────────────────────
     # Полный HTF анализ: PDH/PDL, Fib, POC, CRT, GAP, OB/FVG 4H+1D
     market_structure: Optional[object] = None  # MarketStructureResult
+    # Каскадный сигнал: 4H Fractal Raid → 1H SNR → 15M FVG
+    cascade_signal: Optional[object] = None    # CascadeSignal
 
     # ── 30m ATR (отдельный ТФ) ───────────────────────────────────────────────
     atr_30m_pct: float = 0.0
@@ -1439,6 +1442,23 @@ class BinanceFuturesClient:
                 except Exception as _e:
                     logger.debug(f"[MS] {symbol} error: {_e}")
 
+            # ── Cascade Signal (4H Fractal Raid → 1H SNR → 15M FVG) ─────────
+            cascade_result = None
+            if _MS_AVAILABLE and ms_result:
+                try:
+                    cascade_result = detect_cascade_signal(
+                        price=float(price),
+                        klines_15m=klines_15m,
+                        klines_1h=klines_1h,
+                        klines_4h=klines_4h,
+                        klines_1d=klines_1d,
+                        ms=ms_result,
+                    )
+                    if cascade_result and cascade_result.has_signal:
+                        logger.info(f"[CASCADE] {symbol}: {cascade_result.description} (bonus=+{cascade_result.score_bonus})")
+                except Exception as _ce:
+                    pass
+
             return MarketData(
                 symbol=symbol,
                 price=float(price),
@@ -1475,6 +1495,7 @@ class BinanceFuturesClient:
                 # ── Market Structure ─────────────────────────────────────────
                 market_structure=ms_result,
                 atr_30m_pct=ms_result.atr_30m_pct if ms_result else 0.0,
+                cascade_signal=cascade_result,
             )
         except Exception as e:
             print(f"Market data error {symbol}: {e}")

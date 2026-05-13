@@ -470,7 +470,7 @@ class BingXClient:
                 o_type = order.get("type", "")
                 o_side = order.get("positionSide", "")
                 o_id   = order.get("orderId", "")
-                if o_type in ("STOP_MARKET", "STOP") and o_side == position_side and o_id:
+                if o_type in ("STOP_MARKET", "STOP") and o_type != "TAKE_PROFIT_MARKET" and o_side == position_side and o_id:  # ✅ NEVER cancel TP orders
                     cancel_result = await self._make_request(
                         "DELETE", "/openApi/swap/v2/trade/order",
                         body={"symbol": symbol, "orderId": str(o_id)}

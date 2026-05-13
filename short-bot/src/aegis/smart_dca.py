@@ -175,7 +175,7 @@ class SmartDCAEngine:
             if sl_distance_pct > 0 and dist_pct >= sl_distance_pct * 0.90:
                 break
 
-            dca_price = entry_price * (1 + dist_pct / 100)
+            dca_price = entry_price * (1 - dist_pct / 100)  # ✅ FIX: SHORT DCA ниже entry (было +)
 
             # Размер на этом уровне (растёт с каждым)
             level_size_usd = initial_size_usd * (self.config.size_multiplier ** i)

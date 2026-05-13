@@ -299,14 +299,16 @@ class ShortScorer(BaseScorer):
     def calculate_funding_component(self, current_funding: float,
                                     accumulated_4d: float) -> ScoreComponent:
         score, reasons = 0, []
-        if current_funding >= 0.1:    score += 8;  reasons.append(f"Высокий фандинг {current_funding:.3f}%")
-        elif current_funding >= 0.05: score += 5;  reasons.append(f"Повышенный фандинг {current_funding:.3f}%")
-        elif current_funding > 0:     score += 3;  reasons.append(f"Позитивный фандинг {current_funding:.3f}%")
-        elif current_funding <= -0.05: score += 0; reasons.append(f"Отрицательный фандинг (плохо)")
-        else:                         score += 1;  reasons.append(f"Нейтральный фандинг {current_funding:.3f}%")
-        if accumulated_4d >= 0.5:     score += 7;  reasons.append(f"Высокий накопл. фандинг {accumulated_4d:.2f}%")
-        elif accumulated_4d >= 0.3:   score += 5;  reasons.append(f"Накопл. фандинг {accumulated_4d:.2f}%")
-        elif accumulated_4d >= 0.1:   score += 3
+        # ✅ FIX: пороги пересчитаны под реальный диапазон крипто-фандинга (-0.5%..+0.5%)
+        if current_funding >= 0.10:    score += 10; reasons.append(f"🔥 Экстремальный фандинг {current_funding:.3f}% — лонги перегреты")
+        elif current_funding >= 0.05:  score += 7;  reasons.append(f"Высокий фандинг {current_funding:.3f}%")
+        elif current_funding >= 0.02:  score += 5;  reasons.append(f"Повышенный фандинг {current_funding:.3f}%")
+        elif current_funding > 0:      score += 2;  reasons.append(f"Позитивный фандинг {current_funding:.3f}%")
+        elif current_funding <= -0.05: score += 0;  reasons.append(f"Отрицательный фандинг (шорты платят — плохо)")
+        else:                          score += 1;  reasons.append(f"Нейтральный фандинг {current_funding:.3f}%")
+        if accumulated_4d >= 0.30:     score += 7;  reasons.append(f"Высокий накопл. фандинг {accumulated_4d:.2f}%")
+        elif accumulated_4d >= 0.15:   score += 5;  reasons.append(f"Накопл. фандинг {accumulated_4d:.2f}%")
+        elif accumulated_4d >= 0.05:   score += 3
         elif accumulated_4d < 0:      score += 0;  reasons.append(f"Отрицательный накопл. {accumulated_4d:.2f}%")
         else:                         score += 1
         return ScoreComponent("Funding", min(score, 15), 15, " | ".join(reasons) or "Нейтральный фандинг", current_funding)
@@ -443,10 +445,12 @@ class LongScorer(BaseScorer):
     def calculate_funding_component(self, current_funding: float,
                                     accumulated_4d: float) -> ScoreComponent:
         score, reasons = 0, []
-        if current_funding <= -0.10:  score += 8;  reasons.append(f"Экстремальный -фандинг {current_funding:.3f}%")
-        elif current_funding <= -0.05: score += 5; reasons.append(f"Высокий -фандинг {current_funding:.3f}%")
-        elif current_funding < 0:     score += 3;  reasons.append(f"Отрицательный фандинг {current_funding:.3f}%")
-        elif current_funding >= 0.10: score += 0;  reasons.append(f"Высокий +фандинг {current_funding:.3f}% (плохо)")
+        # ✅ FIX: пересчитаны под реальный диапазон
+        if current_funding <= -0.10:   score += 10; reasons.append(f"🔥 Экстремальный -фандинг {current_funding:.3f}% — шорты перегреты")
+        elif current_funding <= -0.05: score += 7;  reasons.append(f"Высокий -фандинг {current_funding:.3f}%")
+        elif current_funding <= -0.02: score += 5;  reasons.append(f"Повышенный -фандинг {current_funding:.3f}%")
+        elif current_funding < 0:      score += 2;  reasons.append(f"Отрицательный фандинг {current_funding:.3f}%")
+        elif current_funding >= 0.10:  score += 0;  reasons.append(f"Высокий +фандинг {current_funding:.3f}% (плохо для лонга)")
         else:                         score += 1;  reasons.append(f"Нейтральный фандинг {current_funding:.3f}%")
         if accumulated_4d <= -0.5:    score += 7;  reasons.append(f"Глубокий накопл. -фандинг {accumulated_4d:.2f}%")
         elif accumulated_4d <= -0.3:  score += 5;  reasons.append(f"Накопл. -фандинг {accumulated_4d:.2f}%")
