@@ -636,6 +636,43 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         price_trend   = state.pattern_detector._get_price_trend(ohlcv_15m)
         patterns      = state.pattern_detector.detect_all(ohlcv_15m, hourly_deltas, md)
 
+        # ✅ v18: HTF паттерны на 4H и 1D (более значимые сигналы)
+        # Паттерн на 4H весит больше т.к. структурно значим
+        _ms_data = getattr(md, "market_structure", None)
+        _klines_4h = _ms_data and getattr(_ms_data, "has_4h", False)
+        _klines_1d = _ms_data and getattr(_ms_data, "has_1d", False)
+        if ohlcv_4h and len(ohlcv_4h) >= 20:
+            try:
+                _pat_4h = state.pattern_detector.detect_all(ohlcv_4h, None, md)
+                for _p in _pat_4h:
+                    # Увеличиваем вес HTF паттернов — они надёжнее
+                    _p.score_bonus = int(_p.score_bonus * 1.3)
+                    _p.name = f"{_p.name}_4H"
+                patterns = patterns + _pat_4h
+            except Exception:
+                pass
+        if _ms_data and _ms_data.has_1d:
+            # Получаем 1D candles из market_data напрямую через binance
+            try:
+                _kl_1d = await state.binance.get_klines(symbol, "1d", 20)
+                if _kl_1d and len(_kl_1d) >= 10:
+                    _pat_1d = state.pattern_detector.detect_all(_kl_1d, None, md)
+                    for _p in _pat_1d:
+                        _p.score_bonus = int(_p.score_bonus * 1.6)  # Daily = сильнейший сигнал
+                        _p.name = f"{_p.name}_1D"
+                    patterns = patterns + _pat_1d
+            except Exception:
+                pass
+        # Дедупликация: убираем паттерны одного типа если уже есть более HTF версия
+        _seen_base = set()
+        _dedup = []
+        for _p in sorted(patterns, key=lambda x: x.score_bonus, reverse=True):
+            _base = _p.name.replace("_4H","").replace("_1D","")
+            if _base not in _seen_base:
+                _seen_base.add(_base)
+                _dedup.append(_p)
+        patterns = _dedup[:8]  # топ-8 паттернов
+
         # ── PRE-SCORE LOG: все данные перед скорингом ─────────────────
         if verbose:
             top_trader_val = getattr(md, "top_trader_long_short_ratio", None)
@@ -1081,6 +1118,13 @@ async def scan_market():
     except Exception:
         pass
 
+    # ✅ OPT v18: Batch-загрузка ВСЕХ тикеров за 1 запрос (кэш 60s)
+    # Без этого: 341 запрос × /v5/market/tickers → +30s на скан
+    try:
+        await state.binance._fetch_ticker_batch()
+    except Exception as _tb_e:
+        pass  # fallback: одиночные запросы в get_complete_market_data
+
     # BTC correlation score adj
     btc_adj = 0
     if _btc_cache_1h is not None:
@@ -1088,6 +1132,37 @@ async def scan_market():
         elif _btc_cache_1h < -0.5: btc_adj = +1
         elif _btc_cache_1h > 2.0:  btc_adj = -3
         elif _btc_cache_1h > 0.5:  btc_adj = -1
+
+    # ── ADAPTIVE MIN_SCORE по Fear & Greed + BTC тренду ─────────────────────
+    # Динамически сдвигает порог Aegis Engine в диапазоне 62-78
+    # SHORT: жадность → лучше шортить (снижаем порог)
+    # LONG:  страх → лучше покупать (снижаем порог)
+    _base_aegis = Config.MIN_SCORE  # default из env (72)
+    _adaptive_score = _base_aegis
+    _fg = state.fear_greed_index
+    if _fg is not None:
+        if "short" == "short":
+            if _fg > 75:   _adaptive_score -= 5  # жадность = хорошо для шорта
+            elif _fg > 65: _adaptive_score -= 2
+            elif _fg < 25: _adaptive_score += 5  # страх = плохо для шорта
+            elif _fg < 35: _adaptive_score += 2
+        else:  # long
+            if _fg < 20:   _adaptive_score -= 5  # экстремальный страх = покупаем
+            elif _fg < 35: _adaptive_score -= 2
+            elif _fg > 75: _adaptive_score += 5  # жадность = осторожно с лонгами
+            elif _fg > 65: _adaptive_score += 2
+    if _btc_cache_1h is not None:
+        if "short" == "short":
+            if _btc_cache_1h > 3.0:  _adaptive_score += 3  # BTC растёт = шортить сложнее
+            elif _btc_cache_1h < -2.0: _adaptive_score -= 3  # BTC падает = шорты проще
+        else:  # long
+            if _btc_cache_1h < -3.0:  _adaptive_score += 3  # BTC падает = лонги опаснее
+            elif _btc_cache_1h > 2.0:  _adaptive_score -= 2  # BTC растёт = лонги легче
+    _adaptive_score = max(62, min(78, _adaptive_score))
+    if _adaptive_score != _base_aegis:
+        print(f"🎯 [ADAPTIVE] Aegis min_score: {_base_aegis} → {_adaptive_score} "
+              f"(F&G={_fg}, BTC_1h={_btc_cache_1h:.1f if _btc_cache_1h else 0:.1f}%)")
+    state._adaptive_min_score = _adaptive_score
 
     active_count  = await _count_real_positions()
     exchange_full = active_count >= Config.MAX_POSITIONS
@@ -1115,6 +1190,7 @@ async def scan_market():
 
     async def _prefetch(sym: str):
         async with _SCAN_SEM:
+            if hasattr(state, "_adaptive_min_score"): state.scorer.min_score = state._adaptive_min_score
             try:
                 if _is_fresh(state.redis.get_signals(Config.BOT_TYPE, sym, limit=1)):
                     return sym, _FRESH

@@ -108,6 +108,23 @@ class MarketStructureResult:
     has_daily_gap:   bool  = False  # Значимый дневной гэп (>0.3%)
     has_weekly_gap:  bool  = False  # Значимый недельный гэп (>0.5%)
 
+    # ── CME / Weekend GAP ─────────────────────────────────────────────────────
+    # Только для BTC и ETH. CME закрыт Пт 22:00 UTC → Вс 23:00 UTC
+    cme_gap_pct:     float = 0.0    # % разрыв CME (Friday close → Monday open)
+    cme_gap_low:     float = 0.0    # Нижняя граница CME gap
+    cme_gap_high:    float = 0.0    # Верхняя граница CME gap
+    has_cme_gap:     bool  = False  # Есть незакрытый CME gap (>0.5%)
+    cme_gap_dir:     str   = "none" # "up" | "down" | "none"
+
+    # ── Pivot Points (Floor Pivots) ───────────────────────────────────────────
+    pivot_pp:  float = 0.0   # PP  = (H + L + C) / 3
+    pivot_r1:  float = 0.0   # R1  = 2*PP - L
+    pivot_r2:  float = 0.0   # R2  = PP + (H - L)
+    pivot_r3:  float = 0.0   # R3  = H + 2*(PP - L)
+    pivot_s1:  float = 0.0   # S1  = 2*PP - H
+    pivot_s2:  float = 0.0   # S2  = PP - (H - L)
+    pivot_s3:  float = 0.0   # S3  = L - 2*(H - PP)
+
     # ── ATR на 30m ───────────────────────────────────────────────────────────
     atr_30m_pct: float = 0.0   # ATR(14) на 30m как % от цены
 
@@ -126,6 +143,36 @@ class MarketStructureResult:
     ob_bullish_1d: Optional[Tuple[float, float]] = None
     has_ob_4h:     bool = False
     has_ob_1d:     bool = False
+
+
+    # ── Pivot Points (Floor Pivots от Previous Day) ───────────────────────────
+    if r.pdh > 0 and r.pdl > 0 and r.pdc > 0:
+        H, L, C = r.pdh, r.pdl, r.pdc
+        pp = (H + L + C) / 3
+        r.pivot_pp = round(pp, 8)
+        r.pivot_r1 = round(2 * pp - L, 8)
+        r.pivot_r2 = round(pp + (H - L), 8)
+        r.pivot_r3 = round(H + 2 * (pp - L), 8)
+        r.pivot_s1 = round(2 * pp - H, 8)
+        r.pivot_s2 = round(pp - (H - L), 8)
+        r.pivot_s3 = round(L - 2 * (H - pp), 8)
+
+    # ── CME / Weekend GAP ────────────────────────────────────────────────────
+    if r.has_1d and len(klines_1d) >= 4:
+        for i in range(len(klines_1d) - 1, max(0, len(klines_1d) - 6), -1):
+            prev_c = klines_1d[i - 1]
+            curr_c = klines_1d[i]
+            if prev_c.close > 0:
+                gap_pct = (curr_c.open - prev_c.close) / prev_c.close * 100
+                if abs(gap_pct) >= 0.5:
+                    r.cme_gap_pct  = round(gap_pct, 3)
+                    r.has_cme_gap  = True
+                    r.cme_gap_dir  = "up" if gap_pct > 0 else "down"
+                    if gap_pct > 0:
+                        r.cme_gap_low, r.cme_gap_high = prev_c.close, curr_c.open
+                    else:
+                        r.cme_gap_low, r.cme_gap_high = curr_c.open, prev_c.close
+                    break
 
     # ── Ключевые уровни (для вывода) ─────────────────────────────────────────
     key_levels: List[Tuple[float, str]] = field(default_factory=list)
@@ -435,8 +482,13 @@ def compute_market_structure(
 
     # ── Ключевые уровни (для логов) ───────────────────────────────────────────
     levels: List[Tuple[float, str]] = []
-    if r.pdh:  levels.append((r.pdh, "PDH"))
-    if r.pdl:  levels.append((r.pdl, "PDL"))
+    if r.pdh:      levels.append((r.pdh, "PDH"))
+    if r.pdl:      levels.append((r.pdl, "PDL"))
+    if r.pivot_pp: levels.append((r.pivot_pp, "PP (Pivot)"))
+    if r.pivot_r1: levels.append((r.pivot_r1, "R1"))
+    if r.pivot_s1: levels.append((r.pivot_s1, "S1"))
+    if r.pivot_r2: levels.append((r.pivot_r2, "R2"))
+    if r.pivot_s2: levels.append((r.pivot_s2, "S2"))
     if r.pwh:  levels.append((r.pwh, "PWH"))
     if r.pwl:  levels.append((r.pwl, "PWL"))
     if r.poc_4h: levels.append((r.poc_4h, "POC 4H"))
@@ -504,6 +556,15 @@ def proximity_bonus(price: float, ms: MarketStructureResult, direction: str) -> 
         if _near(ms.pdl, 0.8):
             bonus += 7; reasons.append(f"Near PDL {ms.pdl:.4f} +7")
 
+        # Pivot Points — S1/S2 как поддержки для LONG
+        if _near(ms.pivot_s1, 0.5):
+            bonus += 5; reasons.append(f"Near Pivot S1={ms.pivot_s1:.4f} +5")
+        if _near(ms.pivot_pp, 0.4):
+            bonus += 3; reasons.append(f"At Pivot PP={ms.pivot_pp:.4f} +3")
+        # CME Gap fill potential
+        if ms.has_cme_gap and ms.cme_gap_dir == "up" and price > ms.cme_gap_low and price < ms.cme_gap_high:
+            bonus += 6; reasons.append(f"In CME Gap Up {ms.cme_gap_pct:+.2f}% +6")
+
         # Цена у Fib 0.618 (golden pocket) ±0.5%
         if ms.fib_4h and _near(ms.fib_4h.r_618, 0.5):
             bonus += 8; reasons.append("Near 4H Fib 0.618 (golden pocket) +8")
@@ -564,6 +625,15 @@ def proximity_bonus(price: float, ms: MarketStructureResult, direction: str) -> 
         if _near(ms.pdh, 0.8):
             bonus += 7; reasons.append(f"Near PDH {ms.pdh:.4f} +7")
 
+        # Pivot Points — R1/R2 как сопротивление для SHORT
+        if _near(ms.pivot_r1, 0.5):
+            bonus += 5; reasons.append(f"Near Pivot R1={ms.pivot_r1:.4f} +5")
+        if _near(ms.pivot_pp, 0.4):
+            bonus += 3; reasons.append(f"At Pivot PP={ms.pivot_pp:.4f} +3")
+        # CME Gap fill potential  
+        if ms.has_cme_gap and ms.cme_gap_dir == "down" and price > ms.cme_gap_low and price < ms.cme_gap_high:
+            bonus += 6; reasons.append(f"In CME Gap Down {ms.cme_gap_pct:+.2f}% +6")
+
         # Fib 0.618 = golden pocket для шорта от пампа
         if ms.fib_4h and _near(ms.fib_4h.r_618, 0.5):
             bonus += 8; reasons.append("4H Fib 0.618 SHORT golden pocket +8")
@@ -616,6 +686,10 @@ def format_ms_summary(ms: MarketStructureResult) -> str:
         parts.append(f"Fib0.618={ms.fib_4h.r_618:.4f} EQ={ms.fib_4h.r_50:.4f}")
     if ms.has_daily_gap:
         parts.append(f"DailyGap={ms.daily_gap_pct:+.2f}%")
+    if ms.has_cme_gap:
+        parts.append(f"CMEGap={ms.cme_gap_pct:+.2f}% ({ms.cme_gap_dir})")
+    if ms.pivot_pp:
+        parts.append(f"PP={ms.pivot_pp:.4f} R1={ms.pivot_r1:.4f} S1={ms.pivot_s1:.4f}")
     if ms.poc_4h:
         parts.append(f"POC4H={ms.poc_4h:.4f}")
     return " | ".join(parts) if parts else "no structure data"

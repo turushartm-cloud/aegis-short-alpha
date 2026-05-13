@@ -1,3 +1,4 @@
+from typing import Optional
 """
 Position Tracker v2.9 — Phase 2: Micro-Step Trailing Stop
 
@@ -77,10 +78,14 @@ class PositionTracker:
         
         self._running    = False
         self._scan_lock  = None   # asyncio.Lock — set on first use (event loop needed)
+        self._bingx_ws: Optional[object] = None  # BingXWSTracker для мгновенного SL/TP
 
     async def run(self):
         self._running = True
         print(f"📍 PositionTracker started (interval={self.CHECK_INTERVAL}s)")
+        # ✅ v18: BingX WS tracker for instant SL/TP detection
+        import asyncio as _aio
+        _aio.create_task(self._start_bingx_ws())
         while self._running:
             try:
                 await self._scan_all()
@@ -96,6 +101,45 @@ class PositionTracker:
         d_str = "LONG" if direction == "long" else "SHORT"
         print(f"[PT][{d_str}][{symbol}] {message}")
 
+    async def _start_bingx_ws(self):
+        """Запускает BingX WS tracker — мгновенное обнаружение SL/TP без 30s задержки."""
+        try:
+            import os
+            from utils.bingx_ws_tracker import BingXWSTracker
+            api_key    = os.getenv("BINGX_API_KEY", "")
+            api_secret = os.getenv("BINGX_API_SECRET", "")
+            if not api_key:
+                print("[BingX WS] No API key — WS disabled, polling only")
+                return
+
+            async def _on_sl(symbol, price):
+                print(f"[BingX WS] 🛑 INSTANT SL: {symbol} @ {price}")
+                for bt in ("short", "long"):
+                    for sig in self.redis.get_active_signals(bt):
+                        if sig.get("symbol","").upper() == symbol.upper():
+                            sig.update({"status":"sl_hit_ws","close_price":price})
+                            self.redis.save_position(bt, symbol, sig)
+
+            async def _on_tp(symbol, tp_num, price):
+                print(f"[BingX WS] ✅ INSTANT TP{tp_num}: {symbol} @ {price}")
+                for bt in ("short", "long"):
+                    for sig in self.redis.get_active_signals(bt):
+                        if sig.get("symbol","").upper() == symbol.upper():
+                            taken = sig.get("taken_tps", [])
+                            if tp_num not in taken:
+                                taken.append(tp_num)
+                                sig["taken_tps"] = taken
+                                self.redis.save_position(bt, symbol, sig)
+
+            self._bingx_ws = BingXWSTracker(api_key=api_key, api_secret=api_secret,
+                                             on_sl_hit=_on_sl, on_tp_hit=_on_tp)
+            await self._bingx_ws.start()
+            print("[BingX WS] ✅ Instant position tracker active")
+        except ImportError:
+            print("[BingX WS] websockets not installed — pip install websockets")
+        except Exception as e:
+            print(f"[BingX WS] startup error: {e}")
+
     async def _scan_all(self):
         try:
             # ✅ FIX v17: asyncio.Lock prevents duplicate PT processing
@@ -104,9 +148,9 @@ class PositionTracker:
                 self._scan_lock = _aio.Lock()
             if self._scan_lock.locked():
                 await asyncio.sleep(5)
-                return  # scan already running — skip this iteration
+                continue
             async with self._scan_lock:
-                pass  # acquired — proceed with scan below
+              pass  # acquired — proceed with scan below
 
             signals = self.redis.get_active_signals(self.bot_type)
         except Exception as e:
