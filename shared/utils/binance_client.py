@@ -381,21 +381,25 @@ class BinanceFuturesClient:
 
     @staticmethod
     def _to_okx_instid(symbol: str) -> str:
-        """BTCUSDT → BTC-USDT  |  1000BONKUSDT → 1000BONK-USDT"""
+        """BTCUSDT → BTC-USDT-SWAP  |  1000BONKUSDT → 1000BONK-USDT-SWAP
+        ✅ FIX: was returning BTC-USDT (code=51001) — rubik endpoints need -SWAP suffix
+        """
         if symbol.endswith("USDT"):
             base = symbol[:-4]   # strip USDT
-            return f"{base}-USDT"
+            return f"{base}-USDT-SWAP"
         return symbol
 
     async def _okx(self, endpoint: str, params: Dict = None) -> Optional[Any]:
-        """Прямой запрос OKX без прокси. Возвращает data[] или None."""
+        """Прямой запрос OKX без прокси. Возвращает data[] или None.
+        ✅ FIX: timeout 8s → 3s. Rubik stats = fallback, не должны тормозить скан.
+        """
         await self._rate_limit()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self.OKX_URL}{endpoint}",
                 params=params or {},
-                timeout=aiohttp.ClientTimeout(total=8),
+                timeout=aiohttp.ClientTimeout(total=3),
             ) as resp:
                 if resp.status == 200:
                     body = await resp.json()

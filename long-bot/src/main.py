@@ -156,8 +156,11 @@ class Config:
     TRAIL_ACTIVATION  = float(os.getenv("LONG_TRAIL_ACTIVATION", "0.015"))  # +1.5%
 
     # BTC correlation thresholds (Long = позитивная корреляция)
-    BTC_BLOCK_THRESHOLD  = float(os.getenv("BTC_BLOCK_THRESHOLD", "-1.5"))  # ✅ FIX: было -3.0 (слишком мягко) → -1.5
-    BTC_4H_BLOCK         = float(os.getenv("BTC_4H_BLOCK_THRESHOLD", "-2.0"))  # Блок LONG если BTC 4H < -2%
+    # BTC фильтр: блокируем LONG только при РЕЗКОМ падении BTC.
+    # НЕ блокируем при небольших движениях — альты могут идти независимо.
+    # Рекомендация: 1H -3.0%, 4H -3.0% — только экстремальные движения.
+    BTC_BLOCK_THRESHOLD  = float(os.getenv("BTC_BLOCK_THRESHOLD", "-3.0"))  # 1H: блок при -3%/h (резкий дамп)
+    BTC_4H_BLOCK         = float(os.getenv("BTC_4H_BLOCK_THRESHOLD", "-3.0"))  # 4H: блок при -3% за 4ч
 
 
 # ============================================================================
