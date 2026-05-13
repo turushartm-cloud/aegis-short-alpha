@@ -678,6 +678,9 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 _dedup.append(_p)
         patterns = _dedup[:8]  # топ-8 паттернов
 
+        # MS-данные доступны вне блока verbose для сохранения в signal
+        _ms_log = getattr(md, "market_structure", None)
+
         # ── PRE-SCORE LOG: все данные перед скорингом ─────────────────
         if verbose:
             top_trader_val = getattr(md, "top_trader_long_short_ratio", None)
@@ -697,7 +700,6 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 f"hourly_deltas({len(hourly_deltas)})={[round(d,0) for d in hourly_deltas[-5:]]}"
             )
             # MS summary
-            _ms_log = getattr(md, "market_structure", None)
             if _ms_log:
                 from utils.market_structure import format_ms_summary
                 print(f"{log_prefix} 🏗 [MS STRUCTURE] {format_ms_summary(_ms_log)}")
@@ -877,6 +879,19 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             print(f"{log_prefix} 📊 [REALTIME] base={rt_result.base_score:.1f} bonus={rt_result.bonus:+.1f} final={rt_result.final_score:.1f}")
         
         base_score = rt_result.final_score
+
+        # ── PatternML: исторический win-rate бонус/штраф ─────────────────────
+        if state.redis and patterns:
+            try:
+                from core.pattern_ml_scorer import get_pattern_ml_scorer
+                _ml = get_pattern_ml_scorer(state.redis, "short")
+                _ml_bonus, _ml_reason = _ml.get_bonus([p.name for p in patterns])
+                if _ml_bonus != 0:
+                    base_score = max(0, min(100, base_score + _ml_bonus))
+                    if verbose:
+                        print(f"{log_prefix} 🤖 [PatternML] {_ml_reason}")
+            except Exception as _ml_e:
+                pass  # ML scorer не критичен
 
         # ── SL / TP предварительные ──
         stop_loss   = price * (1 + Config.SL_BUFFER / 100)
@@ -1064,6 +1079,19 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             "timestamp":        datetime.utcnow().isoformat(),
             "status":           "active",
             "taken_tps":        [],
+            # MS-данные для дашборда (pivot, PDH/PDL, CME gap)
+            "ms_pivot_pp":  round(getattr(_ms_log, "pivot_pp",  0) or 0, 8) if _ms_log else 0,
+            "ms_pivot_r1":  round(getattr(_ms_log, "pivot_r1",  0) or 0, 8) if _ms_log else 0,
+            "ms_pivot_s1":  round(getattr(_ms_log, "pivot_s1",  0) or 0, 8) if _ms_log else 0,
+            "ms_pdh":       round(getattr(_ms_log, "pdh",        0) or 0, 8) if _ms_log else 0,
+            "ms_pdl":       round(getattr(_ms_log, "pdl",        0) or 0, 8) if _ms_log else 0,
+            "ms_cme_gap_pct":   round(getattr(_ms_log, "cme_gap_pct",  0) or 0, 3) if _ms_log else 0,
+            "ms_cme_gap_dir":   getattr(_ms_log, "cme_gap_dir", "none") if _ms_log else "none",
+            "ms_cme_gap_low":   round(getattr(_ms_log, "cme_gap_low",  0) or 0, 8) if _ms_log else 0,
+            "ms_cme_gap_high":  round(getattr(_ms_log, "cme_gap_high", 0) or 0, 8) if _ms_log else 0,
+            "ms_has_cme_gap":   bool(getattr(_ms_log, "has_cme_gap",   False)) if _ms_log else False,
+            "ms_zone_4h":       getattr(_ms_log, "zone_4h", "neutral") if _ms_log else "neutral",
+            "ms_htf_structure": getattr(_ms_log, "htf_structure", "unknown") if _ms_log else "unknown",
         }
         
         print(f"🟢 [SIGNAL] {symbol}: score={final_score:.1f} grade={signal['grade']} — сигнал создан и отправлен в Telegram!")
