@@ -465,22 +465,44 @@ def compute_market_structure(
         r.pivot_s2 = round(pp - (H - L), 8)
         r.pivot_s3 = round(L - 2 * (H - pp), 8)
 
-    # ── CME / Session GAP ────────────────────────────────────────────
+    # ── CME / Session GAP (только Пт→Вс UTC, т.е. после Friday close) ───────
+    # CME закрыт: пятница ~22:00 UTC → воскресенье ~23:00 UTC
+    # Гэп образуется между закрытием пятницы и открытием понедельника.
+    # Поэтому ищем только свечу с timestamp понедельника (weekday==0) или
+    # пятница→субботу/воскресенье (weekday 4→5→6).
     if r.has_1d and len(klines_1d) >= 4:
+        import datetime as _dt_module
         for _i in range(len(klines_1d) - 1, max(0, len(klines_1d) - 8), -1):
             _pc = klines_1d[_i - 1]
             _cc = klines_1d[_i]
-            if _pc.close > 0:
-                _gap = (_cc.open - _pc.close) / _pc.close * 100
-                if abs(_gap) >= 0.3:
-                    r.cme_gap_pct = round(_gap, 3)
-                    r.has_cme_gap = True
-                    r.cme_gap_dir = "up" if _gap > 0 else "down"
-                    if _gap > 0:
-                        r.cme_gap_low, r.cme_gap_high = _pc.close, _cc.open
+            if _pc.close <= 0:
+                continue
+            _gap = (_cc.open - _pc.close) / _pc.close * 100
+            if abs(_gap) < 0.3:
+                continue
+            # Weekday filter: гэп считается CME только если одна из сторон — Пт/Сб/Вс
+            _is_cme = True  # дефолт: принимаем (для не-дневных или нет timestamp)
+            _ts = getattr(_cc, "open_time", None) or getattr(_cc, "timestamp", None)
+            if _ts:
+                try:
+                    if isinstance(_ts, (int, float)):
+                        _dow = _dt_module.datetime.utcfromtimestamp(_ts / 1000 if _ts > 1e10 else _ts).weekday()
                     else:
-                        r.cme_gap_low, r.cme_gap_high = _cc.open, _pc.close
-                    break
+                        _dow = _dt_module.datetime.fromisoformat(str(_ts)).weekday()
+                    # 0=Пн, 4=Пт, 5=Сб, 6=Вс
+                    # CME gap: открытие Пн (0) после выходных, или сама Пт/Сб/Вс
+                    _is_cme = _dow in (0, 4, 5, 6)
+                except Exception:
+                    pass
+            if _is_cme:
+                r.cme_gap_pct = round(_gap, 3)
+                r.has_cme_gap = True
+                r.cme_gap_dir = "up" if _gap > 0 else "down"
+                if _gap > 0:
+                    r.cme_gap_low, r.cme_gap_high = _pc.close, _cc.open
+                else:
+                    r.cme_gap_low, r.cme_gap_high = _cc.open, _pc.close
+                break
 
     levels: List[Tuple[float, str]] = []
     if r.pdh:      levels.append((r.pdh, "PDH"))

@@ -88,12 +88,20 @@ class BingXWSTracker:
                 async with session.post(url, params=params, headers=headers,
                                         timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     data = await resp.json()
-                    if data.get("code") == 0:
-                        key = data.get("listenKey") or data.get("data", {}).get("listenKey")
+                    # BingX DEMO возвращает {listenKey: ...} без поля code
+                    # BingX REAL возвращает {code: 0, data: {listenKey: ...}}
+                    key = (
+                        data.get("listenKey")
+                        or data.get("data", {}).get("listenKey")
+                        or (data.get("code") == 0 and data.get("data", {}).get("listenKey"))
+                    ) or None
+                    if key:
                         logger.info(f"[BingX WS] Got listenKey: {str(key)[:16]}...")
                         return key
+                    if data.get("code") not in (0, None, "0"):
+                        logger.warning(f"[BingX WS] listenKey API error: code={data.get('code')} msg={data.get('msg', data)}")
                     else:
-                        logger.warning(f"[BingX WS] listenKey error: {data}")
+                        logger.warning(f"[BingX WS] listenKey missing in response: {data}")
         except Exception as e:
             logger.warning(f"[BingX WS] listenKey fetch failed: {e}")
         return None
