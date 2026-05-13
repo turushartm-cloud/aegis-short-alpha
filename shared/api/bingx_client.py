@@ -141,8 +141,6 @@ class BingXClient:
         offset = getattr(self, "_time_offset", 0)
         return int(time.time() * 1000) + offset
 
-    _bingx_rate_sem = None  # Semaphore(10) — инициализируется при первом вызове
-
     async def _make_request(self, method, endpoint, params=None, body=None, signed=True):
         try:
             session  = await self._get_session()
@@ -346,12 +344,6 @@ class BingXClient:
           5. takeProfit: {"type":"TAKE_PROFIT_MARKET", "stopPrice": float, ...}
           6. Все значения — числа, не строки (fix float64 mismatch)
         """
-        # ✅ v19: BingX rate limit — макс 10 одновременных запросов
-        import asyncio as _rl; _cls = type(self)
-        if not hasattr(_cls, "_bingx_rate_sem") or _cls._bingx_rate_sem is None:
-            _cls._bingx_rate_sem = _rl.Semaphore(10)
-        async with _cls._bingx_rate_sem:
-          pass  # rate limit acquired
         if not await self.is_symbol_active(symbol):
             self.last_error = f"{symbol} offline on BingX"
             print(f"⏭ SKIP — {self.last_error}")

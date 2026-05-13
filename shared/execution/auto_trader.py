@@ -139,7 +139,6 @@ class AutoTrader:
                 signal_score = signal["score"],
                 smc_data     = signal.get("smc"),
                 tg_msg_id    = signal.get("tg_msg_id"),
-                ms_context   = {k: signal[k] for k in signal if k.startswith("ms_")},
             )
         except KeyError as e:
             print(f"❌ [AutoTrader] {symbol}: missing field {e}")
@@ -151,7 +150,7 @@ class AutoTrader:
 
     async def open_position(self, symbol, direction, entry_price, stop_loss,
                             take_profits, signal_score, smc_data=None,
-                            tg_msg_id=None, ms_context=None) -> Optional[Dict]:
+                            tg_msg_id=None) -> Optional[Dict]:
         mode = "DEMO" if self.config.demo_mode else "REAL"
         pfx  = f"[AT][{symbol}][{direction.upper()}]"
 
@@ -381,7 +380,6 @@ class AutoTrader:
             "taken_tps":    [],
             "be_done":      False,
             "be2_done":     False,
-            **(ms_context or {}),  # MS-данные: pivot_pp, pdh, pdl, cme_gap, zone_4h, htf_structure
         }
         bot_type = "long" if direction == "long" else "short"
         self.redis.save_signal(bot_type, symbol, position_data)

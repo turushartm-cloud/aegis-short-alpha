@@ -34,18 +34,12 @@ class UpstashRedisClient:
         _pos_days = int(os.getenv("POSITION_TTL_DAYS", "1"))
         self.TTL = {
             "signal": 86400,
-            "position": _pos_days * 86400,
-            "position_unconfirmed": 1800,
+            "position": _pos_days * 86400,        # дефолт 1 день (было 7)
+            "position_unconfirmed": 1800,          # 30 мин — не менять
             "state": 3600,
             "stats": 2592000,
             "cache": 300
         }
-        # ✅ OPT v19: In-memory cache — снижает кол-во Redis reads с 22k до ~4k/час
-        # Кэш активных сигналов (8s TTL): position_tracker вызывает каждые 30-60s,
-        # несколько параллельных вызовов за одну итерацию → одно реальное обращение к Redis
-        import time as _time_module
-        self._signals_cache: dict = {}   # {bot_type: (timestamp, signals_list)}
-        self._signals_cache_ttl = 8.0    # секунд
     
     def health_check(self) -> bool:
         """Проверка соединения с Redis"""
@@ -94,89 +88,22 @@ class UpstashRedisClient:
             print(f"Error getting signals: {e}")
             return []
     
-    def get_active_signals(self, bot_type: str, use_cache: bool = True) -> List[Dict]:
-        """
-        ✅ OPT v19: Возвращает активные сигналы/позиции.
-        
-        Оптимизации:
-        1. In-memory cache (8s) — избегает повторных Redis запросов
-        2. Индекс {bot}:active_index (Redis SET) — O(1) lookup вместо KEYS scan O(N)
-        3. Pipeline для batch-чтения нескольких позиций
-        """
-        import time as _t
-        now = _t.time()
-        # 1. In-memory cache check
-        if use_cache and bot_type in self._signals_cache:
-            ts, cached = self._signals_cache[bot_type]
-            if now - ts < self._signals_cache_ttl:
-                return cached
-
-        active_signals = []
+    def get_active_signals(self, bot_type: str) -> List[Dict]:
         try:
-            # 2. Попытка использовать активный индекс (если создан)
-            index_key = f"{bot_type}:active_index"
-            active_symbols = self.client.smembers(index_key)
-
-            if active_symbols:
-                # Pipeline: читаем все позиции за 1 round-trip
-                pipe = self.client.pipeline()
-                sym_list = [s.decode() if isinstance(s, bytes) else s for s in active_symbols]
-                for sym in sym_list:
-                    pipe.get(f"{bot_type}:positions:{sym}")
-                results = pipe.execute()
-                for sym, raw in zip(sym_list, results):
-                    if raw:
-                        try:
-                            sig = json.loads(raw)
-                            if sig.get("status") in ("active", None):
-                                sig["symbol"] = sym
-                                active_signals.append(sig)
-                        except Exception:
-                            pass
-            else:
-                # Fallback: KEYS scan (медленный, но надёжный)
-                pattern = f"{bot_type}:positions:*"
-                keys = self.client.keys(pattern)
-                if keys:
-                    pipe = self.client.pipeline()
-                    for k in keys:
-                        pipe.get(k)
-                    vals = pipe.execute()
-                    for k, raw in zip(keys, vals):
-                        if raw:
-                            try:
-                                sig = json.loads(raw)
-                                sym = k.decode().split(":")[-1] if isinstance(k, bytes) else k.split(":")[-1]
-                                sig["symbol"] = sym
-                                active_signals.append(sig)
-                            except Exception:
-                                pass
-
+            pattern = f"{bot_type}:signals:*"
+            keys = self.client.keys(pattern)
+            active_signals = []
+            for key in keys:
+                signals = self.client.lrange(key, 0, 0)
+                if signals:
+                    signal = json.loads(signals[0])
+                    if signal.get("status") == "active":
+                        signal["symbol"] = key.split(":")[-1]
+                        active_signals.append(signal)
+            return active_signals
         except Exception as e:
             print(f"Error getting active signals: {e}")
-
-        # Update cache
-        self._signals_cache[bot_type] = (now, active_signals)
-        return active_signals
-
-    def _index_add(self, bot_type: str, symbol: str) -> None:
-        """Добавляет символ в активный индекс при открытии позиции."""
-        try:
-            self.client.sadd(f"{bot_type}:active_index", symbol)
-            self.client.expire(f"{bot_type}:active_index", 7 * 86400)
-        except Exception:
-            pass
-
-    def _index_remove(self, bot_type: str, symbol: str) -> None:
-        """Убирает символ из активного индекса при закрытии позиции."""
-        try:
-            self.client.srem(f"{bot_type}:active_index", symbol)
-        except Exception:
-            pass
-
-    def _index_invalidate_cache(self, bot_type: str) -> None:
-        """Сбрасывает in-memory кэш при записи позиции."""
-        self._signals_cache.pop(bot_type, None)
+            return []
     
     def update_signal_status(self, bot_type: str, symbol: str,
                              timestamp: str, new_status: str) -> bool:
@@ -203,8 +130,6 @@ class UpstashRedisClient:
         try:
             key = f"{bot_type}:positions:{symbol}"
             self.client.setex(key, self.TTL["position"], json.dumps(position_data))
-            self._index_add(bot_type, symbol)       # ✅ OPT: индекс активных
-            self._index_invalidate_cache(bot_type)  # ✅ OPT: сброс in-mem кэша
             return True
         except Exception as e:
             print(f"Error saving position: {e}")
@@ -592,8 +517,6 @@ class UpstashRedisClient:
             key = f"{bot_type}:positions:{symbol}"
             self.client.delete(key)
             print(f"[Redis] 🗑️ positions key deleted: {key}")
-            self._index_remove(bot_type, symbol)      # ✅ OPT
-            self._index_invalidate_cache(bot_type)  # ✅ OPT
             return True
         except Exception as e:
             print(f"[Redis] remove_position error: {e}")
