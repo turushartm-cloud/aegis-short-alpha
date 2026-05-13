@@ -1207,6 +1207,8 @@ class TelegramCommandHandler:
         except Exception as e:
             await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
             print(f"[close_zombies] critical: {e}")
+
+    async def cmd_clearpos(self, args, reply_chat_id: str):
         try:
             if not self.redis:
                 await self._reply(reply_chat_id, "❌ Redis недоступен")
