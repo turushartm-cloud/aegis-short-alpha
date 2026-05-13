@@ -134,6 +134,47 @@ class BingXWSTracker:
 
     # ── Message handler ───────────────────────────────────────────────────────
 
+    async def _keepalive_loop(self, ws) -> None:
+        """
+        ✅ FIX v3.0: BingX требует ping frame каждые 20-30с иначе закрывает соединение.
+        Стандартный websockets ping_interval не работает с BingX (нет pong).
+        Решение: вручную шлём Ping frame + раз в 25 мин обновляем listenKey.
+        """
+        ping_count = 0
+        while self._running:
+            await asyncio.sleep(20)
+            try:
+                await ws.ping()
+                ping_count += 1
+                # Каждые 25 мин (75 пингов × 20с) обновляем listenKey
+                if ping_count % 75 == 0:
+                    await self._do_refresh_listen_key()
+            except Exception:
+                break  # WS закрылся — выходим, внешний цикл переподключится
+
+    async def _do_refresh_listen_key(self) -> None:
+        """Разовое обновление listenKey."""
+        if not self._listen_key:
+            return
+        try:
+            import aiohttp
+            ts = int(time.time() * 1000)
+            params = {"listenKey": self._listen_key, "timestamp": ts}
+            params["signature"] = self._sign(params)
+            url = f"{BINGX_REST}/openApi/user/auth/userDataStream"
+            async with aiohttp.ClientSession() as s:
+                async with s.put(url, params=params,
+                                 headers={"X-BX-APIKEY": self.api_key},
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    data = await r.json()
+                    if data.get("code") == 0:
+                        logger.info("[BingX WS] listenKey refreshed")
+                    else:
+                        logger.warning(f"[BingX WS] listenKey refresh failed: {data}")
+                        self._listen_key = await self._get_listen_key()
+        except Exception as e:
+            logger.warning(f"[BingX WS] refresh error: {e}")
+
     async def _handle_message(self, raw: str) -> None:
         """Обрабатывает входящее WS сообщение от BingX."""
         try:
@@ -201,23 +242,33 @@ class BingXWSTracker:
                 logger.info(f"[BingX WS] Connecting to {BINGX_WS_URL}...")
                 async with websockets.connect(
                     ws_url,
-                    ping_interval=20,
-                    ping_timeout=10,
+                    ping_interval=None,   # ✅ FIX: BingX не поддерживает стандартный WS ping
                     close_timeout=5,
                 ) as ws:
                     backoff = 1
                     logger.info("[BingX WS] ✅ Connected — listening for order updates")
-                    async for raw_msg in ws:
-                        if not self._running:
-                            break
-                        if isinstance(raw_msg, bytes):
-                            # BingX может присылать gzip
-                            try:
-                                import gzip
-                                raw_msg = gzip.decompress(raw_msg).decode("utf-8")
-                            except Exception:
-                                raw_msg = raw_msg.decode("utf-8", errors="ignore")
-                        await self._handle_message(raw_msg)
+                    # ✅ FIX: keepalive задача — каждые 25 мин обновляем listenKey + шлём ping
+                    keepalive_task = asyncio.create_task(
+                        self._keepalive_loop(ws)
+                    )
+                    try:
+                        async for raw_msg in ws:
+                            if not self._running:
+                                break
+                            if isinstance(raw_msg, bytes):
+                                # BingX может присылать gzip
+                                try:
+                                    import gzip
+                                    raw_msg = gzip.decompress(raw_msg).decode("utf-8")
+                                except Exception:
+                                    raw_msg = raw_msg.decode("utf-8", errors="ignore")
+                            await self._handle_message(raw_msg)
+                    finally:
+                        keepalive_task.cancel()
+                        try:
+                            await keepalive_task
+                        except asyncio.CancelledError:
+                            pass
 
             except Exception as e:
                 if not self._running:

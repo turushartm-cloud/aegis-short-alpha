@@ -141,7 +141,7 @@ class PositionTracker:
             print(f"[BingX WS] startup error: {e}")
 
     async def _scan_all(self):
-        # ✅ FIX v17: prevent duplicate concurrent scans
+        # ✅ FIX v3.0: guard covers ENTIRE processing, not just signal fetch
         if getattr(self, '_scan_running', False):
             return
         self._scan_running = True
@@ -151,9 +151,9 @@ class PositionTracker:
             print(f"[PositionTracker] redis error: {e}")
             self._scan_running = False
             return
-        finally:
-            self._scan_running = False
+
         if not signals:
+            self._scan_running = False
             return
 
         # ✅ v4.0: Zombie cleanup — раз в 10 итераций чистим «мёртвые» Redis позиции
@@ -174,6 +174,7 @@ class PositionTracker:
 
         # ✅ VIRTUAL: Отслеживаем TG-only сигналы для статистики
         await self._scan_virtual()
+        self._scan_running = False
 
     async def _scan_virtual(self):
         """
@@ -826,6 +827,13 @@ class PositionTracker:
                 old_sl = signal.get("stop_loss", 0)
                 signal["stop_loss"] = new_sl_micro
                 signal["trailing_active"] = True
+                # ✅ FIX v3.0: Ставим be_done=True здесь, чтобы _check_trailing()
+                # не сделал второй _move_sl() в том же цикле → дубли Telegram
+                if tp_num == 1:
+                    signal["be_done"] = True
+                elif tp_num == 2:
+                    signal["be_done"] = True
+                    signal["be2_done"] = True
                 self._save(symbol, signal)
                 
                 # Перемещаем SL на бирже
@@ -1207,8 +1215,17 @@ class PositionTracker:
         await self._send(text)
 
     def _save(self, symbol: str, signal: Dict):
+        """
+        ✅ FIX v3.0: Обновляем ОБА ключа Redis:
+        - positions:{symbol}  ← читает get_active_signals() (главный ключ!)
+        - signals:{symbol}    ← история сигналов (для дашборда)
+        Было: только signals → get_active_signals возвращал старые данные без taken_tps
+        → TP1 срабатывал повторно на каждом цикле скана
+        """
         try:
-            self.redis.save_signal(self.bot_type, symbol, signal)
+            signal["confirmed"] = True  # ← 7-day TTL, не 30min
+            self.redis.save_position(self.bot_type, symbol, signal)   # ← MAIN FIX
+            self.redis.save_signal(self.bot_type, symbol, signal)     # ← history
         except Exception as e:
             print(f"[PT] redis save: {e}")
 

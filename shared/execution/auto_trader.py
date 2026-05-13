@@ -93,7 +93,8 @@ class AutoTrader:
         self.win_count    = 0
         self.loss_count   = 0
         self.last_reset   = datetime.utcnow().date()
-        self._last_open_ts = 0.0
+        # ✅ FIX v3.0: per-symbol cooldown (было глобальное — блокировало все символы на 30с)
+        self._last_open_ts: dict = {}  # symbol → timestamp
 
         mode = "DEMO" if self.config.demo_mode else "REAL"
         print(f"🤖 AutoTrader v3.0 initialized ({mode})")
@@ -155,8 +156,8 @@ class AutoTrader:
         mode = "DEMO" if self.config.demo_mode else "REAL"
         pfx  = f"[AT][{symbol}][{direction.upper()}]"
 
-        # ── 0. Cooldown ───────────────────────────────────────────────────────
-        since_last = time.time() - self._last_open_ts
+        # ── 0. Cooldown (per-symbol) ─────────────────────────────────────────
+        since_last = time.time() - self._last_open_ts.get(symbol, 0)
         if since_last < self.config.open_cooldown_sec:
             print(f"{pfx} ⏸ SKIP — cooldown ({since_last:.0f}s)")
             return None
@@ -314,7 +315,7 @@ class AutoTrader:
 
         # ── 9. Main order с RETRY при 101209 ─────────────────────────────────
         print(f"{pfx} 📤 Sending order to BingX [{mode}]...")
-        self._last_open_ts = time.time()
+        self._last_open_ts[symbol] = time.time()
 
         order = await self.bingx.place_market_order(
             symbol=bingx_symbol, side=side, position_side=position_side,
@@ -337,7 +338,7 @@ class AutoTrader:
                     notional = retry_size * entry_price
 
         if order is None:
-            self._last_open_ts = 0.0
+            self._last_open_ts.pop(symbol, None)
             err  = self.bingx.last_error or "unknown"
             code = self.bingx.last_error_code
             print(f"{pfx} ❌ ORDER FAILED — code={code} | {err}")
