@@ -399,7 +399,7 @@ class BinanceFuturesClient:
             async with session.get(
                 f"{self.OKX_URL}{endpoint}",
                 params=params or {},
-                timeout=aiohttp.ClientTimeout(total=3),
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 200:
                     body = await resp.json()
