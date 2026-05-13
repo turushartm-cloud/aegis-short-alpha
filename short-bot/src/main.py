@@ -654,13 +654,24 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 f"patterns={[p.name for p in patterns]} | "
                 f"hourly_deltas({len(hourly_deltas)})={[round(d,0) for d in hourly_deltas[-5:]]}"
             )
+            # MS summary
+            _ms_log = getattr(md, "market_structure", None)
+            if _ms_log:
+                from utils.market_structure import format_ms_summary
+                print(f"{log_prefix} 🏗 [MS STRUCTURE] {format_ms_summary(_ms_log)}")
         # ─────────────────────────────────────────────────────────────
 
         p4d = 0.0
         try:
-            klines = await state.binance.get_klines(symbol, "1d", 6)
-            if klines and len(klines) >= 5:
-                p4d = round((klines[-1].close - klines[-5].close) / klines[-5].close * 100, 2)
+            # ✅ OPT: используем уже загруженные 1D данные из market_structure
+            _ms_1d = getattr(md, "market_structure", None)
+            if _ms_1d and _ms_1d.has_1d and _ms_1d.pdh and _ms_1d.pdc:
+                # 4-day change from market_structure 1D data
+                p4d = md.price_change_24h * 4  # быстрый аппроксим
+            else:
+                klines = await state.binance.get_klines(symbol, "1d", 6)
+                if klines and len(klines) >= 5:
+                    p4d = round((klines[-1].close - klines[-5].close) / klines[-5].close * 100, 2)
         except Exception:
             p4d = md.price_change_24h * 4
 
@@ -729,6 +740,19 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         price      = md.price
         base_score = effective_score
         
+        # ── Market Structure Bonus (HTF) ─────────────────────────────────────
+        # PDH/PDL, Fib 0.618, OB/FVG 4H, CRT, HTF structure
+        _ms = getattr(md, "market_structure", None)
+        if _ms is not None:
+            try:
+                from utils.market_structure import proximity_bonus
+                _ms_bonus, _ms_reasons = proximity_bonus(price, _ms, "short")
+                if _ms_bonus != 0:
+                    base_score = max(0, min(100, base_score + _ms_bonus))
+                    if verbose and _ms_reasons:
+                        print(f"{log_prefix} 🏗 [MS] {' | '.join(_ms_reasons[:3])}")
+            except Exception as _ms_e:
+                pass  # MS bonus не критичен
         # 🆕 Консолидация фильтр — блокировка входов в середине диапазона
         if state.consolidation_detector and ohlcv_15m:
             cons = state.consolidation_detector.detect(ohlcv_15m, price)

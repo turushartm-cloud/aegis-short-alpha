@@ -758,6 +758,20 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         price      = md.price
         base_score = effective_score
         
+        # ── Market Structure Bonus (HTF) ─────────────────────────────────────
+        # PDH/PDL, Fib 0.618, OB/FVG 4H, CRT, HTF structure
+        _ms = getattr(md, "market_structure", None)
+        if _ms is not None:
+            try:
+                from utils.market_structure import proximity_bonus
+                _ms_bonus, _ms_reasons = proximity_bonus(price, _ms, "long")
+                if _ms_bonus != 0:
+                    base_score = max(0, min(100, base_score + _ms_bonus))
+                    if verbose and _ms_reasons:
+                        print(f"{log_prefix} 🏗 [MS] {' | '.join(_ms_reasons[:3])}")
+            except Exception as _ms_e:
+                pass  # MS bonus не критичен
+        
         # 🆕 Консолидация фильтр — блокировка входов в середине диапазона
         if state.consolidation_detector and ohlcv_15m:
             cons = state.consolidation_detector.detect(ohlcv_15m, price)

@@ -39,6 +39,16 @@ import logging
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from datetime import datetime
+
+# ── Market Structure Analysis ─────────────────────────────────────────────
+try:
+    from .market_structure import (
+        MarketStructureResult, compute_market_structure
+    )
+    _MS_AVAILABLE = True
+except ImportError:
+    _MS_AVAILABLE = False
+    MarketStructureResult = None
 import time
 import statistics
 
@@ -122,6 +132,13 @@ class MarketData:
     # Top trader L/S ratio - "умные деньги" позиции
     # >1.5 = топы в лонгах, <0.8 = топы в шортах
     top_trader_long_short_ratio: Optional[float] = None
+
+    # ── Market Structure (v4.0) ───────────────────────────────────────────────
+    # Полный HTF анализ: PDH/PDL, Fib, POC, CRT, GAP, OB/FVG 4H+1D
+    market_structure: Optional[object] = None  # MarketStructureResult
+
+    # ── 30m ATR (отдельный ТФ) ───────────────────────────────────────────────
+    atr_30m_pct: float = 0.0
 
 
 @dataclass
@@ -1316,11 +1333,14 @@ class BinanceFuturesClient:
                 self.get_long_short_ratio(symbol),
                 self.get_24h_ticker(symbol),
                 self.get_klines(symbol, "1h", 100),
-                self.get_klines(symbol, "15m", 50),   # ← NEW: 15м данные
+                self.get_klines(symbol, "15m", 75),   # 75 свечей = 18.75ч
+                self.get_klines(symbol, "30m", 75),   # ✅ NEW: 30m + ATR
+                self.get_klines(symbol, "4h",  50),   # ✅ NEW: 4H HTF structure
+                self.get_klines(symbol, "1d",  35),   # ✅ NEW: 35 дней PDH/PDL/ATH
                 return_exceptions=True
             )
 
-            price, funding, oi, ratio, ticker, klines_1h, klines_15m = results
+            price, funding, oi, ratio, ticker, klines_1h, klines_15m,                 klines_30m, klines_4h, klines_1d = results
 
             if isinstance(price, Exception) or not price:
                 self._mark_symbol_fail(symbol)
@@ -1336,6 +1356,9 @@ class BinanceFuturesClient:
             ratio     = None if isinstance(ratio,     Exception) else ratio
             ticker    = None if isinstance(ticker,    Exception) else ticker
             klines_15m = [] if isinstance(klines_15m, Exception) else (klines_15m or [])
+            klines_30m = [] if isinstance(klines_30m, Exception) else (klines_30m or [])
+            klines_4h  = [] if isinstance(klines_4h,  Exception) else (klines_4h  or [])
+            klines_1d  = [] if isinstance(klines_1d,  Exception) else (klines_1d  or [])
 
             rsi = self._calculate_rsi([c.close for c in klines_1h])
 
@@ -1398,6 +1421,24 @@ class BinanceFuturesClient:
             # ── Обработка oi_short ────────────────────────────────────────────
             oi_st = {} if isinstance(oi_short, Exception) or not oi_short else oi_short
 
+            # ── Market Structure Analysis (HTF) ──────────────────────────────
+            ms_result = None
+            if _MS_AVAILABLE:
+                try:
+                    ms_result = compute_market_structure(
+                        price=float(price),
+                        klines_30m=klines_30m,
+                        klines_1h=klines_1h,
+                        klines_4h=klines_4h,
+                        klines_1d=klines_1d,
+                    )
+                    if ms_result.key_levels:
+                        nearest = ms_result.key_levels[:3]
+                        lvl_str = ", ".join(f"{lbl}={px:.4f}" for px, lbl in nearest)
+                        logger.debug(f"[MS] {symbol}: {lvl_str} | {ms_result.htf_structure} | {ms_result.zone_4h}")
+                except Exception as _e:
+                    logger.debug(f"[MS] {symbol} error: {_e}")
+
             return MarketData(
                 symbol=symbol,
                 price=float(price),
@@ -1431,6 +1472,9 @@ class BinanceFuturesClient:
                 oi_change_30m=oi_st.get("oi_30m", 0.0),
                 oi_change_1h=oi_st.get("oi_1h", 0.0),
                 oi_change_4h=oi_st.get("oi_4h", 0.0),
+                # ── Market Structure ─────────────────────────────────────────
+                market_structure=ms_result,
+                atr_30m_pct=ms_result.atr_30m_pct if ms_result else 0.0,
             )
         except Exception as e:
             print(f"Market data error {symbol}: {e}")
