@@ -423,6 +423,8 @@ class TelegramCommandHandler:
         "/watchlist", "/risk",
         # DCA и Performance
         "/dca", "/perf",
+        # Zombie cleanup
+        "/close_zombies",
     }
 
     def __init__(self,
@@ -547,6 +549,8 @@ class TelegramCommandHandler:
                 # DCA и Performance
                 "/dca":          self.cmd_dca,
                 "/perf":         self.cmd_perf,
+                # Zombie cleanup
+                "/close_zombies": self.cmd_close_zombies,
             }
             await handlers[cmd](args, reply_chat_id)
             return True
@@ -654,6 +658,7 @@ class TelegramCommandHandler:
             "🗑 /clearpos — Сбросить застрявшие позиции\n"
             "🧹 /cleanup — Удалить зависшие сделки\n"
             "🧼 /clean — Полная очистка\n"
+            "🧟 /close_zombies — Закрыть позиции без SL\n"
             "🔄 /reset_stats — Сбросить статистику\n"
             "🗑 /flushdb yes — Очистить БД Redis\n"
             "🛑 /emergency_stop — Экстренный стоп\n"
@@ -1101,7 +1106,107 @@ class TelegramCommandHandler:
         except Exception as e:
             await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
 
-    async def cmd_clearpos(self, args, reply_chat_id: str):
+    async def cmd_close_zombies(self, args, reply_chat_id: str):
+        """
+        /close_zombies — Закрыть позиции без SL/TP (зомби).
+        Зомби = позиция в Redis с stop_loss == 0 или отсутствует.
+        Закрывает на бирже через AutoTrader + удаляет из Redis.
+        """
+        await self._reply(reply_chat_id, "🧟 Ищу зомби-позиции (без SL)...")
+        try:
+            if not self.redis:
+                await self._reply(reply_chat_id, "❌ Redis недоступен")
+                return
+
+            positions = self.redis.get_all_positions(self.bot_type)
+            if not positions:
+                await self._reply(reply_chat_id, "✅ Нет позиций в Redis")
+                return
+
+            zombies = []
+            for pos in positions:
+                sl = pos.get("stop_loss") or pos.get("sl") or 0
+                try:
+                    sl_f = float(sl)
+                except Exception:
+                    sl_f = 0.0
+                if sl_f == 0.0:
+                    zombies.append(pos)
+
+            if not zombies:
+                await self._reply(reply_chat_id,
+                    f"✅ Зомби не найдено. Всего позиций в Redis: {len(positions)}")
+                return
+
+            symbols_list = ", ".join(p.get("symbol", "?") for p in zombies)
+            await self._reply(reply_chat_id,
+                f"🧟 Найдено зомби: {len(zombies)}\n"
+                f"<code>{symbols_list}</code>\n\n"
+                f"⏳ Закрываю на бирже...")
+
+            closed_exchange = 0
+            closed_redis    = 0
+            failed          = []
+
+            for pos in zombies:
+                symbol    = pos.get("symbol", "")
+                direction = pos.get("direction", "long")
+                pos_side  = "LONG" if direction == "long" else "SHORT"
+
+                # 1) Закрыть на бирже (если AutoTrader доступен)
+                exchange_ok = False
+                if self.state and self.state.auto_trader:
+                    try:
+                        exchange_ok = await self.state.auto_trader.close_position(
+                            symbol, pos_side
+                        )
+                        if exchange_ok:
+                            closed_exchange += 1
+                    except Exception as e:
+                        print(f"[close_zombies] exchange close {symbol}: {e}")
+                        failed.append(f"{symbol}(ex:{e})")
+
+                # 2) Удалить из Redis в любом случае (zombie cleanup)
+                try:
+                    self.redis.remove_position(self.bot_type, symbol)
+                    # Также помечаем active signal как closed
+                    import json as _json
+                    keys = self.redis.client.keys(f"{self.bot_type}:signals:{symbol}:*")
+                    keys += self.redis.client.keys(f"{self.bot_type}:active:{symbol}")
+                    for k in keys:
+                        try:
+                            raw = self.redis.client.get(k)
+                            if raw:
+                                sig = _json.loads(raw)
+                                sig["status"] = "closed"
+                                sig["close_reason"] = "zombie_cleanup"
+                                sig["closed_at"] = datetime.utcnow().isoformat()
+                                self.redis.client.set(k, _json.dumps(sig), ex=86400)
+                        except Exception:
+                            pass
+                    closed_redis += 1
+                except Exception as e:
+                    print(f"[close_zombies] redis remove {symbol}: {e}")
+
+            report_lines = [
+                "🧹 <b>Zombie Cleanup завершён</b>",
+                "",
+                f"🧟 Найдено зомби:       {len(zombies)}",
+                f"✅ Закрыто на бирже:    {closed_exchange}",
+                f"🗑 Удалено из Redis:    {closed_redis}",
+            ]
+            if failed:
+                report_lines.append(f"❌ Ошибки: {', '.join(failed[:5])}")
+            if closed_exchange < len(zombies):
+                report_lines.append(
+                    "\n⚠️ Не все позиции удалось закрыть на бирже.\n"
+                    "Используй /closeall для принудительного закрытия всего."
+                )
+            await self._reply(reply_chat_id, "\n".join(report_lines))
+
+        except Exception as e:
+            await self._reply(reply_chat_id, f"❌ Ошибка: {e}")
+            print(f"[close_zombies] critical: {e}")
         try:
             if not self.redis:
                 await self._reply(reply_chat_id, "❌ Redis недоступен")
