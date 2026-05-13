@@ -793,7 +793,7 @@ class BinanceFuturesClient:
         inst_id = self._to_okx_instid(symbol)
         data = await self._okx(
             "/api/v5/rubik/stat/contracts/open-interest-volume",
-            {"instId": inst_id.replace("-USDT", "-USDT"), "period": okx_period, "limit": okx_limit}
+            {"instId": inst_id, "period": okx_period, "limit": okx_limit}  # instId = BTC-USDT-SWAP
         )
         if data and len(data) >= 2:
             # data format: [[ts, oi, vol], ...]  newest first → reverse
