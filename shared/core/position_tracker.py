@@ -41,7 +41,7 @@ class PositionTracker:
       6. Записывает P&L в stats:daily:{date}
     """
 
-    CHECK_INTERVAL = 30
+    CHECK_INTERVAL = 60  # ✅ OPT v19: 30→60s (BingX WS handles instant SL/TP)
 
     # ── Трейлинг (активируется ПОСЛЕ BE, не сразу) ───────────────────────────
     TRAIL_DISTANCE  = 0.008   # 0.8% ниже текущей цены (для LONG)

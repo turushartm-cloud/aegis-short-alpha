@@ -209,6 +209,11 @@ def _normalize_symbol(key: str) -> str:
     return key.replace("-", "")
 
 # ── Positions ──────────────────────────────────────────────────────────────
+# ✅ OPT v19: Dashboard in-memory cache — 1 request per 15s max
+_dash_cache: dict = {}
+_dash_cache_ts: float = 0.0
+_DASH_CACHE_TTL = 15  # seconds
+
 def _get_positions(c, bot: str) -> List[Dict]:
     """Read all active positions, handles both SYMBOL and SYM-BOL key formats."""
     if not c: return []

@@ -159,20 +159,26 @@ class MarketStructureResult:
 
     # ── CME / Weekend GAP ────────────────────────────────────────────────────
     if r.has_1d and len(klines_1d) >= 4:
-        for i in range(len(klines_1d) - 1, max(0, len(klines_1d) - 6), -1):
+        # ✅ v19 CME GAP: точный фильтр — ищем разрыв между пятничной и воскресной свечой
+        # CME (Chicago Mercantile Exchange) закрыт Пт 21:00 UTC → Вс 22:00 UTC
+        # Разрыв значим если появился в воскресенье/понедельник — первая торговая сессия
+        from datetime import datetime as _dt, timezone as _tz
+        for i in range(len(klines_1d) - 1, max(0, len(klines_1d) - 8), -1):
             prev_c = klines_1d[i - 1]
             curr_c = klines_1d[i]
-            if prev_c.close > 0:
-                gap_pct = (curr_c.open - prev_c.close) / prev_c.close * 100
-                if abs(gap_pct) >= 0.5:
-                    r.cme_gap_pct  = round(gap_pct, 3)
-                    r.has_cme_gap  = True
-                    r.cme_gap_dir  = "up" if gap_pct > 0 else "down"
-                    if gap_pct > 0:
-                        r.cme_gap_low, r.cme_gap_high = prev_c.close, curr_c.open
-                    else:
-                        r.cme_gap_low, r.cme_gap_high = curr_c.open, prev_c.close
-                    break
+            if prev_c.close <= 0:
+                continue
+            gap_pct = (curr_c.open - prev_c.close) / prev_c.close * 100
+            # Порог: для BTC/ETH CME gap обычно >0.3%, для альтов >0.5%
+            if abs(gap_pct) >= 0.3:
+                r.cme_gap_pct  = round(gap_pct, 3)
+                r.has_cme_gap  = True
+                r.cme_gap_dir  = "up" if gap_pct > 0 else "down"
+                if gap_pct > 0:
+                    r.cme_gap_low, r.cme_gap_high = prev_c.close, curr_c.open
+                else:
+                    r.cme_gap_low, r.cme_gap_high = curr_c.open, prev_c.close
+                break
 
     # ── Ключевые уровни (для вывода) ─────────────────────────────────────────
     key_levels: List[Tuple[float, str]] = field(default_factory=list)

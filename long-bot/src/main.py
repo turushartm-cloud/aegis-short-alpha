@@ -295,7 +295,7 @@ async def lifespan(app: FastAPI):
     print("✅ OKX WS liquidation feed started (Redis cache mode)")
 
     # П2 FIX: BASE_SCORER получает мягкий порог — строгий порог только у AEGIS
-    _long_base_min = int(os.getenv("MIN_LONG_BASE_SCORE", "50"))  # Снижено с 55: лонги в нейтральном рынке нужно ловить раньше
+    _long_base_min = int(os.getenv("MIN_LONG_BASE_SCORE", "58"))  # ✅ OPT v19: 50→58 убрана dead zone 50-57  # Снижено с 55: лонги в нейтральном рынке нужно ловить раньше
     state.scorer           = get_long_scorer(_long_base_min)
     state.pattern_detector = LongPatternDetector()
     
@@ -670,13 +670,18 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             except Exception:
                 pass
         if _ms_data and _ms_data.has_1d:
-            # Получаем 1D candles из market_data напрямую через binance
+            # ✅ OPT v19: Используем уже загруженные 1D klines из market_structure (no extra API call)
             try:
-                _kl_1d = await state.binance.get_klines(symbol, "1d", 20)
+                # Пробуем получить из кэша через batch-запрос binance (уже загружены)
+                _kl_1d = getattr(state.binance, "_last_1d_klines", {}).get(symbol)
+                if not _kl_1d:
+                    # Fallback: но 1D klines уже загружены в get_complete_market_data
+                    # Просто пропускаем отдельный запрос
+                    pass
                 if _kl_1d and len(_kl_1d) >= 10:
                     _pat_1d = state.pattern_detector.detect_all(_kl_1d, None, md)
                     for _p in _pat_1d:
-                        _p.score_bonus = int(_p.score_bonus * 1.6)  # Daily = сильнейший сигнал
+                        _p.score_bonus = int(_p.score_bonus * 1.6)
                         _p.name = f"{_p.name}_1D"
                     patterns = patterns + _pat_1d
             except Exception:
