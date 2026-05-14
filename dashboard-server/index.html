@@ -251,7 +251,7 @@ function renderPositions(){
   const tb=$('posBody'),d=D.realPos;
   if(!d||!d.length){tb.innerHTML='<tr><td colspan="10" class="empty">No real positions</td></tr>';return;}
   tb.innerHTML=d.map(p=>{
-    const dir=p.direction||'long',t1=tp1(p.take_profits),uP=p.unrealized_pct;
+    const dir=p.direction||'long',t1=tp1(p.take_profits),uP=p.unrealized_pnl??p.unrealized_pct;
     return`<tr><td style="font-weight:600">${p.symbol}</td><td><span class="tag ${p.bot}">${(p.bot||'?').toUpperCase()}</span></td><td><span class="tag ${dir}">${dir.toUpperCase()}</span></td><td class="mono">${fP(p.entry_price)}</td><td class="mono" style="color:var(--red)">${fP(p.stop_loss)}</td><td class="mono" style="color:var(--green)">${t1?fP(t1):'—'}</td><td class="${sCls(p.signal_score||0)}">${p.signal_score||p.score||'—'}</td><td>${beStr(p.be_done,p.be2_done)}</td><td>${uP!=null?`<span class="pnl ${uP>=0?'pos':'neg'}">${pStr(uP)}</span>`:'—'}</td><td style="color:var(--text2)">${fAge(p.opened_at||p.timestamp)}</td></tr>`;
   }).join('');
 }
