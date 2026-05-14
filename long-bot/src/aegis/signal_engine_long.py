@@ -84,8 +84,8 @@ class AegisLongSignalEngine:
         SignalStrengthLong.WATCH:    50.0,
     }
 
-    MIN_COMPONENTS_VALID = 1
-    MIN_COMPONENT_SCORE  = 15.0
+    MIN_COMPONENTS_VALID = 2
+    MIN_COMPONENT_SCORE  = 20.0
 
     def __init__(
         self,
@@ -351,20 +351,30 @@ class AegisLongSignalEngine:
 
         final_score = total_weighted
 
+        # HARD GATE: z_volume — главный индикатор mean-reversion LONG.
+        # Без признаков капитуляции (dump exhaustion) LONG невозможен по стратегии.
+        z_vol = components.get("z_volume")
+        if z_vol and z_vol.raw_score < 20:
+            logger.info(
+                f"[AEGIS REJECT LONG] {symbol}: z_volume={z_vol.raw_score:.0f} < 20 "
+                f"— нет признаков dump exhaustion, сигнал отклонён"
+            )
+            return None
+
         if base_score > 0:
             if base_score >= 70:
-                # Сильный базовый скор — Aegis добавляет бонус поверх
-                final_score = base_score + min(final_score * 0.15, 15)
+                # Aegis — качественный фильтр: реальное взвешенное среднее 45/55
+                # Предотвращает inflate до 100% при слабом Aegis
+                final_score = total_weighted * 0.45 + base_score * 0.55
             elif base_score >= 58:
-                # Хороший базовый скор — base_score является главным драйвером (70%)
-                # Aegis служит фильтром качества, а не вето
+                # Хороший базовый скор — base_score главный драйвер (70%), Aegis фильтр
                 final_score = total_weighted * 0.30 + base_score * 0.70
             else:
                 # Слабый базовый скор — Aegis должен компенсировать (50/50)
                 final_score = total_weighted * 0.50 + base_score * 0.50
 
-        # Порог: используем min_score из конфига, но не ниже 45 для не-mean-reversion рынков
-        effective_min = min(self.min_score, 47.0)
+        # Порог: используем min_score из конфига напрямую
+        effective_min = self.min_score
 
         if final_score < effective_min or valid_components < self.MIN_COMPONENTS_VALID:
             cs_str = " | ".join(f"{k}={v.raw_score:.0f}" for k, v in components.items())
