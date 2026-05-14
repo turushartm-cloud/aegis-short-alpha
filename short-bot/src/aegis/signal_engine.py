@@ -84,7 +84,7 @@ class AegisSignalEngine:
         SignalStrength.WATCH:    50.0,
     }
 
-    MIN_COMPONENTS_VALID = 1
+    MIN_COMPONENTS_VALID = 2
     MIN_COMPONENT_SCORE  = 30.0
 
     def __init__(
@@ -343,10 +343,21 @@ class AegisSignalEngine:
 
         final_score = total_weighted  # веса = 1.0, raw_score 0-100
 
+        # HARD GATE: z_volume — главный индикатор SHORT (памп/перекупленность).
+        # Без признаков pump exhaustion SHORT невозможен по стратегии.
+        z_vol = components.get("z_volume")
+        if z_vol and z_vol.raw_score < 15:
+            logger.info(
+                f"[AEGIS REJECT] {symbol}: z_volume={z_vol.raw_score:.0f} < 15 "
+                f"— нет признаков pump exhaustion, сигнал отклонён"
+            )
+            return None
+
         if base_score > 0:
             if base_score >= 70:
-                # Сильный базовый скор — Aegis добавляет бонус поверх
-                final_score = base_score + min(final_score * 0.15, 15)
+                # Aegis — качественный фильтр: реальное взвешенное среднее 45/55
+                # Предотвращает inflate до 100% при слабом Aegis
+                final_score = total_weighted * 0.45 + base_score * 0.55
             elif base_score >= 58:
                 # Хороший базовый скор — base_score главный (70%), Aegis — фильтр
                 final_score = total_weighted * 0.30 + base_score * 0.70
