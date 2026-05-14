@@ -111,6 +111,11 @@ class PositionTracker:
             if not api_key:
                 print("[BingX WS] No API key — WS disabled, polling only")
                 return
+            # BingX DEMO не поддерживает userDataStream — WS работает только в REAL режиме
+            demo_mode = os.getenv("BINGX_DEMO_MODE", "true").strip().lower() not in ("false", "0", "no", "real")
+            if demo_mode:
+                print("[BingX WS] DEMO mode — WS tracker отключён (paper trading не поддерживает userDataStream)")
+                return
 
             async def _on_sl(symbol, price):
                 print(f"[BingX WS] 🛑 INSTANT SL: {symbol} @ {price}")
@@ -132,9 +137,9 @@ class PositionTracker:
                                 self.redis.save_position(bt, symbol, sig)
 
             self._bingx_ws = BingXWSTracker(api_key=api_key, api_secret=api_secret,
-                                             on_sl_hit=_on_sl, on_tp_hit=_on_tp)
+                                             on_sl_hit=_on_sl, on_tp_hit=_on_tp, demo=False)
             await self._bingx_ws.start()
-            print("[BingX WS] ✅ Instant position tracker active")
+            print("[BingX WS] ✅ Instant position tracker active (REAL mode)")
         except ImportError:
             print("[BingX WS] websockets not installed — pip install websockets")
         except Exception as e:

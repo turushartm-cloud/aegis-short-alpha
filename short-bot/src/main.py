@@ -1195,7 +1195,7 @@ async def scan_market():
     _adaptive_score = max(62, min(78, _adaptive_score))
     if _adaptive_score != _base_aegis:
         print(f"🎯 [ADAPTIVE] Aegis min_score: {_base_aegis} → {_adaptive_score} "
-              f"(F&G={_fg}, BTC_1h={_btc_cache_1h:.1f if _btc_cache_1h else 0:.1f}%)")
+              f"(F&G={_fg}, BTC_1h={(_btc_cache_1h or 0):.1f}%)")
     state._adaptive_min_score = _adaptive_score
 
     active_count  = await _count_real_positions()
