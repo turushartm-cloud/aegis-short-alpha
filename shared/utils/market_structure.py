@@ -937,31 +937,31 @@ def detect_cascade_signal(
     parts = []
 
     if result.fractal_4h_raided:
-        score += 8
+        score += 4
         parts.append(f"4H Fractal Raid {fractal_side.upper()} @ {fractal_level:.4f}")
 
     if result.price_in_snr:
-        score += 8
+        score += 4
         parts.append(f"In 1H SNR Zone {snr_low:.4f}–{snr_high:.4f}")
     elif snr_high > 0:
-        score += 3
+        score += 2
         parts.append(f"SNR formed {snr_low:.4f}–{snr_high:.4f}")
 
     if result.price_in_fvg_15m:
-        score += 12
+        score += 6
         parts.append(f"In 15M FVG {fvg_15m_low:.4f}–{fvg_15m_high:.4f} 🎯")
     elif fvg_15m_high > 0:
-        score += 5
+        score += 2
         parts.append(f"15M FVG nearby {fvg_15m_low:.4f}–{fvg_15m_high:.4f}")
 
     if daily_fvg_raid:
-        score += 6
+        score += 2
         parts.append(f"Daily FVG manipulation {daily_fvg_low:.4f}–{daily_fvg_high:.4f}")
 
     if score > 0:
         result.has_signal    = True
         result.direction     = direction
-        result.confidence    = min(score / 34.0, 1.0)
+        result.confidence    = min(score / 16.0, 1.0)
         result.score_bonus   = score
         result.description   = " | ".join(parts)
 

@@ -770,13 +770,13 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         fg_reason = ""
         if fg is not None:
             if fg < 20:
-                fg_modifier, fg_reason = 6,  f"🧠 [F&G] {fg} Экстремальный страх → LONG +6"
+                fg_modifier, fg_reason = 2,  f"🧠 [F&G] {fg} Экстремальный страх → LONG +2"
             elif fg < 35:
-                fg_modifier, fg_reason = 3,  f"🧠 [F&G] {fg} Страх → LONG +3"
+                fg_modifier, fg_reason = 1,  f"🧠 [F&G] {fg} Страх → LONG +1"
             elif fg > 80:
-                fg_modifier, fg_reason = -5, f"🧠 [F&G] {fg} Жадность → LONG -5"
+                fg_modifier, fg_reason = -6, f"🧠 [F&G] {fg} Жадность → LONG -6"
             elif fg > 65:
-                fg_modifier, fg_reason = -2, f"🧠 [F&G] {fg} Умеренная жадность → LONG -2"
+                fg_modifier, fg_reason = -3, f"🧠 [F&G] {fg} Умеренная жадность → LONG -3"
 
         raw_score       = base_result.total_score
         effective_score = max(min(raw_score + fg_modifier + _mtf_bonus, 100), 0)
