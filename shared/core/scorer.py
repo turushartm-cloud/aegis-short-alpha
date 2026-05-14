@@ -278,7 +278,7 @@ class BaseScorer:
 
 class ShortScorer(BaseScorer):
 
-    def __init__(self, min_score: int = 54):  # Было 65 — откалибровано под fallback
+    def __init__(self, min_score: int = 58):  # ✅ FIX: 54→58 убрана dead zone 50-57
         super().__init__(min_score, Direction.SHORT)
 
     def calculate_rsi_component(self, rsi_1h: float) -> ScoreComponent:
@@ -592,11 +592,10 @@ class LongScorer(BaseScorer):
 _short_scorer = None
 _long_scorer  = None
 
-def get_short_scorer(min_score: int = 54) -> ShortScorer:
+def get_short_scorer(min_score: int = 58) -> ShortScorer:
     """
     Синглтон ShortScorer.
-    Дефолт 54 совпадает с ShortScorer.__init__ — чтобы не было
-    расхождения при вызове без явного min_score.
+    Дефолт 58 совпадает с ShortScorer.__init__ — dead zone 50-57 убрана.
     """
     global _short_scorer
     if _short_scorer is None:

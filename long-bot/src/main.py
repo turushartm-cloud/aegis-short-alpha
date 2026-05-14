@@ -861,6 +861,19 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         
         base_score = rt_result.final_score
 
+        # ── PatternML: исторический win-rate бонус/штраф ─────────────────────
+        if state.redis and patterns:
+            try:
+                from core.pattern_ml_scorer import get_pattern_ml_scorer
+                _ml = get_pattern_ml_scorer(state.redis, "long")
+                _ml_bonus, _ml_reason = _ml.get_bonus([p.name for p in patterns])
+                if _ml_bonus != 0:
+                    base_score = max(0, min(100, base_score + _ml_bonus))
+                    if verbose:
+                        print(f"{log_prefix} 🤖 [PatternML] {_ml_reason}")
+            except Exception as _ml_e:
+                pass  # ML scorer не критичен
+
         # ── SL НИЖЕ входа (Long) ──────────────────────────────────────
         stop_loss   = price * (1 - Config.SL_BUFFER / 100)
         entry_price = price
@@ -1028,10 +1041,23 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             "timestamp":        datetime.utcnow().isoformat(),
             "status":           "active",
             "taken_tps":        [],
+            # MS-данные для дашборда (pivot, PDH/PDL, CME gap)
+            "ms_pivot_pp":  round(getattr(_ms_data, "pivot_pp",  0) or 0, 8) if _ms_data else 0,
+            "ms_pivot_r1":  round(getattr(_ms_data, "pivot_r1",  0) or 0, 8) if _ms_data else 0,
+            "ms_pivot_s1":  round(getattr(_ms_data, "pivot_s1",  0) or 0, 8) if _ms_data else 0,
+            "ms_pdh":       round(getattr(_ms_data, "pdh",        0) or 0, 8) if _ms_data else 0,
+            "ms_pdl":       round(getattr(_ms_data, "pdl",        0) or 0, 8) if _ms_data else 0,
+            "ms_cme_gap_pct":   round(getattr(_ms_data, "cme_gap_pct",  0) or 0, 3) if _ms_data else 0,
+            "ms_cme_gap_dir":   getattr(_ms_data, "cme_gap_dir", "none") if _ms_data else "none",
+            "ms_cme_gap_low":   round(getattr(_ms_data, "cme_gap_low",  0) or 0, 8) if _ms_data else 0,
+            "ms_cme_gap_high":  round(getattr(_ms_data, "cme_gap_high", 0) or 0, 8) if _ms_data else 0,
+            "ms_has_cme_gap":   bool(getattr(_ms_data, "has_cme_gap",   False)) if _ms_data else False,
+            "ms_zone_4h":       getattr(_ms_data, "zone_4h", "neutral") if _ms_data else "neutral",
+            "ms_htf_structure": getattr(_ms_data, "htf_structure", "unknown") if _ms_data else "unknown",
         }
-        
+
         if verbose:
-            print(f"🟢 [SIGNAL-LONG] {symbol}: score={final_score:.1f} grade={signal['grade']} — сигнал создан и отправлен в Telegram!")
+            print(f"🟢 [SIGNAL-LONG] {symbol}: score={final_score:.1f} — сигнал создан!")
         return signal
 
     except Exception as e:

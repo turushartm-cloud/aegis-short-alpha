@@ -288,6 +288,12 @@ class BingXWSTracker:
         if not self.api_key or not self.api_secret:
             logger.warning("[BingX WS] No API credentials — WS tracker disabled")
             return
+        # ✅ FIX: BingX DEMO/paper trading не поддерживает userDataStream WS.
+        # listenKey endpoint работает только для реальных аккаунтов.
+        # В DEMO режиме WS tracker не нужен — ордера отслеживаются через polling.
+        if self.demo:
+            logger.info("[BingX WS] DEMO mode — WS tracker отключён (paper trading не поддерживает userDataStream)")
+            return
         self._running = True
         self._ws_task      = asyncio.create_task(self._ws_loop())
         self._refresh_task = asyncio.create_task(self._refresh_listen_key_loop())
