@@ -33,6 +33,8 @@ services:
         sync: false
       - key: SHORT_TELEGRAM_CHAT_ID
         sync: false
+      - key: SHORT_TELEGRAM_TOPIC_ID
+        sync: false  # Telegram топик для short-bot (опционально)
       - key: RENDER_EXTERNAL_URL
         fromService:
           name: aegis-short-alpha
@@ -40,23 +42,126 @@ services:
           property: url
       # Config
       - key: MAX_PAIRS
-        value: "500"
+        value: "200"
       - key: MAX_WATCHLIST
-        value: "500"
+        value: "150"             # FIX: 1000→150 — Render Starter 512MB, OOM при >200
       - key: MIN_SHORT_SCORE
         value: "65"          # AEGIS final threshold
       - key: MIN_SHORT_BASE_SCORE
-        value: "50"          # BASE_SCORER порог (мягче — AEGIS потом доуточняет)
+        value: "55"          # BASE_SCORER порог (мягче — AEGIS потом доуточняет)
+      - key: AEGIS_SHORT_MIN_SCORE
+        value: "65"          # AEGIS engine внутренний порог (аналог AEGIS_LONG_MIN_SCORE=65)
+      - key: Z_VOLUME_GATE_MIN_SHORT
+        value: "10"           # BUG-2 FIX: было хардкод 15, выравниваем с LONG=8
       - key: SCAN_INTERVAL
-        value: "120"          # П8: было 180 → 120s
-      - key: MAX_POSITIONS
-        value: "15"
+        value: "180"          # П8: было 180 → 120s
+      - key: SCAN_CONCURRENCY
+        value: "8"            # FIX: 20→8 — Render Starter OOM fix (512MB limit)
+      - key: MAX_SHORT_POSITIONS
+        value: "15"           # Лимит SHORT позиций (независимо от LONG-бота)
       - key: SHORT_SL_BUFFER
         value: "2.5"
       - key: SHORT_LEVERAGE
         value: "5-30"
+      - key: SHORT_TRAIL_ACTIVATION
+        value: "0.010"         # 1.0% в прибыли — активация trailing stop
+      - key: ATR_SL_MULT
+        value: "1.5"           # Множитель ATR для расчёта SL
+      - key: ATR_SL_MIN_PCT
+        value: "1.5"           # Мин ATR SL от входа
+      - key: ATR_SL_MAX_PCT
+        value: "3.5"           # B3 FIX: SHORT фиксированный TP1=3% → SL>3.5% убивает RR<1.0
       - key: MIN_VOLUME_USDT
-        value: "150000"       # П15: было 300000 → 150000
+        value: "200000"       # П15: было 300000 → 150000
+      - key: ACCOUNT_CAPITAL_USD
+        value: "20000"          # Капитал счёта в USD (для расчёта размера позиции)
+      - key: MAX_CONSECUTIVE_LOSSES
+        value: "3"             # Стоп торговли после N подряд убытков
+      - key: Z_GATE_NEAR_MISS_Z_MIN
+        value: "6.0"           # C6: z≥6+base≥65 → bypass gate (REDUSDT z=7.0 тип)
+      - key: Z_GATE_HIGH_SCORE_BYPASS_MIN
+        value: "80"            # C6: base≥80+z≥2 → bypass gate (FIDAUSDT score=98 тип)
+      - key: Z_GATE_SYSTEMIC_BTC_PCT
+        value: "5.0"           # C6: BTC ±X%/1h → systemic move bypass
+      - key: SYSTEMIC_PUMP_BTC_PCT
+        value: "3.0"           # D: SystemicPumpGuard — BTC ≥+3%/1h → pump check
+      - key: SYSTEMIC_PUMP_ALTS_RATIO
+        value: "0.50"          # D: SystemicPumpGuard — >50% альтов price_trend=up → блок
+      - key: SYSTEMIC_PUMP_COOLDOWN_MIN
+        value: "30"            # D: SystemicPumpGuard — cooldown 30 мин после детекции
+      # ─── PUMP GUARD OUTLIER BYPASS (Блок 1) ──────────────────────────────
+      - key: PUMP_OUTLIER_PRICE_PCT
+        value: "15.0"          # SHORT bypass: токен падает ≥15%/24h при pump рынка → SHORT разрешён
+      - key: PUMP_OUTLIER_VOL_SPIKE
+        value: "2.0"           # SHORT bypass: volume_spike_ratio ≥ 2.0x при pump рынка
+      # ─── RELATIVE STRENGTH vs BTC (Блок 2) ───────────────────────────────
+      - key: ENABLE_RELATIVE_STRENGTH
+        value: "true"          # RS = token% - btc% для 1h и 24h
+      - key: RS_BONUS_MAX
+        value: "12"            # Макс бонус/штраф от RS (±12 очков к effective_score)
+      # ─── TOKEN DIVERGENCE SCORER (Блок 3) ────────────────────────────────
+      - key: ENABLE_DIVERGENCE_SCORER
+        value: "true"          # Composite: RS (30%) + Volume (22%) + OI (18%) + Funding (18%) + CVD (12%)
+      - key: DIVERGENCE_BONUS_MAX
+        value: "20"            # Макс composite бонус/штраф (±20 очков к effective_score)
+      # Block 6: CVD / Taker component
+      - key: ENABLE_CVD_COMPONENT
+        value: "true"          # CVD taker buy/sell ratio как 5й компонент дивергенции
+      - key: CVD_BUY_THRESHOLD
+        value: "0.55"          # >0.55 = buy pressure для LONG
+      - key: CVD_SELL_THRESHOLD
+        value: "0.45"          # <0.45 = sell pressure для SHORT
+      # Block 5: Risk multiplier thresholds (pump guard)
+      - key: PUMP_RISK_MULT_BLOCK_PCT
+        value: "8.0"           # BTC +8%/1h → SHORT полностью заблокирован (mult=0.0)
+      - key: PUMP_RISK_MULT_HALF_PCT
+        value: "5.0"           # BTC +5%/1h → SHORT риск ×0.5
+      - key: PUMP_RISK_MULT_REDUCE_PCT
+        value: "3.0"           # BTC +3%/1h → SHORT риск ×0.75
+      # ─── P0: Counter-Trend Block (RSI gate removed, threshold tuning) ────────
+      - key: SHORT_BLOCK_AFTER_DROP_PCT
+        value: "4.0"           # P0b: FIX 7.0→4.0 — блок раньше при 4H дампе
+      - key: SHORT_DROP_BYPASS_MIN_SCORE
+        value: "85"            # score ≥ 85 разрешает bypass post-dump блока
+      # ─── P0c: BTC direction thresholds (ShortFilter) ─────────────────────────
+      - key: SHORT_FILTER_BTC_BLOCK_PCT
+        value: "4.0"           # BTC +4%/1h → SHORT полностью заблокирован
+      - key: SHORT_FILTER_BTC_MODERATE_PCT
+        value: "1.0"           # P0c: FIX 2.0→1.0 — штраф -10 раньше при recovery
+      # ─── P1: BTC Momentum Guard (V-Shape detector) ───────────────────────────
+      - key: ENABLE_BTC_MOMENTUM_GUARD
+        value: "true"          # P1: детект V-shape BTC recovery → блок SHORT
+      - key: BTC_VSHAPE_DUMP_THR
+        value: "-2.0"          # BTC был ≤ -2%/1h = "dump зафиксирован"
+      - key: BTC_VSHAPE_RECOVERY_THR
+        value: "-0.5"          # BTC теперь ≥ -0.5%/1h = "recovery активна" → блок
+      - key: BTC_VSHAPE_HISTORY_SIZE
+        value: "4"             # Окно памяти: последние 4 цикла скана
+      - key: BTC_RAPID_BOUNCE_PCT
+        value: "1.5"           # Рост BTC на 1.5% за N циклов = rapid bounce
+      # ─── P2: Momentum Exhaustion Filter ──────────────────────────────────────
+      - key: ENABLE_MOMENTUM_EXHAUSTION
+        value: "true"          # P2: блок SHORT на истощённом momentum (SWARMS/BOME-паттерн)
+      - key: EXHAUSTION_DROP_4H
+        value: "-6.0"          # 4H упал ≥ 6% → актив уже на дне
+      - key: EXHAUSTION_DROP_24H
+        value: "-15.0"         # 24H упал ≥ 15% + RSI перепродан → блок
+      - key: EXHAUSTION_RSI_MAX
+        value: "38.0"          # RSI < 38 = перепродан на момент exhaustion
+      # ─── P3: Anti-Chasing Filter ─────────────────────────────────────────────
+      - key: ENABLE_ANTI_CHASING
+        value: "true"          # P3: блок если цена уже отскочила X% от low (шорт на дне)
+      - key: ANTI_CHASE_CANDLES
+        value: "4"             # Окно: последние 4 свечи 15m
+      - key: ANTI_CHASE_PCT
+        value: "2.5"           # Отскок ≥ 2.5% от low за 4×15m → вход запрещён
+      # ─── RS-FILTER: токен сильнее BTC → SHORT запрещён (CFGUSDT-паттерн) ──
+      - key: SHORT_RS_FILTER_ENABLED
+        value: "true"
+      - key: SHORT_RS_BLOCK_1H_PCT
+        value: "8.0"           # Символ опережает BTC на 1H ≥ 8% → SHORT заблокирован
+      - key: SHORT_RS_BLOCK_24H_PCT
+        value: "15.0"          # Символ опережает BTC на 24H ≥ 15% → SHORT заблокирован
       - key: RISK_PER_TRADE
         value: "0.001"
       - key: MAX_POSITION_PCT
@@ -86,7 +191,102 @@ services:
       - key: USE_SMC
         value: "true"
       - key: AUTO_TRADING_ENABLED
-        value: "false"
+        value: "true"
+      - key: SKIP_NODATA_TTL
+        value: "3600"           # 1ч skip вместо 24ч — быстрее восстановление после ошибок
+      - key: COINMARKETCAP_API_KEY
+        sync: false  # ← Прописать в Render Dashboard
+      - key: CRYPTOCOMPARE_API_KEY
+        sync: false  # ← Прописать в Render Dashboard (3-й fallback OnChain)
+      - key: COINGLASS_API_KEY
+        sync: false  # ← Прописать в Render Dashboard
+      - key: ENABLE_EXTREME_FUNDING_BYPASS
+        value: "true"
+      - key: EXTREME_FUNDING_BYPASS_THRESHOLD
+        value: "0.05"           # funding ≥ 0.05% + ≥3 паттернов + base≥70 → bypass z_volume
+      - key: EXTREME_FUNDING_BYPASS_MIN_PATTERNS
+        value: "3"
+      - key: EXTREME_FUNDING_BYPASS_MIN_BASE
+        value: "70"
+      - key: ENABLE_MOMENTUM_SHORT
+        value: "true"
+      - key: MOMENTUM_RSI_MAX_SHORT
+        value: "50"
+      - key: MOMENTUM_VOL_MIN_SHORT
+        value: "1.3"
+      - key: MOMENTUM_DOWNTREND_1H
+        value: "-1.5"
+      - key: ENABLE_OVERBOUGHT_SHORT
+        value: "true"
+      - key: OVERBOUGHT_RSI_MIN_SHORT
+        value: "63"             # RSI ≥ 63 + trend=up + L/S≥55% + паттерн → шорт без volume spike
+      - key: CONSOLIDATION_FILTER_ENABLED
+        value: "true"           # false = отключить фильтр консолидации полностью
+      - key: ENABLE_BEARISH_CONT_SHORT
+        value: "true"
+      - key: BEARISH_CONT_RSI_MIN_SHORT
+        value: "30"             # RSI выше этого — не на дне, ещё есть потенциал падения
+      - key: BEARISH_CONT_RSI_MAX_SHORT
+        value: "68"             # RSI ниже этого — даунтренд от перекупленного пика (было 55)
+      - key: BEARISH_CONT_BASE_MIN_SHORT
+        value: "70"             # v1: Минимальный BASE score для активации bypass (raised 55→70)
+      - key: FUNDING_EXTREME_SHORT
+        value: "0.05"           # ≥0.05%→score60, ≥0.10%→75, ≥0.15%→90 в AEGIS + BASE +10
+      - key: ENABLE_TREND_DETECTOR
+        value: "true"
+      - key: TREND_SCORE_BONUS
+        value: "8"              # +8 к base_score при 2/4 условий в направлении SHORT
+      - key: TREND_SCORE_PENALTY
+        value: "10"             # −10 к base_score при 2/4 условий ПРОТИВ направления SHORT
+      - key: TREND_MOMENTUM_4H
+        value: "1.5"            # Мин 4H движение %
+      - key: TREND_MOMENTUM_1H
+        value: "0.3"            # Мин 1H движение %
+      - key: TREND_MOMENTUM_1D
+        value: "2.5"            # Мин 1D движение % (proxy из 6×4H)
+      - key: TREND_VOLUME_MULT
+        value: "1.3"            # Мин volume surge ×
+      # #19: KillZoneFilter
+      - key: KILL_ZONE_BONUS
+        value: "10"              # +10 к base_score в London (02-05 UTC) и NY (08-11 UTC)
+      - key: KILL_ZONE_PENALTY
+        value: "5"               # -5 в мёртвую Asia зону (14-20 UTC)
+      # A5: OHLCV кеш
+      - key: OHLCV_CACHE_TTL
+        value: "0"               # 0 = авто (= SCAN_INTERVAL)
+      # Signals DB
+      - key: SIGNALS_DB_PATH
+        value: "/opt/render/project/signals_short.db"
+      - key: SL_COOLDOWN_HOURS
+        value: "1.0"             # Блок повторного входа на символ после стопа (часов)
+      # Pre-pump detector (SHORT: тихая вершина + OI + перегретый funding → bypass z_gate)
+      - key: EXTENDED_TP_SHORT
+        value: "true"            # true = 6 TP уровней для трендовых паттернов (false = стандартные 4)
+      # PatternML — минимум сделок по паттерну для статистической значимости
+      - key: PATTERN_ML_MIN_TRADES
+        value: "3"               # Default=3 (бот новый, мало данных); рекомендуется 5+ после 100 сделок
+      - key: ENABLE_PRE_PUMP_DETECTOR
+        value: "true"
+      - key: PRE_PUMP_ATR_SQUEEZE
+        value: "0.65"            # ATR(14)/SMA(ATR,20) < X → сжатие
+      - key: PRE_PUMP_RANGE_PCT
+        value: "3.5"             # Диапазон 20 баров / close < X%
+      - key: PRE_PUMP_OI_MIN_PCT
+        value: "2.0"             # oi_change_4h ≥ X% для подтверждения
+      - key: PRE_PUMP_SOFT_SCORE
+        value: "60"              # score ≥ X → z_gate × 0.6
+      - key: PRE_PUMP_BYPASS_SCORE
+        value: "75"              # score ≥ X + OI → полный bypass
+      - key: PRE_PUMP_PRICE_POSITION
+        value: "0.40"            # SHORT: цена должна быть в верхних 40% диапазона (ratio > 0.60)
+      # ─── ANTI-CATASTROPHE FILTERS (SUI/DYM/BLESS/ICNT FIX) ─────────────────
+      - key: SHORT_REQUIRE_PREMIUM
+        value: "true"            # true = SHORT только в PREMIUM zone (выше POC 4H). false = отключить.
+      - key: SHORT_RSI_OVERSOLD_BLOCK
+        value: "30"              # SHORT заблокирован если RSI < X. RSI<30 = экстремальная перепроданность.
+      # ─── WEEKLY SNR / OB / ZONE FILTERS ─────────────────────────────────────
+      - key: SHORT_BLOCK_WEEKLY_BULL_OB
+        value: "true"            # true = SHORT заблокирован если цена в Weekly Bullish OB (институциональная покупка).
 
   # ═══════════════════════════════════════════════════════════════════════
   # 🟢 AEGIS LONG ALPHA - Long Trading Bot
@@ -117,6 +317,8 @@ services:
         sync: false
       - key: LONG_TELEGRAM_CHAT_ID
         sync: false
+      - key: LONG_TELEGRAM_TOPIC_ID
+        sync: false  # Telegram топик для long-bot (опционально)
       - key: RENDER_EXTERNAL_URL
         fromService:
           name: aegis-long-alpha
@@ -124,23 +326,69 @@ services:
           property: url
       # Config (LONG-specific)
       - key: MAX_PAIRS
-        value: "500"
+        value: "200"
       - key: MAX_WATCHLIST
-        value: "500"
+        value: "150"             # FIX: 2000→150 — Render Starter 512MB, OOM fix
       - key: MIN_LONG_SCORE
-        value: "70"           # AEGIS final threshold
+        value: "72"           # AEGIS final threshold
       - key: MIN_LONG_BASE_SCORE
-        value: "45"           # BASE_SCORER порог (мягче — ищет перепроданность)
+        value: "65"           # BASE_SCORER порог
+      - key: AEGIS_LONG_MIN_SCORE
+        value: "65"           # AEGIS engine внутренний порог
       - key: SCAN_INTERVAL
         value: "180"          # Long чуть медленнее short
-      - key: MAX_POSITIONS
-        value: "15"
+      - key: SCAN_CONCURRENCY
+        value: "8"            # FIX: 20→8 — Render Starter OOM fix
+      - key: MAX_LONG_POSITIONS
+        value: "15"           # Лимит LONG позиций (независимо от SHORT-бота)
       - key: LONG_SL_BUFFER
         value: "3.0"
+      - key: SWING_SL_MIN_PCT
+        value: "2.5"             # Увеличено 2.0→2.5: низколиквидные альты требуют запас
+      - key: ATR_SL_MAX_PCT
+        value: "5.0"             # B3 FIX: LONG DCA масштабирует TP1 под SL → RR=1.0 при любом SL
+      - key: ATR_SL_MIN_PCT
+        value: "2.5"             # Увеличено 2.0→2.5
+      - key: LONG_SL_HARD_MIN_PCT
+        value: "3.0"             # Увеличено 2.0→3.0: абсолютный минимум, защита от tight SL
+      - key: SL_COOLDOWN_HOURS
+        value: "1.0"             # Блок повторного входа на символ после стопа (часов)
+      - key: HTF_BEARISH_PENALTY
+        value: "5"               # Штраф −5 pts если 4H+1H оба медвежьи без подтверждения разворота
+      - key: COINMARKETCAP_API_KEY
+        sync: false  # ← Прописать в Render Dashboard
+      - key: CRYPTOCOMPARE_API_KEY
+        sync: false  # ← Прописать в Render Dashboard (3-й fallback OnChain)
+      - key: COINGLASS_API_KEY
+        sync: false  # ← Прописать в Render Dashboard
       - key: LONG_LEVERAGE
         value: "5-20"
       - key: MIN_VOLUME_USDT
         value: "200000"       # П15: long — чуть выше порог для качества
+      - key: ACCOUNT_CAPITAL_USD
+        value: "20000"          # Капитал счёта в USD (для расчёта размера позиции)
+      - key: MAX_CONSECUTIVE_LOSSES
+        value: "3"             # Стоп торговли после N подряд убытков
+      - key: MAX_EXPOSURE_PCT
+        value: "0.60"          # Максимальная экспозиция портфеля
+      - key: USE_ATR_SL
+        value: "true"          # Использовать ATR для расчёта SL
+      - key: Z_VOLUME_GATE_MIN
+        value: "10"             # Порог z_volume gate для LONG (default=8, adaptive→3 при системных условиях)
+      - key: Z_NODATA_BYPASS_MIN
+        value: "85"             # Variant B: base≥85 + dump_detector=0 → полный bypass z_gate (uptrend сигнал)
+      - key: Z_NODATA_SOFT_BYPASS_MIN
+        value: "75"             # Variant B: base≥75 + dump_detector=0 → soft bypass (−5pts к итоговому score)
+      - key: ONCHAIN_FALLBACK_TTL
+        value: "10800"          # Variant D: TTL fallback кэша OnChain (3ч — при сбое CoinGecko API)
+      - key: ENABLE_MOMENTUM_LONG
+        value: "true"          # Bypass z_volume gate для momentum LONG
+      - key: Z_GATE_NEAR_MISS_Z_MIN
+        value: "6.0"           # C6: z≥6+base≥65 → bypass gate (REDUSDT z=7.0 тип)
+      - key: Z_GATE_HIGH_SCORE_BYPASS_MIN
+        value: "80"            # C6: base≥80+z≥2 → bypass gate (FIDAUSDT score=98 тип)
+      - key: Z_GATE_SYSTEMIC_BTC_PCT
+        value: "5.0"           # C6: BTC -X%/1h → systemic crash bypass (LONG)
       - key: RISK_PER_TRADE
         value: "0.001"
       - key: MAX_POSITION_PCT
@@ -176,6 +424,119 @@ services:
       - key: ENABLE_BTC_FILTER
         value: "true"
       - key: BTC_BLOCK_THRESHOLD
-        value: "-3.0"
+        value: "-2.0"         # было -3.0 → -2.0: блокируем лонги при умеренном падении BTC
       - key: AUTO_TRADING_ENABLED
-        value: "false"
+        value: "true"
+      - key: SKIP_NODATA_TTL
+        value: "3600"           # 1ч skip вместо 24ч
+      - key: CONSOLIDATION_FILTER_ENABLED
+        value: "true"           # false = отключить фильтр консолидации полностью
+      - key: FUNDING_EXTREME_LONG
+        value: "-0.05"          # ≤-0.05%→score60, ≤-0.10%→75, ≤-0.15%→90 в AEGIS + BASE +10
+      - key: ENABLE_EXTREME_FUNDING_BYPASS
+        value: "true"           # ✅ FIX #4: bypass z_volume gate при экстрем. отриц. funding
+      - key: EXTREME_FUNDING_BYPASS_THRESHOLD
+        value: "0.05"           # |funding| ≥ 0.05% → bypass (ALGOUSDT -0.0565% тип)
+      - key: EXTREME_FUNDING_BYPASS_MIN_BASE
+        value: "65"             # база ≥ 65 для LONG (мягче чем 70 в SHORT)
+      - key: ENABLE_TREND_DETECTOR
+        value: "true"
+      - key: TREND_SCORE_BONUS
+        value: "8"              # +8 к base_score при 2/4 условий в направлении LONG
+      - key: TREND_SCORE_PENALTY
+        value: "10"             # −10 к base_score при 2/4 условий ПРОТИВ направления LONG
+      - key: TREND_MOMENTUM_4H
+        value: "1.5"
+      - key: TREND_MOMENTUM_1H
+        value: "0.3"
+      - key: TREND_MOMENTUM_1D
+        value: "2.5"
+      - key: TREND_VOLUME_MULT
+        value: "1.3"
+      # SystemicCrashGuard (A2)
+      - key: SYSTEMIC_CRASH_BTC_PCT
+        value: "-3.0"           # BTC ≤ -3%/1h → системный краш (было -5.0 — слишком мягко)
+      - key: SYSTEMIC_CRASH_ALTS_RATIO
+        value: "0.65"           # 65%+ альтов с отрицательной 1h → краш (было 0.80)
+      - key: SYSTEMIC_CRASH_COOLDOWN_MIN
+        value: "45"             # Блокировка LONG на 45 мин после краша (было 30)
+      - key: CRASH_POST_COOLDOWN_MIN
+        value: "30"             # Дополнительный cooldown после восстановления (30 мин НЕ торговать)
+      # ─── CRASH GUARD OUTLIER BYPASS (Блок 1) ─────────────────────────────
+      - key: CRASH_OUTLIER_PRICE_PCT
+        value: "15.0"          # LONG bypass: токен растёт ≥15%/24h при crash рынка → LONG разрешён
+      - key: CRASH_OUTLIER_VOL_SPIKE
+        value: "2.0"           # LONG bypass: volume_spike_ratio ≥ 2.0x при crash рынка
+      # ─── RELATIVE STRENGTH vs BTC (Блок 2) ───────────────────────────────
+      - key: ENABLE_RELATIVE_STRENGTH
+        value: "true"          # RS = token% - btc% для 1h и 24h
+      - key: RS_BONUS_MAX
+        value: "12"            # Макс бонус/штраф от RS (±12 очков к effective_score)
+      # ─── TOKEN DIVERGENCE SCORER (Блок 3) ────────────────────────────────
+      - key: ENABLE_DIVERGENCE_SCORER
+        value: "true"          # Composite: RS (30%) + Volume (22%) + OI (18%) + Funding (18%) + CVD (12%)
+      - key: DIVERGENCE_BONUS_MAX
+        value: "20"            # Макс composite бонус/штраф (±20 очков к effective_score)
+      # Block 6: CVD / Taker component
+      - key: ENABLE_CVD_COMPONENT
+        value: "true"          # CVD taker buy/sell ratio как 5й компонент дивергенции
+      - key: CVD_BUY_THRESHOLD
+        value: "0.55"          # >0.55 = buy pressure для LONG
+      - key: CVD_SELL_THRESHOLD
+        value: "0.45"          # <0.45 = sell pressure для SHORT
+      # Block 5: Risk multiplier thresholds (crash guard)
+      - key: CRASH_RISK_MULT_BLOCK_PCT
+        value: "-8.0"          # BTC -8%/1h → LONG полностью заблокирован (mult=0.0)
+      - key: CRASH_RISK_MULT_HALF_PCT
+        value: "-5.0"          # BTC -5%/1h → LONG риск ×0.5
+      - key: CRASH_RISK_MULT_REDUCE_PCT
+        value: "-3.0"          # BTC -3%/1h → LONG риск ×0.75
+      # #19: KillZoneFilter
+      - key: KILL_ZONE_BONUS
+        value: "10"
+      - key: KILL_ZONE_PENALTY
+        value: "5"
+      # A5: OHLCV кеш
+      - key: OHLCV_CACHE_TTL
+        value: "0"               # 0 = авто (= SCAN_INTERVAL)
+      - key: EXTENDED_TP_LONG
+        value: "true"            # true = 6 TP уровней для long-bot (false = стандартные 4)
+      # PatternML — минимум сделок по паттерну для статистической значимости
+      - key: PATTERN_ML_MIN_TRADES
+        value: "3"               # Default=3 (бот новый, мало данных); рекомендуется 5+ после 100 сделок
+      # Pre-pump detector (LONG: тихое накопление + OI↑ + funding нейтральный → bypass z_gate)
+      - key: ENABLE_PRE_PUMP_DETECTOR
+        value: "true"
+      - key: PRE_PUMP_ATR_SQUEEZE
+        value: "0.65"
+      - key: PRE_PUMP_RANGE_PCT
+        value: "3.5"
+      - key: PRE_PUMP_OI_MIN_PCT
+        value: "2.0"
+      - key: PRE_PUMP_SOFT_SCORE
+        value: "60"
+      - key: PRE_PUMP_BYPASS_SCORE
+        value: "75"
+      - key: PRE_PUMP_PRICE_POSITION
+        value: "0.40"            # LONG: цена должна быть в нижних 40% диапазона (ratio < 0.40)
+      # ─── WEEKLY SNR / OB / ZONE FILTERS (LONG) ───────────────────────────────
+      - key: LONG_REQUIRE_DISCOUNT
+        value: "true"            # true = LONG блокирован в Weekly PREMIUM (умные деньги продают). false = отключить.
+      - key: LONG_WEEKLY_PREMIUM_BYPASS_SCORE
+        value: "88"              # Исключение Weekly PREMIUM блока для ultra-high-confidence сигналов score >= X.
+      - key: LONG_BLOCK_WEEKLY_BEAR_OB
+        value: "true"            # true = LONG заблокирован если цена в Weekly Bearish OB (стена продаж).
+      # ─── BTC Momentum Guard (Rapid Dump blocker for LONG) ───────────────────
+      - key: ENABLE_BTC_MOMENTUM_GUARD
+        value: "true"          # Блок LONG при Rapid Dump BTC (зеркально V-shape short-guard)
+      - key: BTC_VSHAPE_DUMP_THR
+        value: "-2.0"          # BTC был ниже -2%/1h → dump зафиксирован
+      - key: BTC_VSHAPE_RECOVERY_THR
+        value: "-0.5"          # BTC теперь выше -0.5%/1h → recovery началась
+      - key: BTC_VSHAPE_HISTORY_SIZE
+        value: "4"             # Окно памяти циклов для V-shape детекции
+      - key: BTC_RAPID_BOUNCE_PCT
+        value: "1.5"           # BTC вырос на 1.5% за N циклов = Rapid Bounce (для short-guard)
+      # Signals DB
+      - key: SIGNALS_DB_PATH
+        value: "/opt/render/project/signals_long.db"

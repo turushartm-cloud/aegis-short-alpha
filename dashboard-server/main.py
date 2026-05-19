@@ -246,16 +246,12 @@ def _get_positions(c, bot: str) -> List[Dict]:
 def _get_signals(c, bot: str) -> List[Dict]:
     if not c: return []
     try:
-        # First try state["active_signals"] — fast path
+        # state["active_signals"] — это INT (count), не список сигналов.
+        # Всегда используем scan по ключам для получения реальных данных.
         state_raw = c.get(f"{bot}:state")
-        state     = jl(state_raw) or {}
-        active_from_state = state.get("active_signals", [])
-        if active_from_state and isinstance(active_from_state, list):
-            for s in active_from_state:
-                s["bot"] = bot
-            return active_from_state
+        _ = jl(state_raw) or {}  # читаем для кэша, но active_signals там int
 
-        # Fallback: scan signals:* keys
+        # Scan signals:* keys
         keys = c.keys(f"{bot}:signals:*")
         out  = []
         for k in keys[:300]:

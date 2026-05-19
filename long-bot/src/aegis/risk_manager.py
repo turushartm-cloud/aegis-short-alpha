@@ -312,32 +312,6 @@ class AegisRiskManager:
         }
 
     # ─────────────────────────────────────────────────────────────────
-    # R/R Validation
-    # ─────────────────────────────────────────────────────────────────
-
-    def validate_rr(
-        self,
-        entry:      float,
-        stop_loss:  float,
-        take_profit: float,     # Первый TP
-    ) -> Tuple[bool, float, str]:
-        """
-        Проверяет соответствие R/R минимуму.
-        Returns: (valid, rr_ratio, message)
-        """
-        risk   = abs(stop_loss - entry)
-        reward = abs(entry - take_profit)
-
-        if risk <= 0:
-            return False, 0.0, "Zero risk distance"
-
-        rr = reward / risk
-        if rr < self.limits.min_rr_ratio:
-            return False, round(rr, 2), f"R/R {rr:.2f} < min {self.limits.min_rr_ratio}"
-
-        return True, round(rr, 2), f"R/R {rr:.2f} ✅"
-
-    # ─────────────────────────────────────────────────────────────────
     # Portfolio Heat
     # ─────────────────────────────────────────────────────────────────
 

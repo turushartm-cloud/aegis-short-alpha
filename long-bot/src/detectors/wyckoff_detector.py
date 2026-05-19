@@ -43,31 +43,6 @@ class WyckoffAccumulationDetector:
     def __init__(self, lookback: int = 50):
         self.lookback = lookback
 
-    def _find_swing_lows(self, ohlcv: list, window: int = 5) -> List[Tuple[int, float]]:
-        """Находит локальные минимумы (swing lows)"""
-        lows = []
-        for i in range(window, len(ohlcv) - window):
-            c = ohlcv[i]
-            if all(c.low <= ohlcv[j].low for j in range(i - window, i + window + 1) if j != i):
-                lows.append((i, c.low))
-        return lows
-
-    def _find_swing_highs(self, ohlcv: list, window: int = 5) -> List[Tuple[int, float]]:
-        """Находит локальные максимумы (swing highs)"""
-        highs = []
-        for i in range(window, len(ohlcv) - window):
-            c = ohlcv[i]
-            if all(c.high >= ohlcv[j].high for j in range(i - window, i + window + 1) if j != i):
-                highs.append((i, c.high))
-        return highs
-
-    def _avg_volume(self, ohlcv: list, start: int, end: int) -> float:
-        if start >= end or end > len(ohlcv):
-            return 0.0
-        vols = [getattr(c, 'volume', 0) or getattr(c, 'quote_volume', 0)
-                for c in ohlcv[start:end]]
-        return sum(vols) / len(vols) if vols else 0.0
-
     def _detect_selling_climax(self, ohlcv: list) -> Optional[Dict]:
         """
         Selling Climax (SC): Резкое падение с аномальным объёмом,
@@ -200,6 +175,32 @@ class WyckoffAccumulationDetector:
                         "score": score,
                     }
         return None
+
+    def _find_swing_lows(self, ohlcv: list, window: int = 5) -> List[float]:
+        """Находит локальные минимумы (swing lows) — опорные уровни поддержки."""
+        lows = []
+        for i in range(window, len(ohlcv) - window):
+            c = ohlcv[i]
+            if all(c.low <= ohlcv[j].low for j in range(i - window, i + window + 1) if j != i):
+                lows.append(c.low)
+        return lows
+
+    def _find_swing_highs(self, ohlcv: list, window: int = 5) -> List[float]:
+        """Находит локальные максимумы (swing highs) — опорные уровни сопротивления."""
+        highs = []
+        for i in range(window, len(ohlcv) - window):
+            c = ohlcv[i]
+            if all(c.high >= ohlcv[j].high for j in range(i - window, i + window + 1) if j != i):
+                highs.append(c.high)
+        return highs
+
+    def _avg_volume(self, ohlcv: list, start: int, end: int) -> float:
+        """Среднее значение объёма за срез ohlcv[start:end]."""
+        sl = ohlcv[start:end]
+        if not sl:
+            return 0.0
+        vols = [getattr(c, 'volume', 0) or getattr(c, 'quote_volume', 0) for c in sl]
+        return sum(vols) / len(vols) if vols else 0.0
 
     async def analyze(self, symbol: str, ohlcv: list, market_data: Any = None) -> Dict:
         """
