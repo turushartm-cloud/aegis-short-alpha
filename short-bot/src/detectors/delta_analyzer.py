@@ -101,6 +101,70 @@ class DeltaAnalyzer:
             logger.warning(f"[Delta] {symbol}: ошибка расчёта — {type(e).__name__}: {e}")
             return {"score": 25.0, "reasons": ["Delta: ошибка расчёта"], "metadata": {}}
 
+    def detect_divergence(self, ohlcv: list, lookback: int = 10) -> dict:
+        """
+        #21 Delta Divergence:
+        Price Higher-High + CVD Lower-High → скрытая медвежья дивергенция (SHORT сигнал).
+        Price Lower-Low  + CVD Higher-Low  → скрытая бычья дивергенция (LONG сигнал, для справки).
+
+        Returns: {"bearish": bool, "bullish": bool, "score_bonus": int, "reason": str}
+        """
+        result = {"bearish": False, "bullish": False, "score_bonus": 0, "reason": ""}
+        if not ohlcv or len(ohlcv) < lookback + 2:
+            return result
+        try:
+            recent = ohlcv[-lookback:]
+            prices = [c.close for c in recent]
+            # CVD суррогат
+            cvd_series = []
+            running = 0.0
+            for c in recent:
+                rng = c.high - c.low
+                body = c.close - c.open
+                vol  = getattr(c, "volume", 0) or getattr(c, "quote_volume", 0)
+                delta = vol * (body / rng) if rng > 0 else 0.0
+                running += delta
+                cvd_series.append(running)
+
+            # Ищем два пика в ценах и CVD
+            half = len(prices) // 2
+            price_first_half_max = max(prices[:half])
+            price_second_half_max = max(prices[half:])
+            cvd_first_half_max   = max(cvd_series[:half])
+            cvd_second_half_max  = max(cvd_series[half:])
+
+            price_first_half_min = min(prices[:half])
+            price_second_half_min = min(prices[half:])
+            cvd_first_half_min   = min(cvd_series[:half])
+            cvd_second_half_min  = min(cvd_series[half:])
+
+            # Медвежья дивергенция: цена HH, CVD LH
+            if (price_second_half_max > price_first_half_max * 1.002 and
+                    cvd_second_half_max < cvd_first_half_max * 0.98):
+                result["bearish"]     = True
+                result["score_bonus"] = 18
+                result["reason"]      = (
+                    f"📉 [DELTA_DIV] Медвежья дивергенция: "
+                    f"Price HH={price_second_half_max:.4f} > {price_first_half_max:.4f}, "
+                    f"CVD LH={cvd_second_half_max:.0f} < {cvd_first_half_max:.0f}"
+                )
+                logger.info(result["reason"])
+
+            # Бычья дивергенция: цена LL, CVD HL
+            elif (price_second_half_min < price_first_half_min * 0.998 and
+                    cvd_second_half_min > cvd_first_half_min * 1.02):
+                result["bullish"]     = True
+                result["score_bonus"] = 18
+                result["reason"]      = (
+                    f"📈 [DELTA_DIV] Бычья дивергенция: "
+                    f"Price LL={price_second_half_min:.4f} < {price_first_half_min:.4f}, "
+                    f"CVD HL={cvd_second_half_min:.0f} > {cvd_first_half_min:.0f}"
+                )
+
+        except Exception as e:
+            logger.debug(f"[DeltaDiv]: {e}")
+        return result
+
 
 # ─────────────────────────────────────────────────────────────────────
 # __init__ for detectors package

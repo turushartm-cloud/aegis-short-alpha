@@ -12,7 +12,11 @@ BingX Futures API Client  v2.4-final
 """
 
 import os, json, hmac, hashlib, time
-from typing import Optional, Dict, List, Any, Set
+from typing import Optional, Dict, List, Any, Set, Tuple
+
+# Кеш /openOrders: symbol → (timestamp, orders_list), TTL 30s
+_open_orders_cache: Dict[str, Tuple[float, List]] = {}
+_OPEN_ORDERS_CACHE_TTL = 30.0
 from dataclasses import dataclass
 from datetime import datetime
 import aiohttp
@@ -103,6 +107,10 @@ class BingXClient:
         self.last_error: Optional[str] = None
         self.last_error_code: Optional[int] = None
         self._time_offset: int = 0   # ✅ FIX: server time offset
+        # ✅ FIX rate-limit: кеш order book + счётчик 429 для throttle
+        self._ob_cache: Dict[str, tuple] = {}   # symbol → (timestamp, data)
+        self._ob_cache_ttl: int = int(os.getenv("OB_CACHE_TTL", "60"))  # сек, дефолт 60
+        self._ob_429_until: float = 0.0          # время до которого не делаем OB запросы
         print(f"🚀 BingX Client ({'DEMO' if self.demo else 'REAL'})")
 
     async def _get_session(self):
@@ -288,11 +296,20 @@ class BingXClient:
     # POSITIONS
     # =========================================================================
 
-    async def get_positions(self, symbol=None) -> List[BingXPosition]:
+    async def get_positions(self, symbol=None, raise_on_api_error: bool = False) -> List[BingXPosition]:
+        """
+        Получает открытые позиции.
+        raise_on_api_error=True → бросает RuntimeError если BingX вернул None (429, сеть, etc.)
+        Это критично для zombie-cleanup: пустой [] из-за API ошибки ≠ "позиции нет".
+        """
         params = {"symbol": symbol} if symbol else {}
         result = await self._make_request("GET", "/openApi/swap/v2/user/positions", params=params)
+        if result is None:
+            if raise_on_api_error:
+                raise RuntimeError(f"BingX positions API недоступен: {self.last_error or 'нет ответа'}")
+            return []
         positions = []
-        if result and result.get("code") == 0:
+        if result.get("code") == 0:
             for d in result.get("data", []):
                 try:
                     size = float(d.get("positionAmt", 0))
@@ -449,6 +466,88 @@ class BingXClient:
     # UPDATE STOP LOSS — отменить старый SL + выставить новый
     # =========================================================================
 
+    # =========================================================================
+    # ORDER BOOK — P1
+    # =========================================================================
+
+    async def get_order_book(self, symbol: str, depth: int = 20) -> Optional[Dict]:
+        """
+        Fetches order book for perpetual futures from BingX.
+        Returns: {"bids": [[price, qty], ...], "asks": [[price, qty], ...]} or None
+
+        ✅ FIX rate-limit:
+          - In-memory кеш (OB_CACHE_TTL=60с) — не запрашиваем одну монету чаще раза в минуту
+          - При HTTP 429 → глобальный cooldown 30с, дальнейшие запросы возвращают кеш/None
+        """
+        import time as _time
+        now = _time.monotonic()
+
+        # Возвращаем кеш если TTL ещё не истёк
+        if symbol in self._ob_cache:
+            cached_at, cached_data = self._ob_cache[symbol]
+            if now - cached_at < self._ob_cache_ttl:
+                return cached_data
+
+        # Если глобальный rate-limit cooldown — не делаем запрос
+        if now < self._ob_429_until:
+            # Возвращаем кеш если есть, иначе None
+            return self._ob_cache.get(symbol, (0, None))[1]
+
+        try:
+            endpoint = "/openApi/swap/v2/quote/depth"
+            # BingX uses USDT pairs like BTC-USDT for swap
+            bingx_sym = symbol.replace("USDT", "-USDT") if "-" not in symbol else symbol
+            data = await self._make_request("GET", endpoint,
+                                             params={"symbol": bingx_sym, "limit": depth},
+                                             signed=False)
+            if data and data.get("code") == 0:
+                result = data.get("data", {})
+                self._ob_cache[symbol] = (_time.monotonic(), result)
+                return result
+            # Проверяем 429: HTTP 429 → _parse_response вернул None, last_error = "HTTP 429"
+            if data is None and self.last_error and "429" in str(self.last_error):
+                import logging as _lg
+                _lg.getLogger(__name__).warning(f"[OrderBook] 429 rate limit → cooldown 30s")
+                self._ob_429_until = now + 30.0
+            # Проверяем 429 в теле ответа (BingX иногда возвращает JSON с кодом)
+            elif data and data.get("code") in (429, -1003, -1015):
+                import logging as _lg
+                _lg.getLogger(__name__).warning(f"[OrderBook] rate limit code {data.get('code')} → cooldown 30s")
+                self._ob_429_until = now + 30.0
+            return None
+        except Exception as e:
+            import logging as _lg
+            _lg.getLogger(__name__).debug(f"[OrderBook] {symbol}: {e}")
+            # При ошибке — возвращаем кеш если есть
+            return self._ob_cache.get(symbol, (0, None))[1]
+
+    async def get_ticker(self, symbol: str) -> Optional[Dict]:
+        """
+        Получает последнюю цену по символу через /openApi/swap/v2/quote/price.
+        Используется zombie-cleanup для проверки, жив ли символ.
+        Returns: {"price": float, "lastPrice": float} or None
+        """
+        try:
+            bingx_sym = symbol.replace("USDT", "-USDT") if "-" not in symbol else symbol
+            data = await self._make_request(
+                "GET", "/openApi/swap/v2/quote/price",
+                params={"symbol": bingx_sym},
+                signed=False,
+            )
+            if data and data.get("code") == 0:
+                inner = data.get("data", {})
+                raw_price = inner.get("price", 0)
+                return {"price": float(raw_price), "lastPrice": float(raw_price)}
+            return None
+        except Exception as e:
+            import logging as _lg
+            _lg.getLogger(__name__).debug(f"[Ticker] {symbol}: {e}")
+            return None
+
+    # =========================================================================
+    # UPDATE STOP LOSS — отменить старый SL + выставить новый
+    # =========================================================================
+
     async def update_stop_loss(self, symbol: str, position_side: str,
                                 new_sl: float, direction: str) -> bool:
         """
@@ -461,16 +560,23 @@ class BingXClient:
         """
         pfx = f"[BingX][update_sl][{symbol}][{position_side}]"
         try:
-            # ── 1. Получаем открытые ордера ───────────────────────────────────
-            open_orders_result = await self._make_request(
-                "GET", "/openApi/swap/v2/trade/openOrders",
-                params={"symbol": symbol}
-            )
-            open_orders = []
-            if open_orders_result and open_orders_result.get("code") == 0:
-                data = open_orders_result.get("data", {})
-                open_orders = data.get("orders", [])
-            print(f"{pfx} Открытых ордеров: {len(open_orders)}")
+            # ── 1. Получаем открытые ордера (с кешем 30s) ────────────────────
+            _now = time.time()
+            _cached = _open_orders_cache.get(symbol)
+            if _cached and (_now - _cached[0]) < _OPEN_ORDERS_CACHE_TTL:
+                open_orders = _cached[1]
+                print(f"{pfx} Открытых ордеров (кеш): {len(open_orders)}")
+            else:
+                open_orders_result = await self._make_request(
+                    "GET", "/openApi/swap/v2/trade/openOrders",
+                    params={"symbol": symbol}
+                )
+                open_orders = []
+                if open_orders_result and open_orders_result.get("code") == 0:
+                    data = open_orders_result.get("data", {})
+                    open_orders = data.get("orders", [])
+                    _open_orders_cache[symbol] = (_now, open_orders)
+                print(f"{pfx} Открытых ордеров: {len(open_orders)}")
 
             # ── 2. Отменяем все STOP_MARKET ордера нужной стороны ────────────
             cancelled = 0

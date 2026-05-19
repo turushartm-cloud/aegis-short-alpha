@@ -114,13 +114,14 @@ class MarketData:
     # Расстояние до 24h low в %
     pct_from_low_24h:     float = 5.0
 
-    # ── Краткосрочные OI изменения (v3.1) ────────────────────────────────────
+    # ── Краткосрочные OI изменения (v4.0) ────────────────────────────────────
     # Источник: get_oi_short_term() — цепочка Binance→Bybit→OKX
-    # oi_1h > +5% при росте цены = позиции накапливаются (лонгисты входят)
-    # oi_1h < -5% при падении цены = позиции закрываются (капитуляция)
-    oi_change_30m:        float = 0.0  # ✅ NEW: 30m OI change
+    # oi_15m = позиции открываются/закрываются ПРЯМО СЕЙЧАС (самый быстрый сигнал)
+    oi_change_15m:        float = 0.0  # 🆕 15m OI — самый быстрый
+    oi_change_30m:        float = 0.0
     oi_change_1h:         float = 0.0
     oi_change_4h:         float = 0.0
+    # oi_change_4d используется в OIAnalyzerLong.analyze() (oi_4d секция)
     # >0.6 = агрессивные покупки (бычье давление), <0.4 = агрессивные продажи
     taker_buy_sell_ratio: Optional[float] = None
 
@@ -222,6 +223,10 @@ class BinanceFuturesClient:
     _binance_symbols_last_update: float = 0.0
     BINANCE_SYMBOLS_TTL:        int   = 3600  # Обновляем whitelist каждый час
 
+    # Прокси-ротация: {proxy: failed_at_timestamp}
+    _dead_proxy_times: dict = {}
+    DEAD_PROXY_TTL: int = 300  # 5 мин cooldown на мёртвый прокси
+
     def __init__(self, api_key=None, api_secret=None):
         self.api_key = api_key or os.getenv("BINANCE_API_KEY", "")
         self.session: Optional[aiohttp.ClientSession] = None
@@ -234,11 +239,19 @@ class BinanceFuturesClient:
         self._okx_redis   = None   # Устанавливается ботом: client.set_redis(redis)
 
         proxy_env = os.getenv("PROXY_LIST", "")
-        self._proxies     = [p.strip() for p in proxy_env.split(",") if p.strip()]
+        raw_proxies = [p.strip() for p in proxy_env.split(",") if p.strip()]
+        # Дедупликация прокси (в списке могут быть повторы)
+        seen = set()
+        self._proxies = []
+        for p in raw_proxies:
+            if p not in seen:
+                seen.add(p)
+                self._proxies.append(p)
         self._proxy_idx   = 0
         self._active_proxy: Optional[str] = None
 
-        print(f"🔧 Market client v3.1: {'Binance+proxy' if self._try_binance else 'Bybit'} → OKX fallback")
+        print(f"🔧 Market client v3.1: {'Binance+proxy' if self._try_binance else 'Bybit'} → OKX fallback"
+              + (f" ({len(self._proxies)} proxies)" if self._proxies else ""))
 
     def _next_proxy(self) -> Optional[str]:
         if not self._proxies:
@@ -246,6 +259,31 @@ class BinanceFuturesClient:
         p = self._proxies[self._proxy_idx % len(self._proxies)]
         self._proxy_idx += 1
         return p
+
+    def _is_proxy_dead(self, proxy: str) -> bool:
+        failed_at = BinanceFuturesClient._dead_proxy_times.get(proxy, 0)
+        return time.time() - failed_at < self.DEAD_PROXY_TTL
+
+    def _mark_proxy_dead(self, proxy: str):
+        BinanceFuturesClient._dead_proxy_times[proxy] = time.time()
+        host = proxy.split('@')[-1] if '@' in proxy else proxy
+        logger.warning(f"[Proxy] ❌ {host} → недоступен, cooldown {self.DEAD_PROXY_TTL}s")
+        if self._active_proxy == proxy:
+            self._active_proxy = None
+
+    def _get_live_proxies(self) -> list:
+        """Живые прокси — активный первым, остальные в порядке списка."""
+        live = [p for p in self._proxies if not self._is_proxy_dead(p)]
+        if not live:
+            # Все мёртвые — сбрасываем cooldown и пробуем заново
+            BinanceFuturesClient._dead_proxy_times.clear()
+            logger.warning("[Proxy] Все прокси в cooldown — сбрасываем и пробуем заново")
+            live = self._proxies.copy()
+        # Активный первым (быстрый путь)
+        if self._active_proxy and self._active_proxy in live:
+            live.remove(self._active_proxy)
+            live.insert(0, self._active_proxy)
+        return live
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -281,7 +319,9 @@ class BinanceFuturesClient:
             print("✅ Data source: Bybit (default)")
             return
 
-        for proxy in self._proxies[:3]:
+        for proxy in self._proxies:  # пробуем все прокси, не только первые 3
+            if self._is_proxy_dead(proxy):
+                continue
             try:
                 session = await self._get_session()
                 async with session.get(
@@ -296,7 +336,10 @@ class BinanceFuturesClient:
                         host = proxy.split('@')[-1] if '@' in proxy else proxy
                         print(f"✅ Data source: Binance via proxy ({host})")
                         return
+                    # HTTP ошибка — прокси работает но Binance отвечает плохо
+                    break
             except Exception:
+                self._mark_proxy_dead(proxy)
                 continue
 
         self._use_binance = False
@@ -372,30 +415,47 @@ class BinanceFuturesClient:
 
     async def _binance(self, endpoint: str, params: Dict = None) -> Optional[Any]:
         await self._rate_limit()
-        proxy = self._active_proxy or self._next_proxy()
-        try:
-            session = await self._get_session()
-            async with session.get(
-                f"{self.BINANCE_URL}{endpoint}",
-                params=params or {},
-                proxy=proxy,
-                timeout=aiohttp.ClientTimeout(total=10),
-                ssl=False
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                # ── Логируем HTTP-ошибки с дедупликацией ────────────────────
-                if self._should_log_error(endpoint, params):
-                    logger.warning(
-                        f"[Binance] HTTP {resp.status} | {endpoint} | proxy={proxy} | params={params}"
-                    )
+        proxies = self._get_live_proxies()
+        if not proxies:
+            return None
+
+        for proxy in proxies:
+            try:
+                session = await self._get_session()
+                async with session.get(
+                    f"{self.BINANCE_URL}{endpoint}",
+                    params=params or {},
+                    proxy=proxy,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                    ssl=False
+                ) as resp:
+                    if resp.status == 200:
+                        # Фиксируем рабочий прокси если сменился
+                        if proxy != self._active_proxy:
+                            host = proxy.split('@')[-1] if '@' in proxy else proxy
+                            logger.info(f"[Proxy] ✅ Активный прокси → {host}")
+                            self._active_proxy = proxy
+                        return await resp.json()
+                    # HTTP-ошибка (404, 400 и т.д.) — не вина прокси, выходим
+                    if self._should_log_error(endpoint, params):
+                        logger.warning(
+                            f"[Binance] HTTP {resp.status} | {endpoint} | proxy={proxy.split('@')[-1] if '@' in proxy else proxy}"
+                        )
+                    return None
+            except asyncio.TimeoutError:
+                logger.warning(f"[Binance] TIMEOUT | proxy={proxy.split('@')[-1] if '@' in proxy else proxy} | пробуем следующий")
+                self._mark_proxy_dead(proxy)
+                continue
+            except Exception as e:
+                err = str(e)
+                if any(kw in err for kw in ("Cannot connect", "Connection", "proxy", "tunnel")):
+                    self._mark_proxy_dead(proxy)
+                    continue
+                logger.warning(f"[Binance] ERROR | {endpoint} | {type(e).__name__}: {e}")
                 return None
-        except asyncio.TimeoutError:
-            logger.warning(f"[Binance] TIMEOUT | {endpoint} | proxy={proxy}")
-            return None
-        except Exception as e:
-            logger.warning(f"[Binance] ERROR | {endpoint} | proxy={proxy} | {type(e).__name__}: {e}")
-            return None
+
+        logger.warning(f"[Binance] Все прокси недоступны для {endpoint}")
+        return None
 
     # =========================================================================
     # OKX DIRECT (no proxy needed — globally accessible)
@@ -864,8 +924,13 @@ class BinanceFuturesClient:
             items = result.get("list", [])
             if len(items) >= 2:
                 logger.debug(f"[OI] {symbol}: Bybit fallback ✅")
-                return [{"sumOpenInterest": float(item.get("openInterest", 0))}
-                        for item in items]
+                # ✅ FIX S9: Bybit возвращает newest-first (как и свечи).
+                # Разворачиваем → oldest-first, чтобы _analyze_oi_trend и get_oi_change
+                # корректно считали change_pct = (newest - oldest) / oldest.
+                return list(reversed([
+                    {"sumOpenInterest": float(item.get("openInterest", 0))}
+                    for item in items
+                ]))
 
         # ── 3. OKX direct fallback ────────────────────────────────────────────
         imap_okx = {"5m": "5m", "15m": "5m", "30m": "5m",   # OKX rubik min=5m
@@ -903,25 +968,34 @@ class BinanceFuturesClient:
 
     async def get_oi_short_term(self, symbol: str) -> Dict[str, float]:
         """
-        Краткосрочные OI-изменения для усиления сигналов.
-        Возвращает {'oi_30m': %, 'oi_1h': %, 'oi_4h': %} — пригодны для Aegis-скора.
-        ✅ Добавлен 30m таймфрейм по запросу.
+        Краткосрочные OI-изменения для Aegis-скора.
+        Возвращает {'oi_15m', 'oi_30m', 'oi_1h', 'oi_4h'} в %.
+        Порядок от быстрого к медленному: 15m → 30m → 1h → 4h.
         """
-        results = {"oi_30m": 0.0, "oi_1h": 0.0, "oi_4h": 0.0}
+        results = {"oi_15m": 0.0, "oi_30m": 0.0, "oi_1h": 0.0, "oi_4h": 0.0}
         try:
-            # 30m — последние 2 свечи = изменение за 30 мин
+            # 15m — самый быстрый: 3 свечи (15m × 3 = 45 мин окно, берём первую и последнюю)
+            h15 = await self.get_open_interest_history(symbol, "15m", 4)
+            if h15 and len(h15) >= 2:
+                old = float(h15[0].get("sumOpenInterest", 0))
+                new = float(h15[-1].get("sumOpenInterest", 0))
+                results["oi_15m"] = round((new - old) / old * 100, 2) if old else 0.0
+
+            # 30m — 2 свечи
             h30 = await self.get_open_interest_history(symbol, "30m", 4)
             if h30 and len(h30) >= 2:
                 old = float(h30[0].get("sumOpenInterest", 0))
                 new = float(h30[-1].get("sumOpenInterest", 0))
                 results["oi_30m"] = round((new - old) / old * 100, 2) if old else 0.0
 
+            # 1h
             h1 = await self.get_open_interest_history(symbol, "1h", 6)
             if h1 and len(h1) >= 2:
                 old = float(h1[0].get("sumOpenInterest", 0))
                 new = float(h1[-1].get("sumOpenInterest", 0))
                 results["oi_1h"] = round((new - old) / old * 100, 2) if old else 0.0
 
+            # 4h
             h4 = await self.get_open_interest_history(symbol, "4h", 6)
             if h4 and len(h4) >= 2:
                 old = float(h4[0].get("sumOpenInterest", 0))
@@ -1399,13 +1473,16 @@ class BinanceFuturesClient:
                 self.get_24h_ticker(symbol),
                 self.get_klines(symbol, "1h", 100),
                 self.get_klines(symbol, "15m", 75),   # 75 свечей = 18.75ч
-                self.get_klines(symbol, "30m", 75),   # ✅ NEW: 30m + ATR
-                self.get_klines(symbol, "4h",  50),   # ✅ NEW: 4H HTF structure
-                self.get_klines(symbol, "1d",  35),   # ✅ NEW: 35 дней PDH/PDL/ATH
+                self.get_klines(symbol, "30m", 75),   # 30m + ATR
+                self.get_klines(symbol, "4h",  50),   # 4H HTF structure
+                self.get_klines(symbol, "1d",  35),   # 35 дней PDH/PDL/ATH
+                self.get_klines(symbol, "1w",  20),   # 20 недель — Weekly SNR/OB/FVG
+                self.get_klines(symbol, "1M",   6),   # 6 месяцев — Monthly levels
                 return_exceptions=True
             )
 
-            price, funding, oi, ratio, ticker, klines_1h, klines_15m,                 klines_30m, klines_4h, klines_1d = results
+            price, funding, oi, ratio, ticker, klines_1h, klines_15m, \
+                klines_30m, klines_4h, klines_1d, klines_1w, klines_1M = results
 
             if isinstance(price, Exception) or not price:
                 self._mark_symbol_fail(symbol)
@@ -1424,6 +1501,8 @@ class BinanceFuturesClient:
             klines_30m = [] if isinstance(klines_30m, Exception) else (klines_30m or [])
             klines_4h  = [] if isinstance(klines_4h,  Exception) else (klines_4h  or [])
             klines_1d  = [] if isinstance(klines_1d,  Exception) else (klines_1d  or [])
+            klines_1w  = [] if isinstance(klines_1w,  Exception) else (klines_1w  or [])
+            klines_1M  = [] if isinstance(klines_1M,  Exception) else (klines_1M  or [])
 
             rsi = self._calculate_rsi([c.close for c in klines_1h])
 
@@ -1496,11 +1575,13 @@ class BinanceFuturesClient:
                         klines_1h=klines_1h,
                         klines_4h=klines_4h,
                         klines_1d=klines_1d,
+                        klines_1w=klines_1w or None,
+                        klines_1M=klines_1M or None,
                     )
                     if ms_result.key_levels:
                         nearest = ms_result.key_levels[:3]
                         lvl_str = ", ".join(f"{lbl}={px:.4f}" for px, lbl in nearest)
-                        logger.debug(f"[MS] {symbol}: {lvl_str} | {ms_result.htf_structure} | {ms_result.zone_4h}")
+                        logger.debug(f"[MS] {symbol}: {lvl_str} | HTF={ms_result.htf_structure} | 4H={ms_result.zone_4h} | 1W={ms_result.zone_weekly} | conf_s={ms_result.confluence_short}")
                 except Exception as _e:
                     logger.debug(f"[MS] {symbol} error: {_e}")
 
@@ -1551,6 +1632,7 @@ class BinanceFuturesClient:
                 recent_liquidations_usd=recent_liquidations_usd,
                 liq_side=liq_side,
                 top_trader_long_short_ratio=top_trader_long_short_ratio,
+                oi_change_15m=oi_st.get("oi_15m", 0.0),
                 oi_change_30m=oi_st.get("oi_30m", 0.0),
                 oi_change_1h=oi_st.get("oi_1h", 0.0),
                 oi_change_4h=oi_st.get("oi_4h", 0.0),

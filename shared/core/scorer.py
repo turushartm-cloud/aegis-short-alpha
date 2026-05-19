@@ -1,5 +1,9 @@
 """
-Dual Scoring System: ShortScorer + LongScorer  v2.1
+Dual Scoring System: ShortScorer + LongScorer  v2.2
+
+ИЗМЕНЕНИЯ v2.2:
+  ✅ P4: _funding_extreme_bonus — экстремальные пороги фандинга (+10)
+  ✅ P1: orderbook_score param в calculate_score() для обоих скоров
 
 ИЗМЕНЕНИЯ v2.1:
   ✅ Новые паттерны добавлены в calculate_pattern_component:
@@ -12,6 +16,7 @@ Dual Scoring System: ShortScorer + LongScorer  v2.1
   ✅ atr_14_pct в скоре: штраф за чрезмерную волатильность
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from enum import Enum
@@ -56,6 +61,7 @@ class ScoreResult:
     grade:        str
     components:   List[ScoreComponent]
     reasons:      List[str]
+    funding_info: str = ""   # показывается в TG, не влияет на скор
     timestamp:    datetime = field(default_factory=datetime.utcnow)
 
     @property
@@ -96,6 +102,11 @@ LONG_PATTERN_STRENGTHS = {
     "TRAP_SHORT":               18,
     "REJECTION_LONG":           15,
     "ACCUMULATION":             22,
+    # P2: Flag / Pennant (78% точность — continuation паттерны)
+    "FLAG_LONG":                15,
+    "PENNANT_LONG":             12,
+    # CASCADE синтетический
+    "CASCADE_LONG":             18,
 }
 
 SHORT_PATTERN_STRENGTHS = {
@@ -112,6 +123,11 @@ SHORT_PATTERN_STRENGTHS = {
     "TRAP_LONG":                18,
     "REJECTION_SHORT":          15,
     "DISTRIBUTION":             22,
+    # P2: Flag / Pennant (78% точность — continuation паттерны)
+    "FLAG_SHORT":               15,
+    "PENNANT_SHORT":            12,
+    # CASCADE синтетический
+    "CASCADE_SHORT":            18,
 }
 
 
@@ -171,6 +187,26 @@ class BaseScorer:
             return -3, f"Высокая волатильность ATR={atr_pct:.1f}% -3"
         return 0, ""
 
+    def _funding_extreme_bonus(self, funding: float, direction: str) -> Tuple[int, str]:
+        """
+        P4: Бонус за экстремальный фандинг.
+        SHORT: очень высокий фандинг → лонги перегреты → +10
+        LONG:  очень отрицательный фандинг → шорты перегреты → +10
+        Пороги читаются из ENV с безопасными дефолтами.
+        """
+        try:
+            extreme_short = float(os.getenv("FUNDING_EXTREME_SHORT", "0.05"))
+            extreme_long  = float(os.getenv("FUNDING_EXTREME_LONG",  "-0.05"))
+            if direction == "short":
+                if funding >= extreme_short:
+                    return 10, f"🔥 Экстремальный фандинг {funding:.4f}% — long liquidation"
+            else:
+                if funding <= extreme_long:
+                    return 10, f"🔥 Экстремальный -фандинг {funding:.4f}% — short squeeze"
+        except Exception:
+            pass
+        return 0, ""
+
     def calculate_top_trader_component(
         self,
         top_trader_ratio: Optional[float],
@@ -196,7 +232,8 @@ class BaseScorer:
             elif top_trader_ratio <= 0.8: score, desc = 7,  f"Топ-трейдеры {top_trader_ratio:.2f} — шорт перевес"
             elif top_trader_ratio <= 1.0: score, desc = 4,  f"Топ-трейдеры {top_trader_ratio:.2f} — нейтраль"
             elif top_trader_ratio <= 1.3: score, desc = 2,  f"Топ-трейдеры {top_trader_ratio:.2f} — лёгкий лонг"
-            else:                          score, desc = 0,  f"Топ-трейдеры {top_trader_ratio:.2f} — в лонге (осторожно)"
+            elif top_trader_ratio <= 2.0: score, desc = 4,  f"🔥 Топ-трейдеры {top_trader_ratio:.2f} — перегружены лонгами (контр-сигнал SHORT)"
+            else:                          score, desc = 6,  f"🚨 Топ-трейдеры {top_trader_ratio:.2f} — экстремальный лонг-перегрев (сильный SHORT сигнал)"
         else:
             # Для LONG: топ-трейдеры в лонге = хороший знак
             if top_trader_ratio >= 1.7:   score, desc = 10, f"🐋 Топ-трейдеры {top_trader_ratio:.2f} — активно лонгуют"
@@ -206,6 +243,47 @@ class BaseScorer:
             else:                          score, desc = 0,  f"Топ-трейдеры {top_trader_ratio:.2f} — в шорте (осторожно)"
 
         return ScoreComponent("TopTrader", score, 10, desc, top_trader_ratio)
+
+    def calculate_htf_zone_component(
+        self, htf_structure: str, zone: str, direction: str
+    ) -> ScoreComponent:
+        """
+        Market Structure alignment: HTF trend + price zone.
+        Заменяет Funding в BASE_SCORER (max 13).
+
+        SHORT: BEARISH+PREMIUM = +13 (идеал), BULLISH+DISCOUNT = -12 (опасно)
+        LONG:  BULLISH+DISCOUNT = +13 (идеал), BEARISH+PREMIUM = -10 (опасно)
+        """
+        htf = (htf_structure or "").upper()
+        z   = (zone or "").upper()
+        score = 0
+        parts = []
+
+        if direction == "short":
+            if "BEARISH" in htf:    score += 8; parts.append(f"HTF BEARISH ✅ по тренду")
+            elif "RANGING" in htf:  score += 3; parts.append(f"HTF RANGING нейтраль")
+            elif "BULLISH" in htf:  score -= 4; parts.append(f"HTF BULLISH ⚠️ против тренда -4")
+            else:                   parts.append(f"HTF={htf_structure or 'неизвестно'}")
+            if "PREMIUM" in z:      score += 5; parts.append(f"Zone PREMIUM ✅ шорт из хаёв")
+            elif "DISCOUNT" in z:   score -= 2; parts.append(f"Zone DISCOUNT ⚠️ шорт из лоёв -2")
+            else:                   score += 1; parts.append(f"Zone {z or 'neutral'}")
+        else:  # long
+            if "BULLISH" in htf:    score += 8; parts.append(f"HTF BULLISH ✅ по тренду")
+            elif "RANGING" in htf:  score += 3; parts.append(f"HTF RANGING нейтраль")
+            elif "BEARISH" in htf:  score -= 6; parts.append(f"HTF BEARISH ⚠️ против тренда -6")
+            else:                   parts.append(f"HTF={htf_structure or 'неизвестно'}")
+            if "DISCOUNT" in z:     score += 5; parts.append(f"Zone DISCOUNT ✅ лонг из лоёв")
+            elif "PREMIUM" in z:    score -= 4; parts.append(f"Zone PREMIUM ⚠️ лонг из хаёв -4")
+            else:                   score += 1; parts.append(f"Zone {z or 'neutral'}")
+
+        score = max(score, -10)  # не более -10 штрафа
+        return ScoreComponent("HTF+Zone", score, 13, " | ".join(parts) or "Нет данных MS", None)
+
+    def _funding_info_str(self, current_funding: float, accumulated_4d: float) -> str:
+        """Строка для TG-уведомления — не влияет на скор."""
+        s = f"{'+'if current_funding>=0 else ''}{current_funding:.4f}%"
+        a = f"{'+'if accumulated_4d>=0 else ''}{accumulated_4d:.3f}%"
+        return f"Funding: {s} (acc {a})"
 
     def _taker_bonus(self, taker_ratio: Optional[float], direction: str) -> Tuple[int, str]:
         """
@@ -281,7 +359,7 @@ class ShortScorer(BaseScorer):
     def __init__(self, min_score: int = 58):  # ✅ FIX: 54→58 убрана dead zone 50-57
         super().__init__(min_score, Direction.SHORT)
 
-    def calculate_rsi_component(self, rsi_1h: float) -> ScoreComponent:
+    def calculate_rsi_component(self, rsi_1h: float, rsi_15m: float = None, rsi_30m: float = None, rsi_4h: float = None) -> ScoreComponent:
         # RSI — ВСПОМОГАТЕЛЬНЫЙ фактор для mean-reversion SHORT
         # Главное: Z-score + Volume. RSI лишь подтверждает или слегка штрафует.
         # Максимум 12 (было 20) — снизили вес относительно структурных сигналов
@@ -294,6 +372,16 @@ class ShortScorer(BaseScorer):
         elif rsi_1h >= 30: score, desc = 2,  f"RSI {rsi_1h:.1f} — Нижняя нейтраль"
         else:              score, desc = 1,  f"RSI {rsi_1h:.1f} — Перепродан (осторожнее)"
         # Не даём 0: RSI — не gate, лишь снижает вес при экстремальной перепроданности
+        # Multi-TF overbought confirmation for SHORT
+        mtf_bonus = 0
+        if rsi_15m is not None and rsi_30m is not None:
+            if rsi_15m > 72 and rsi_30m > 68:
+                mtf_bonus += 3; desc += f" | RSI15m={rsi_15m:.0f} RSI30m={rsi_30m:.0f} — перегрев везде"
+            elif rsi_15m > 68 and rsi_30m > 63:
+                mtf_bonus += 2; desc += f" | RSI15m={rsi_15m:.0f} подтверждает"
+        if rsi_4h is not None and rsi_4h > 65:
+            mtf_bonus += 2; desc += f" | RSI4H={rsi_4h:.0f}"
+        score = min(score + mtf_bonus, 12)
         return ScoreComponent("RSI", score, 12, desc, rsi_1h)
 
     def calculate_funding_component(self, current_funding: float,
@@ -324,20 +412,35 @@ class ShortScorer(BaseScorer):
         else:                  score, desc = 0,  f"{long_ratio:.0f}% лонгов — толпа в шортах"
         return ScoreComponent("L/S Ratio", score, 15, desc, long_ratio)
 
-    def calculate_oi_component(self, oi_change_4d: float, price_change_4d: float) -> ScoreComponent:
+    def calculate_oi_component(self, oi_15m: float = 0.0, oi_30m: float = 0.0,
+                               oi_1h: float = 0.0, oi_4h: float = 0.0,
+                               price_change_24h: float = 0.0) -> ScoreComponent:
         score, reasons = 0, []
-        if oi_change_4d >= 25:    score += 8;  reasons.append(f"OI +{oi_change_4d:.1f}% — перегрев")
-        elif oi_change_4d >= 15:  score += 6;  reasons.append(f"OI +{oi_change_4d:.1f}% — рост")
-        elif oi_change_4d >= 5:   score += 3;  reasons.append(f"OI +{oi_change_4d:.1f}%")
-        elif oi_change_4d < -10:  score += 5;  reasons.append(f"OI {oi_change_4d:.1f}% — массовое закрытие")
-        if price_change_4d >= 15: score += 7;  reasons.append(f"Цена +{price_change_4d:.1f}% за 4д — перегрев")
-        elif price_change_4d >= 8: score += 5; reasons.append(f"Цена +{price_change_4d:.1f}% за 4д")
-        elif price_change_4d >= 3: score += 2
-        elif price_change_4d < -10: score += 3; reasons.append(f"Обвал {price_change_4d:.1f}%")
-        return ScoreComponent("OI", min(score, 15), 15, " | ".join(reasons) or "Нейтральный OI", oi_change_4d)
+        # OI 15m — ультрабыстрый сигнал (прямо сейчас)
+        if oi_15m < -2:   score += 3; reasons.append(f"OI 15m {oi_15m:.1f}% — ликвидации сейчас")
+        elif oi_15m < -1: score += 1; reasons.append(f"OI 15m {oi_15m:.1f}%")
+        elif oi_15m > 3:  score += 2; reasons.append(f"OI 15m +{oi_15m:.1f}% — лонги открываются (топливо)")
+        elif oi_15m > 1:  score += 1; reasons.append(f"OI 15m +{oi_15m:.1f}%")
+        # OI 30m — быстрый сигнал
+        if oi_30m < -2:   score += 3; reasons.append(f"OI 30m {oi_30m:.1f}% — позиции рушатся")
+        elif oi_30m < -1: score += 1; reasons.append(f"OI 30m {oi_30m:.1f}%")
+        elif oi_30m > 3:  score -= 1; reasons.append(f"OI 30m +{oi_30m:.1f}% — вход лонгов")
+        # OI 1H — основной сигнал
+        if oi_1h > 3:    score += 5; reasons.append(f"OI 1H +{oi_1h:.1f}% — позиции открываются")
+        elif oi_1h > 1:  score += 2; reasons.append(f"OI 1H +{oi_1h:.1f}%")
+        elif oi_1h < -3: score -= 2; reasons.append(f"OI 1H {oi_1h:.1f}% — закрытие (против шорта)")
+        # OI 4H — фоновый тренд
+        if oi_4h > 8:    score += 3; reasons.append(f"OI 4H +{oi_4h:.1f}% — накопление позиций")
+        elif oi_4h > 3:  score += 1; reasons.append(f"OI 4H +{oi_4h:.1f}%")
+        # Цена 24H — контекст перегрева
+        if price_change_24h >= 15: score += 4; reasons.append(f"Цена +{price_change_24h:.1f}% за 24H — перегрев")
+        elif price_change_24h >= 8: score += 2; reasons.append(f"Цена +{price_change_24h:.1f}% за 24H")
+        elif price_change_24h < -10: score += 2; reasons.append(f"Обвал {price_change_24h:.1f}% за 24H")
+        return ScoreComponent("OI", min(score, 15), 15, " | ".join(reasons) or "Нейтральный OI", oi_15m)
 
     def calculate_delta_component(self, hourly_deltas: List[float],
-                                   price_trend: str) -> ScoreComponent:
+                                   price_trend: str,
+                                   delta_30m: Optional[List[float]] = None) -> ScoreComponent:
         score, reasons = 0, []
         if not hourly_deltas:
             return ScoreComponent("Delta", 0, 20, "Нет данных дельты", 0)
@@ -351,6 +454,14 @@ class ShortScorer(BaseScorer):
             score += 8; reasons.append("Слабая медвежья дивергенция")
         elif price_trend == "sideways" and neg_hours >= 4:
             score += 6; reasons.append("Распределение в боковике")
+        # 30M быстрая дельта — агрессия продавцов прямо сейчас
+        if delta_30m and len(delta_30m) >= 2:
+            recent = delta_30m[-4:]  # последние 2 часа по 30m
+            neg_30m = sum(1 for d in recent if d < 0)
+            if neg_30m >= 3:
+                score += 5; reasons.append(f"30m дельта: {neg_30m}/4 негат. — продавцы сейчас")
+            elif neg_30m >= 2:
+                score += 2; reasons.append(f"30m дельта: {neg_30m}/4 негат.")
         return ScoreComponent("Delta", min(score, 20), 20, " | ".join(reasons) or "Нейтральная дельта",
                               sum(hourly_deltas))
 
@@ -368,21 +479,32 @@ class ShortScorer(BaseScorer):
         return ScoreComponent("Patterns", total, 30, desc), names
 
     def calculate_score(self, rsi_1h, funding_current, funding_accumulated,
-                        long_ratio, oi_change_4d, price_change_4d,
-                        hourly_deltas, price_trend, patterns,
+                        long_ratio, price_change_24h: float = 0.0,
+                        hourly_deltas = None, price_trend = "sideways", patterns = None,
                         volume_spike_ratio: float = 1.0,
                         atr_14_pct: float = 0.5,
                         top_trader_ratio: Optional[float] = None,
-                        taker_ratio: Optional[float] = None) -> ScoreResult:
+                        taker_ratio: Optional[float] = None,
+                        rsi_15m: float = None, rsi_30m: float = None, rsi_4h: float = None,
+                        oi_15m: float = 0.0, oi_30m: float = 0.0,
+                        oi_1h: float = 0.0, oi_4h: float = 0.0,
+                        htf_structure: str = "", zone: str = "",
+                        delta_30m: Optional[List[float]] = None,
+                        orderbook_score: int = 0,
+                        liq_analysis=None) -> ScoreResult:
+        if hourly_deltas is None:
+            hourly_deltas = []
+        if patterns is None:
+            patterns = []
         components = []
-        components.append(self.calculate_rsi_component(rsi_1h))
-        components.append(self.calculate_funding_component(funding_current, funding_accumulated))
+        components.append(self.calculate_rsi_component(rsi_1h, rsi_15m, rsi_30m, rsi_4h))
+        # 🆕 HTF+Zone вместо Funding (в BASE_SCORER)
+        components.append(self.calculate_htf_zone_component(htf_structure, zone, "short"))
         components.append(self.calculate_ratio_component(long_ratio))
-        components.append(self.calculate_oi_component(oi_change_4d, price_change_4d))
-        components.append(self.calculate_delta_component(hourly_deltas, price_trend))
+        components.append(self.calculate_oi_component(oi_15m, oi_30m, oi_1h, oi_4h, price_change_24h))
+        components.append(self.calculate_delta_component(hourly_deltas, price_trend, delta_30m=delta_30m))
         pat_comp, pat_names = self.calculate_pattern_component(patterns)
         components.append(pat_comp)
-        # 🆕 Top Trader component
         components.append(self.calculate_top_trader_component(top_trader_ratio, "short"))
         total = sum(c.score for c in components)
         max_p = sum(c.max_score for c in components)
@@ -390,19 +512,28 @@ class ShortScorer(BaseScorer):
         strong = sum(1 for c in components if c.score >= c.max_score * 0.6)
         if strong >= 4: total += 5
         elif strong >= 3: total += 3
-        # Volume spike bonus
         vs_bonus, vs_reason = self._volume_spike_bonus(volume_spike_ratio)
         total += vs_bonus
-        # ATR penalty
         atr_pen, atr_reason = self._atr_penalty(atr_14_pct)
         total += atr_pen
-        # 🆕 Taker flow bonus
         tk_bonus, tk_reason = self._taker_bonus(taker_ratio, "short")
         total += tk_bonus
+        # P4: Funding extreme bonus
+        fe_bonus, fe_reason = self._funding_extreme_bonus(funding_current, "short")
+        total += fe_bonus
+        # P1: Order book score
+        try:
+            total += int(orderbook_score)
+        except Exception:
+            pass
+        # S10: Liquidation zone магниты
+        liq_comp = self.calculate_liquidation_component(liq_analysis)
+        liq_bonus = liq_comp.score
+        total += liq_bonus
         total = min(max(total, 0), 100)
         reasons = []
-        if components[0].score >= 15: reasons.append(f"RSI перекуплен ({rsi_1h:.1f})")
-        if components[1].score >= 8:  reasons.append("Лонги платят фандинг")
+        if components[0].score >= 8:  reasons.append(f"RSI перекуплен ({rsi_1h:.1f})")
+        if components[1].score >= 8:  reasons.append(components[1].description)
         if components[2].score >= 10: reasons.append(f"Толпа в лонгах ({long_ratio:.0f}%)")
         if components[3].score >= 10: reasons.append("Лонги перегружены (OI растёт)")
         if components[4].score >= 10: reasons.append("Медвежья дивергенция")
@@ -411,12 +542,18 @@ class ShortScorer(BaseScorer):
         if vs_reason: reasons.append(vs_reason)
         if atr_reason: reasons.append(atr_reason)
         if tk_reason: reasons.append(tk_reason)
+        if fe_reason: reasons.append(fe_reason)
+        if orderbook_score >= 6: reasons.append(f"Стакан подтверждает short")
+        if liq_bonus != 0 and liq_comp.description: reasons.append(liq_comp.description)
+        # Funding — только для уведомления, не в скоре
+        f_info = self._funding_info_str(funding_current, funding_accumulated)
         return ScoreResult(
             total_score=total, max_possible=max_p, direction=Direction.SHORT,
             is_valid=total >= self.min_score,
             confidence=self.determine_confidence(total),
             grade=self.calculate_grade(total),
             components=components, reasons=reasons,
+            funding_info=f_info,
         )
 
 
@@ -425,7 +562,7 @@ class LongScorer(BaseScorer):
     def __init__(self, min_score: int = 55):  # Ниже порог для лонгов
         super().__init__(min_score, Direction.LONG)
 
-    def calculate_rsi_component(self, rsi_1h: float, price_change_1h: float = 0.0) -> ScoreComponent:
+    def calculate_rsi_component(self, rsi_1h: float, price_change_1h: float = 0.0, rsi_15m: float = None, rsi_30m: float = None, rsi_4h: float = None) -> ScoreComponent:
         # RSI — ВСПОМОГАТЕЛЬНЫЙ фактор. Не блокирует при трендовом движении.
         is_momentum = price_change_1h > 3.0  # цена +3%/час = явный тренд вверх
         if rsi_1h <= 20:   score, desc = 20, f"RSI {rsi_1h:.1f} — Экстремальная перепроданность"
@@ -440,6 +577,24 @@ class LongScorer(BaseScorer):
         elif rsi_1h <= 75: score, desc = (5 if is_momentum else 1), f"RSI {rsi_1h:.1f} — {'MOMENTUM тренд' if is_momentum else 'Высокий RSI'}"
         elif rsi_1h <= 85: score, desc = (6 if is_momentum else 0), f"RSI {rsi_1h:.1f} — {'Сильный MOMENTUM — тренд продолжается' if is_momentum else 'Перекупленность'}"
         else:              score, desc = (4 if is_momentum else 0), f"RSI {rsi_1h:.1f} — {'Экстремальный MOMENTUM' if is_momentum else 'Перекупленность крит.'}"
+        # Multi-TF oversold confirmation for LONG — разворот начался прямо сейчас?
+        mtf_bonus = 0
+        mtf_parts = []
+        if rsi_15m is not None and rsi_30m is not None:
+            if rsi_15m < 25 and rsi_30m < 30:
+                mtf_bonus += 4; mtf_parts.append(f"RSI15m={rsi_15m:.0f} RSI30m={rsi_30m:.0f} — дамп сейчас")
+            elif rsi_15m < 30 and rsi_30m < 35:
+                mtf_bonus += 2; mtf_parts.append(f"RSI15m={rsi_15m:.0f} перепродан")
+            # 15m RSI выше 30m = начало отскока
+            if rsi_15m > rsi_30m and rsi_30m < 35 and rsi_15m > 30:
+                mtf_bonus += 3; mtf_parts.append(f"RSI15m({rsi_15m:.0f})>30m({rsi_30m:.0f}) — отскок")
+        elif rsi_15m is not None and rsi_15m < 30:
+            mtf_bonus += 2
+        if rsi_4h is not None and rsi_4h < 35:
+            mtf_bonus += 2; mtf_parts.append(f"RSI4H={rsi_4h:.0f} тоже перепродан")
+        score = min(score + mtf_bonus, 20)
+        if mtf_parts:
+            desc += " | " + " | ".join(mtf_parts)
         return ScoreComponent("RSI", score, 20, desc, rsi_1h)
 
     def calculate_funding_component(self, current_funding: float,
@@ -471,22 +626,38 @@ class LongScorer(BaseScorer):
         else:                   score, desc = 0,  f"Толпа в лонгах — плохо для лонга"
         return ScoreComponent("L/S Ratio", score, 15, desc, long_ratio)
 
-    def calculate_oi_component(self, oi_change_4d: float, price_change_4d: float) -> ScoreComponent:
+    def calculate_oi_component(self, oi_15m: float = 0.0, oi_30m: float = 0.0,
+                               oi_1h: float = 0.0, oi_4h: float = 0.0,
+                               price_change_24h: float = 0.0) -> ScoreComponent:
         score, reasons = 0, []
-        if oi_change_4d >= 15:   score += 5;  reasons.append(f"OI +{oi_change_4d:.1f}% — накопление")
-        elif oi_change_4d >= 5:  score += 3;  reasons.append(f"OI +{oi_change_4d:.1f}%")
-        elif oi_change_4d < -15: score += 8;  reasons.append(f"OI {oi_change_4d:.1f}% — массовое закрытие шортов")
-        elif oi_change_4d < -5:  score += 5;  reasons.append(f"OI {oi_change_4d:.1f}% — шорты выходят")
-        if price_change_4d <= -15: score += 7; reasons.append(f"Цена {price_change_4d:.1f}% за 4д — перепроданность")
-        elif price_change_4d <= -8: score += 5; reasons.append(f"Цена {price_change_4d:.1f}% за 4д")
-        elif price_change_4d <= -3: score += 2
-        elif price_change_4d >= 10: score += 0; reasons.append(f"Цена +{price_change_4d:.1f}% (перегрев)")
-        return ScoreComponent("OI", min(score, 15), 15, " | ".join(reasons) or "Нейтральный OI", oi_change_4d)
+        # OI 15m — ультрабыстрый (шорты закрываются прямо сейчас = лонг импульс)
+        if oi_15m < -2:   score += 3; reasons.append(f"OI 15m {oi_15m:.1f}% — шорты сдаются (сквиз)")
+        elif oi_15m < -1: score += 1; reasons.append(f"OI 15m {oi_15m:.1f}%")
+        elif oi_15m > 3:  score += 2; reasons.append(f"OI 15m +{oi_15m:.1f}% — лонги входят быстро")
+        elif oi_15m > 1:  score += 1; reasons.append(f"OI 15m +{oi_15m:.1f}%")
+        # OI 30m — быстрый сигнал
+        if oi_30m > 2:    score += 3; reasons.append(f"OI 30m +{oi_30m:.1f}% — быстрый вход")
+        elif oi_30m > 1:  score += 1; reasons.append(f"OI 30m +{oi_30m:.1f}%")
+        elif oi_30m < -3: score += 2; reasons.append(f"OI 30m {oi_30m:.1f}% — шорты быстро закрываются")
+        # OI 1H — главный сигнал раннего входа
+        if oi_1h > 3:    score += 5; reasons.append(f"OI 1H +{oi_1h:.1f}% — лонги входят сейчас")
+        elif oi_1h > 1:  score += 3; reasons.append(f"OI 1H +{oi_1h:.1f}%")
+        elif oi_1h < -3: score += 4; reasons.append(f"OI 1H {oi_1h:.1f}% — шорты закрываются (сквиз)")
+        elif oi_1h < -1: score += 2; reasons.append(f"OI 1H {oi_1h:.1f}% — шорты выходят")
+        # OI 4H — фоновый тренд
+        if oi_4h > 5:    score += 3; reasons.append(f"OI 4H +{oi_4h:.1f}% — накопление")
+        elif oi_4h < -5: score += 2; reasons.append(f"OI 4H {oi_4h:.1f}% — разгрузка позиций")
+        # Цена 24H — контекст перепроданности
+        if price_change_24h <= -15: score += 4; reasons.append(f"Цена {price_change_24h:.1f}% — перепроданность")
+        elif price_change_24h <= -8: score += 2; reasons.append(f"Цена {price_change_24h:.1f}% за 24H")
+        elif price_change_24h >= 10: score -= 2; reasons.append(f"Цена +{price_change_24h:.1f}% (перегрев)")
+        return ScoreComponent("OI", min(score, 15), 15, " | ".join(reasons) or "Нейтральный OI", oi_15m)
 
     def calculate_delta_component(self, hourly_deltas: List[float],
                                    price_trend: str,
                                    btc_change_1h: float = 0.0,
-                                   coin_change_1h: float = 0.0) -> ScoreComponent:
+                                   coin_change_1h: float = 0.0,
+                                   delta_30m: Optional[List[float]] = None) -> ScoreComponent:
         score, reasons = 0, []
         if not hourly_deltas:
             return ScoreComponent("Delta", 0, 20, "Нет данных дельты", 0)
@@ -502,13 +673,20 @@ class LongScorer(BaseScorer):
         elif price_trend == "sideways" and pos_hours >= 4:
             score += 6; reasons.append("Накопление в боковике")
         # ✅ FIX #5: Относительная слабость vs BTC — монета падает сильнее BTC при общем росте
-        # Признак накопления: дельта бычья, но монета отстаёт от BTC (возможна ротация)
         elif price_trend == "rising" and btc_change_1h > 0 and pos_hours >= 3:
             relative_weakness = btc_change_1h - coin_change_1h
             if relative_weakness > 1.0:
                 score += 10; reasons.append(f"Относит. слабость vs BTC (+{btc_change_1h:.1f}% vs +{coin_change_1h:.1f}%) — накопление при росте рынка")
             elif relative_weakness > 0.5:
                 score += 6; reasons.append(f"Умеренная слабость vs BTC — дельта растёт")
+        # 30M быстрая дельта — покупатели агрессивны прямо сейчас?
+        if delta_30m and len(delta_30m) >= 2:
+            recent = delta_30m[-4:]  # последние 2 часа по 30m
+            pos_30m = sum(1 for d in recent if d > 0)
+            if pos_30m >= 3:
+                score += 5; reasons.append(f"30m дельта: {pos_30m}/4 позит. — покупатели сейчас")
+            elif pos_30m >= 2:
+                score += 2; reasons.append(f"30m дельта: {pos_30m}/4 позит.")
         return ScoreComponent("Delta", min(score, 20), 20, " | ".join(reasons) or "Нейтральная дельта",
                               sum(hourly_deltas))
 
@@ -533,41 +711,74 @@ class LongScorer(BaseScorer):
         return ScoreComponent("Patterns", total, 30, desc), names
 
     def calculate_score(self, rsi_1h, funding_current, funding_accumulated,
-                        long_ratio, oi_change_4d, price_change_4d,
-                        hourly_deltas, price_trend, patterns,
+                        long_ratio, price_change_24h: float = 0.0,
+                        hourly_deltas = None, price_trend = "sideways", patterns = None,
                         volume_spike_ratio: float = 1.0,
                         atr_14_pct: float = 0.5,
                         price_change_1h: float = 0.0,
                         top_trader_ratio: Optional[float] = None,
                         taker_ratio: Optional[float] = None,
-                        btc_change_1h: float = 0.0) -> ScoreResult:
+                        btc_change_1h: float = 0.0,
+                        rsi_15m: float = None, rsi_30m: float = None, rsi_4h: float = None,
+                        oi_15m: float = 0.0, oi_30m: float = 0.0,
+                        oi_1h: float = 0.0, oi_4h: float = 0.0,
+                        htf_structure: str = "", zone: str = "",
+                        momentum_mode: bool = False,
+                        delta_30m: Optional[List[float]] = None,
+                        orderbook_score: int = 0,
+                        liq_analysis=None) -> ScoreResult:
+        if hourly_deltas is None:
+            hourly_deltas = []
+        if patterns is None:
+            patterns = []
         components = []
-        components.append(self.calculate_rsi_component(rsi_1h, price_change_1h))
-        components.append(self.calculate_funding_component(funding_current, funding_accumulated))
+        components.append(self.calculate_rsi_component(rsi_1h, price_change_1h, rsi_15m, rsi_30m, rsi_4h))
+        # 🆕 HTF+Zone вместо Funding (в BASE_SCORER)
+        components.append(self.calculate_htf_zone_component(htf_structure, zone, "long"))
         components.append(self.calculate_ratio_component(long_ratio))
-        components.append(self.calculate_oi_component(oi_change_4d, price_change_4d))
-        # ✅ FIX #5: передаём btc_change_1h для определения относительной слабости
-        components.append(self.calculate_delta_component(hourly_deltas, price_trend, btc_change_1h=btc_change_1h, coin_change_1h=price_change_1h))
+        components.append(self.calculate_oi_component(oi_15m, oi_30m, oi_1h, oi_4h, price_change_24h))
+        components.append(self.calculate_delta_component(hourly_deltas, price_trend, btc_change_1h=btc_change_1h, coin_change_1h=price_change_1h, delta_30m=delta_30m))
         pat_comp, pat_names = self.calculate_pattern_component(patterns)
         components.append(pat_comp)
-        # 🆕 Top Trader component
         components.append(self.calculate_top_trader_component(top_trader_ratio, "long"))
         total = sum(c.score for c in components)
         max_p = sum(c.max_score for c in components)
         strong = sum(1 for c in components if c.score >= c.max_score * 0.6)
         if strong >= 4: total += 5
         elif strong >= 3: total += 3
+        # Momentum Mode — для breakout/continuation сигналов
+        if momentum_mode:
+            m_bonus = 0
+            if 55 <= rsi_1h <= 72:       m_bonus += 10
+            if oi_1h > 2:                m_bonus += 8
+            elif oi_1h > 1:              m_bonus += 4
+            if volume_spike_ratio > 3:   m_bonus += 6
+            elif volume_spike_ratio > 2: m_bonus += 3
+            if price_change_1h > 4:      m_bonus += 4
+            elif price_change_1h > 2:    m_bonus += 2
+            total += m_bonus
         vs_bonus, vs_reason = self._volume_spike_bonus(volume_spike_ratio)
         total += vs_bonus
         atr_pen, atr_reason = self._atr_penalty(atr_14_pct)
         total += atr_pen
-        # 🆕 Taker flow bonus
         tk_bonus, tk_reason = self._taker_bonus(taker_ratio, "long")
         total += tk_bonus
+        # P4: Funding extreme bonus
+        fe_bonus, fe_reason = self._funding_extreme_bonus(funding_current, "long")
+        total += fe_bonus
+        # P1: Order book score
+        try:
+            total += int(orderbook_score)
+        except Exception:
+            pass
+        # S10: Liquidation zone магниты
+        liq_comp = self.calculate_liquidation_component(liq_analysis)
+        liq_bonus = liq_comp.score
+        total += liq_bonus
         total = min(max(total, 0), 100)
         reasons = []
         if components[0].score >= 15: reasons.append(f"RSI перепродан ({rsi_1h:.1f})")
-        if components[1].score >= 8:  reasons.append("Шорты платят фандинг")
+        if components[1].score >= 8:  reasons.append(components[1].description)
         if components[2].score >= 10: reasons.append(f"Толпа в шортах ({100-long_ratio:.0f}%)")
         if components[3].score >= 10: reasons.append("Шорты закрываются (OI падает)")
         if components[4].score >= 10: reasons.append("Бычья дивергенция")
@@ -576,12 +787,18 @@ class LongScorer(BaseScorer):
         if vs_reason: reasons.append(vs_reason)
         if atr_reason: reasons.append(atr_reason)
         if tk_reason: reasons.append(tk_reason)
+        if fe_reason: reasons.append(fe_reason)
+        if orderbook_score >= 6: reasons.append(f"Стакан подтверждает long")
+        if liq_bonus != 0 and liq_comp.description: reasons.append(liq_comp.description)
+        # Funding — только для уведомления, не в скоре
+        f_info = self._funding_info_str(funding_current, funding_accumulated)
         return ScoreResult(
             total_score=total, max_possible=max_p, direction=Direction.LONG,
             is_valid=total >= self.min_score,
             confidence=self.determine_confidence(total),
             grade=self.calculate_grade(total),
             components=components, reasons=reasons,
+            funding_info=f_info,
         )
 
 

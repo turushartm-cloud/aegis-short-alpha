@@ -21,16 +21,46 @@ import re
 import asyncio
 import sys
 import logging
+import gc
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
-from decimal import Decimal
 
-# Настройка логирования — INFO уровень для видимости fallback логов
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Настройка логирования — однократная конфигурация с dedup-фильтром
+import time as _time
+
+class _DedupLogFilter(logging.Filter):
+    """Подавляет одинаковые log-строки в пределах 5-секундного окна."""
+    def __init__(self, capacity: int = 300):
+        super().__init__()
+        self._seen: dict = {}
+        self._cap = capacity
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        key = f"{record.levelno}:{record.name}:{record.getMessage()[:120]}"
+        now = _time.monotonic()
+        last = self._seen.get(key, 0.0)
+        if now - last < 5.0:
+            return False
+        self._seen[key] = now
+        if len(self._seen) > self._cap:
+            oldest = sorted(self._seen, key=self._seen.get)[:60]
+            for k in oldest:
+                del self._seen[k]
+        return True
+
+if not logging.root.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+_dedup_filter = _DedupLogFilter()
+logging.getLogger("aegis.signal_engine").addFilter(_dedup_filter)
+logging.getLogger("aegis").addFilter(_dedup_filter)
+# B6 FIX: расширяем dedup на PatternML, orderbook и root (подавляем ×12 при hot-reload)
+logging.getLogger("aegis.pattern_ml").addFilter(_dedup_filter)
+logging.getLogger("core.orderbook_scorer").addFilter(_dedup_filter)
+logging.root.addFilter(_dedup_filter)  # ← ловит всё, включая не-aegis логгеры
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -87,10 +117,14 @@ from aegis.signal_engine import AegisSignalEngine, SignalStrength
 from aegis.smart_dca import SmartDCAEngine, GridConfig, GridType
 from aegis.risk_manager import AegisRiskManager, RiskLimits
 from aegis.performance_tracker import PerformanceTracker, TradeRecord
+from aegis.systemic_pump_guard import SystemicPumpGuard
 from detectors.pump_detector import PumpDetector, ZScoreConfig
 from detectors.oi_analyzer import OIAnalyzer, FundingConfig
 from detectors.liquidation_mapper import LiquidationMapper
 from detectors.delta_analyzer import DeltaAnalyzer
+# Coinglass API отключён: постоянные HTTP 500 → liq_detector=None
+from core.kill_zone_filter import KillZoneFilter  # #19
+from core.btc_momentum_guard import BTCMomentumGuard
 
 
 # ============================================================================
@@ -106,9 +140,9 @@ class Config:
     # ── Paid tier limits (vs free 50/300/10) ──
     MAX_PAIRS     = int(os.getenv("MAX_PAIRS", "150"))
     SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "180"))
-    MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "12"))
+    MAX_POSITIONS = int(os.getenv("MAX_SHORT_POSITIONS", os.getenv("MAX_POSITIONS", "12")))
 
-    MIN_SCORE     = int(os.getenv("MIN_SHORT_SCORE", "55"))  # Снижено с 60: новая blend-формула (70% base) даёт ~55-65 при base=60
+    MIN_SCORE     = int(os.getenv("MIN_SHORT_SCORE", "65"))  # FIX: default выровнен с render.yaml (было 55 — расхождение 10 пунктов)
     SL_BUFFER     = float(os.getenv("SHORT_SL_BUFFER", "2.0"))  # ✅ FIX v17: 2.5→2.0% для RR≥1.5
     LEVERAGE      = os.getenv("SHORT_LEVERAGE", "5-30")
 
@@ -144,8 +178,22 @@ class Config:
     BINGX_DEMO      = os.getenv("BINGX_DEMO_MODE", "true").strip().lower() not in ("false", "0", "no", "real")
 
     # Watchlist
-    MIN_VOLUME_USDT = int(os.getenv("MIN_VOLUME_USDT", "300000"))
-    MAX_WATCHLIST   = int(os.getenv("MAX_WATCHLIST", "150"))
+    MIN_VOLUME_USDT     = int(os.getenv("MIN_VOLUME_USDT", "200000"))    # ✅ v2.1: 300K→200K
+    MAX_WATCHLIST       = int(os.getenv("MAX_WATCHLIST", "200"))          # ✅ v2.1: 150→200
+    WATCHLIST_REFRESH_H = float(os.getenv("WATCHLIST_REFRESH_H", "2.0")) # ✅ v2.1: обновление каждые 2ч
+
+    # ATR-dynamic SL (M1)
+    USE_ATR_SL  = os.getenv("USE_ATR_SL", "true").lower() == "true"
+    ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.5"))
+    ATR_SL_MIN  = float(os.getenv("ATR_SL_MIN_PCT", "1.0"))
+    ATR_SL_MAX  = float(os.getenv("ATR_SL_MAX_PCT", "4.0"))
+
+    # ✅ FIX: AEGIS_SHORT_MIN_SCORE — реальный порог Aegis engine (аналог LONG бота)
+    AEGIS_MIN_SCORE      = int(os.getenv("AEGIS_SHORT_MIN_SCORE", "60"))  # FIX: default выровнен с render.yaml (было 55)
+    # ✅ FIX: Adaptive threshold ceiling — max +N от MIN_SHORT_BASE_SCORE
+    ADAPTIVE_MAX_BOOST   = int(os.getenv("ADAPTIVE_MAX_BOOST", "3"))
+    # ✅ FIX: MOMENTUM SHORT порог (аналог LONG бота)
+    MOMENTUM_SCORE_THRESHOLD = int(os.getenv("MOMENTUM_SCORE_THRESHOLD", "58"))
 
     # ✅ Постоянный блэклист — символы которые всегда пропускаем
     # Формат ENV: SYMBOL_BLACKLIST=GIGAUSDT,LUNAUSDT,我踏马来了USDT
@@ -157,6 +205,13 @@ class Config:
     MAX_DAILY_TRADES  = int(os.getenv("MAX_DAILY_TRADES_SHORT", "10"))  # v3.0
     SIGNAL_TTL_HOURS = 24
     TRAIL_ACTIVATION = float(os.getenv("SHORT_TRAIL_ACTIVATION", "0.010"))
+
+    # P4: Funding extreme thresholds (informational — scorer reads ENV directly)
+    FUNDING_EXTREME_LONG  = float(os.getenv("FUNDING_EXTREME_LONG",  "-0.05"))
+    FUNDING_EXTREME_SHORT = float(os.getenv("FUNDING_EXTREME_SHORT",  "0.05"))
+
+    # P1: Order book
+    ENABLE_ORDERBOOK = os.getenv("ENABLE_ORDERBOOK_SCORER", "true").lower() == "true"
 
 
 # ============================================================================
@@ -191,6 +246,8 @@ class BotState:
         self.dca_engine:          Optional[SmartDCAEngine]        = None
         self.risk_manager:        Optional[AegisRiskManager]      = None
         self.performance_tracker: Optional[PerformanceTracker]    = None
+        self.pump_guard:          SystemicPumpGuard               = SystemicPumpGuard()
+        self.btc_momentum_guard:  BTCMomentumGuard                = BTCMomentumGuard()
 
         # Detectors
         self.pump_detector:   Optional[PumpDetector]       = None
@@ -201,7 +258,17 @@ class BotState:
 
         # Metrics
         self.coinglass        = None
+        self.liq_detector:    Optional[Any] = None
         self.fear_greed_index: Optional[int] = None   # 🆕 0-100, None = не загружен
+        # Signals DB + Trade Analytics
+        self.signals_db        = None
+        self._signal_db_map: dict = {}
+        self.trade_analytics   = None
+        # Signal Queue + Trade Manager
+        self.signal_queue      = None
+        self.trade_manager     = None
+        # A5: OHLCV scan-cycle cache
+        self.ohlcv_cache       = None
 
 
 state = BotState()
@@ -306,7 +373,7 @@ async def lifespan(app: FastAPI):
     state.scorer           = get_short_scorer(_short_base_min)
     print(
         f"📐 Score thresholds: BASE_SCORER={_short_base_min} | "
-        f"AEGIS_ENGINE={Config.MIN_SCORE} | FINAL_FILTER={Config.MIN_SCORE}"
+        f"AEGIS_ENGINE={Config.AEGIS_MIN_SCORE} | FINAL_FILTER={Config.MIN_SCORE}"
     )
     state.pattern_detector = ShortPatternDetector()
     
@@ -330,14 +397,18 @@ async def lifespan(app: FastAPI):
 
     state.liq_mapper     = LiquidationMapper() if Config.ENABLE_LIQ_MAPPER else None
     state.delta_analyzer = DeltaAnalyzer()     if Config.ENABLE_DELTA else None
+    state.coinglass      = None   # Coinglass API отключён (HTTP 500)
+    state.liq_detector   = None  # LiquidationZoneDetector требует Coinglass
 
     # ── Aegis Signal Engine ──
+    from core.pre_pump_detector import get_pre_pump_detector
     state.signal_engine = AegisSignalEngine(
         pump_detector=state.pump_detector,
         oi_analyzer=state.oi_analyzer,
         liq_mapper=state.liq_mapper,
         delta_analyzer=state.delta_analyzer,
-        min_score=Config.MIN_SCORE,
+        pre_pump_detector=get_pre_pump_detector(),
+        min_score=Config.AEGIS_MIN_SCORE,
     ) if Config.ENABLE_AEGIS_ENGINE else None
 
     # ── Smart DCA ──
@@ -364,6 +435,28 @@ async def lifespan(app: FastAPI):
 
     # ── Performance Tracker ──
     state.performance_tracker = PerformanceTracker(redis_client=state.redis)
+
+    # ── Signals DB + Trade Analytics (подключение PLAN2 файлов) ──
+    try:
+        from database.signals_db import get_signals_db
+        from database.trade_analytics import TradeAnalytics
+        _db_path = os.getenv("SIGNALS_DB_PATH", "/opt/render/project/signals_short.db")
+        state.signals_db      = get_signals_db(db_path=_db_path)
+        state.trade_analytics = TradeAnalytics(redis_client=state.redis, bot_type="short")
+        print("✅ SignalsDB + TradeAnalytics: подключены")
+    except Exception as _e:
+        print(f"⚠️ SignalsDB init error: {_e}")
+
+    try:
+        from core.signal_queue import get_signal_queue
+        from execution.trade_manager import get_trade_manager
+        from core.ohlcv_cache import get_ohlcv_cache  # A5
+        state.signal_queue  = get_signal_queue()
+        state.trade_manager = get_trade_manager()
+        state.ohlcv_cache   = get_ohlcv_cache(Config.SCAN_INTERVAL)
+        print("✅ SignalQueue + TradeManager + OHLCVCache: инициализированы")
+    except Exception as _e:
+        print(f"⚠️ SignalQueue/TradeManager init: {_e}")
 
     print(f"✅ Aegis Engine: {'ON' if state.signal_engine else 'OFF'} | "
           f"DCA: {'ON' if state.dca_engine else 'OFF'} | "
@@ -439,10 +532,85 @@ async def lifespan(app: FastAPI):
     state.last_scan  = datetime.utcnow()
 
     # ── Position Tracker ──
+    def _on_trade_closed(record: dict):
+        _sym      = record.get("symbol", "")
+        _pnl_pct  = float(record.get("pnl_pct", 0))
+        _capital  = float(os.getenv("ACCOUNT_CAPITAL_USD", "1000"))
+        _pnl_usd  = _pnl_pct * _capital / 100
+
+        # performance_tracker
+        if state.performance_tracker:
+            try:
+                from aegis.performance_tracker import TradeRecord
+                state.performance_tracker.record_trade(TradeRecord(
+                    symbol=_sym,
+                    direction=record.get("direction", "short"),
+                    entry_price=float(record.get("entry_price", 0)),
+                    exit_price=float(record.get("close_price", 0)),
+                    entry_time=record.get("opened_at", ""),
+                    exit_time=record.get("closed_at", ""),
+                    pnl_pct=_pnl_pct,
+                    pnl_usd=_pnl_usd,
+                    won=_pnl_pct > 0,
+                    exit_reason=record.get("close_type", ""),
+                    score=float(record.get("score", 0)),
+                    strength=record.get("strength", ""),
+                ))
+            except Exception:
+                pass
+
+        # signals_db: закрываем запись сигнала с P&L
+        if state.signals_db:
+            try:
+                _sid = state._signal_db_map.pop(_sym, None)
+                if _sid:
+                    state.signals_db.close_signal(_sid, float(record.get("close_price", 0)), _pnl_pct, _pnl_usd)
+            except Exception:
+                pass
+
+        # trade_analytics: TP-уровень детализация
+        if state.trade_analytics:
+            try:
+                from database.trade_analytics import record_trade_with_tp
+                from datetime import datetime as _dt
+                _ct = record.get("close_type", "SL")
+                if _ct == "SL":        _tp_lvl = 0
+                elif _ct == "BE":      _tp_lvl = -1
+                elif _ct.startswith("TP"):
+                    _tp_lvl = int(_ct[2:]) if _ct[2:].isdigit() else 1
+                else:                  _tp_lvl = 1 if _pnl_pct > 0 else 0
+                record_trade_with_tp(
+                    redis_client=state.redis,
+                    symbol=_sym,
+                    direction=record.get("direction", "short"),
+                    entry_price=float(record.get("entry_price", 0)),
+                    exit_price=float(record.get("close_price", 0)),
+                    pnl_percent=_pnl_pct, pnl_usd=_pnl_usd,
+                    tp_level=_tp_lvl, timeframe="15m",
+                    bot_type="short",  # ✅ B8-FIX #3: изолируем short:trade_history
+                )
+            except Exception:
+                pass
+
+        # trade_manager: закрытие позиции → обновление TP/Win статистики
+        if state.trade_manager:
+            try:
+                _ct = record.get("close_type", "SL")
+                _close_price = float(record.get("close_price", 0))
+                _reason = "SL_HIT" if _ct == "SL" else "TRAIL_STOP" if _ct == "TRAIL" else "CLOSED"
+                _open_pos = state.trade_manager.get_open_positions()
+                for _tm_pos in _open_pos:
+                    if _tm_pos.symbol == _sym:
+                        state.trade_manager._close_position(_tm_pos.trade_id, _reason, _close_price)
+                        break
+            except Exception:
+                pass
+
     state.tracker = PositionTracker(
         bot_type=Config.BOT_TYPE, telegram=state.telegram,
         redis_client=state.redis, binance_client=state.binance,
         config=Config, auto_trader=state.auto_trader,
+        on_trade_closed=_on_trade_closed,
     )
 
     mode_str = "DEMO" if Config.BINGX_DEMO else "REAL"
@@ -461,7 +629,36 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(background_scanner())
     asyncio.create_task(state.tracker.run())
     asyncio.create_task(_daily_report_task())
-    asyncio.create_task(_fear_greed_task())   # 🆕 F&G polling
+    asyncio.create_task(_fear_greed_task())        # 🆕 F&G polling
+    asyncio.create_task(_startup_sl_sync())        # 🚨 FIX: SL=0 bug sync
+    asyncio.create_task(_watchlist_refresh_task()) # ✅ C3: watchlist auto-refresh
+
+    # SignalQueue: retry processor для failed execute_signal
+    if state.signal_queue:
+        async def _execute_queued_signal(sq_sig) -> bool:
+            if not state.auto_trader:
+                return False
+            try:
+                sig_dict = sq_sig.indicators if isinstance(sq_sig.indicators, dict) else {}
+                if not sig_dict or not sig_dict.get("entry_price"):
+                    return False
+                result = await state.auto_trader.execute_signal(sig_dict)
+                if result and state.trade_manager:
+                    try:
+                        _lev = int(str(Config.LEVERAGE).split("-")[0])
+                        state.trade_manager.create_position(
+                            symbol=sq_sig.symbol, direction="SHORT",
+                            entry_price=sig_dict.get("entry_price", 0),
+                            qty=float(result.get("qty", 0)) if isinstance(result, dict) else 0.0,
+                            stop_loss=sig_dict.get("stop_loss", 0), leverage=_lev,
+                        )
+                    except Exception:
+                        pass
+                return result is not None
+            except Exception as _e:
+                print(f"[SignalQueue] retry failed {sq_sig.symbol}: {_e}")
+                return False
+        await state.signal_queue.start_processing(_execute_queued_signal)
 
     yield
 
@@ -519,7 +716,7 @@ async def _count_real_positions() -> int:
         return 0
 
 
-async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbose: bool = True) -> Optional[Dict]:
+async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbose: bool = True, cached_btc_24h: float = 0.0) -> Optional[Dict]:
     """
     Aegis scan_symbol v1.0:
     - Параллельный расчёт через AegisSignalEngine
@@ -529,26 +726,32 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
     """
     log_prefix = f"🔍 [{symbol}]"
     try:
-        # ✅ FIX: Проверяем оба уровня блэклиста
-        # Уровень 1: вечный Redis-блэклист (символ промахнулся 3+ раз)
-        if state.redis and state.redis.client.exists(f"blacklist:{symbol}"):
+        # ✅ OPT: Проверяем in-memory наборы (загружены в scan_market) — нет Redis-вызовов
+        # Fallback на Redis.exists если наборы не инициализированы (первый запуск)
+        _bl_set = getattr(state, '_blacklist_set', None)
+        _sk_set = getattr(state, '_skip_nodata_set', None)
+        if _bl_set is not None:
+            if symbol in _bl_set: return None
+        elif state.redis and state.redis.client.exists(f"blacklist:{symbol}"):
             return None
-        # Уровень 2: 24-часовой skip (временный промах)
-        if state.redis and state.redis.client.exists(f"skip:nodata:{symbol}"):
+        if _sk_set is not None:
+            if symbol in _sk_set: return None
+        elif state.redis and state.redis.client.exists(f"skip:nodata:{symbol}"):
             return None
+
+        # ✅ SL cooldown: не открываем повторно если стоп был < SL_COOLDOWN_HOURS назад
+        _sl_cd_h = float(os.getenv("SL_COOLDOWN_HOURS", "1.0"))
+        _sl_cd_key = f"sl_cooldown:short:{symbol.replace('-', '')}"
+        try:
+            if state.redis and state.redis.client.exists(_sl_cd_key):
+                if verbose:
+                    print(f"{log_prefix} 🚫 [SL_COOLDOWN] {symbol}: стоп был недавно — ждём {_sl_cd_h}ч")
+                return None
+        except Exception:
+            pass
 
         md = await state.binance.get_complete_market_data(symbol)
         if not md:
-            # П1: Попробовать альтернативный формат (SPACE-USDT для OKX)
-            alt_symbol = symbol  # Binance/Bybit уже пробовали
-            try:
-                from api.okx_client import get_okx_client
-                okx = get_okx_client()
-                okx_data = await okx.get_open_interest(symbol)
-                if okx_data:
-                    pass  # Fallback частичный — продолжаем с Bybit-only
-            except Exception:
-                pass
             if verbose:
                 print(f"{log_prefix} ❌ Нет market data от Binance/Bybit — пропуск")
             # ✅ FIX: Счётчик промахов → вечный бан после 3 раз
@@ -562,20 +765,36 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                         state.redis.client.set(f"blacklist:{symbol}", f"nodata:{count}")
                         state.redis.client.delete(count_key)
                         print(f"🚫 [{symbol}] Добавлен в постоянный блэклист ({count} промахов)")
+                        # Обновляем in-memory set
+                        if hasattr(state, '_blacklist_set') and state._blacklist_set is not None:
+                            state._blacklist_set.add(symbol)
                     else:
-                        # 24-часовой skip
-                        state.redis.client.setex(f"skip:nodata:{symbol}", 86400, "1")
+                        # skip TTL читается из ENV SKIP_NODATA_TTL (дефолт 86400 = 24ч)
+                        _skip_ttl = int(os.getenv("SKIP_NODATA_TTL", "86400"))
+                        state.redis.client.setex(f"skip:nodata:{symbol}", _skip_ttl, "1")
+                        # Обновляем in-memory set
+                        if hasattr(state, '_skip_nodata_set') and state._skip_nodata_set is not None:
+                            state._skip_nodata_set.add(symbol)
             except Exception:
                 pass
             return None
 
-        # Загружаем OHLCV параллельно
-        ohlcv_15m, ohlcv_30m, ohlcv_4h = await asyncio.gather(
-            state.binance.get_klines(symbol, "15m", 100),
-            state.binance.get_klines(symbol, "30m", 50),
-            state.binance.get_klines(symbol, "4h", 20),
-            return_exceptions=True,
-        )
+        # A5: Загружаем OHLCV через кеш (один запрос на (symbol, interval) за скан)
+        _cache = state.ohlcv_cache
+        if _cache:
+            ohlcv_15m, ohlcv_30m, ohlcv_4h = await asyncio.gather(
+                _cache.get(symbol, "15m", 100, lambda: state.binance.get_klines(symbol, "15m", 100)),
+                _cache.get(symbol, "30m", 50,  lambda: state.binance.get_klines(symbol, "30m", 50)),
+                _cache.get(symbol, "4h",  20,  lambda: state.binance.get_klines(symbol, "4h",  20)),
+                return_exceptions=True,
+            )
+        else:
+            ohlcv_15m, ohlcv_30m, ohlcv_4h = await asyncio.gather(
+                state.binance.get_klines(symbol, "15m", 100),
+                state.binance.get_klines(symbol, "30m", 50),
+                state.binance.get_klines(symbol, "4h", 20),
+                return_exceptions=True,
+            )
         if isinstance(ohlcv_15m, Exception) or not ohlcv_15m or len(ohlcv_15m) < 20:
             if verbose:
                 print(f"{log_prefix} ❌ Недостаточно OHLCV данных (нужно 20, есть {len(ohlcv_15m) if ohlcv_15m else 0})")
@@ -605,36 +824,115 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             rsi_30m = _calc_rsi(ohlcv_30m) if ohlcv_30m else None
             rsi_4h  = _calc_rsi(ohlcv_4h)  if ohlcv_4h  else None
             rsi_1h  = md.rsi_1h or 50
-            _p1h = getattr(md, "price_change_1h", 0) or 0
-            _p4h = getattr(md, "price_change_4h", 0) or 0
-            _is_downtrend = _p1h < -3.0 or _p4h < -8.0  # Явный даунтренд по цене
+            _p1h  = getattr(md, "price_change_1h",  0) or 0
+            _p4h  = getattr(md, "price_change_4h",  0) or 0
+            _p24h = getattr(md, "price_change_24h", 0) or 0
+            _momentum_1h_thr = float(os.getenv("MOMENTUM_DOWNTREND_1H", "-1.5"))
+            _momentum_4h_thr = float(os.getenv("MOMENTUM_DOWNTREND_4H", "-8.0"))
+            _is_downtrend = _p1h < _momentum_1h_thr or _p4h < _momentum_4h_thr
 
-            # Шорт: все таймфреймы перегреты → сильный сигнал
-            if rsi_4h and rsi_30m:
+            # ── REAL Multi-TF: price momentum alignment across 4H / 1H / 30M ───
+            # Считаем сколько TF подтверждают SHORT направление
+            _mtf_bearish_count = 0
+            _mtf_bullish_count = 0
+
+            # TF confirmations (price direction)
+            if _p4h  < -1.0:  _mtf_bearish_count += 1
+            elif _p4h  > 1.0: _mtf_bullish_count += 1
+            if _p1h  < -0.5:  _mtf_bearish_count += 1
+            elif _p1h  > 0.5: _mtf_bullish_count += 1
+            if _p24h < -3.0:  _mtf_bearish_count += 1
+            elif _p24h > 3.0: _mtf_bullish_count += 1
+
+            # RSI alignment (4H + 1H + 30M)
+            _rsi_bearish = sum([
+                1 if (rsi_4h  or 50) > 68 else 0,
+                1 if rsi_1h  > 63 else 0,
+                1 if (rsi_30m or 50) > 63 else 0,
+            ])
+            _rsi_bullish = sum([
+                1 if (rsi_4h  or 50) < 35 else 0,
+                1 if rsi_1h  < 38 else 0,
+                1 if (rsi_30m or 50) < 38 else 0,
+            ])
+
+            # Compute MTF bonus
+            if _mtf_bearish_count >= 3 and _rsi_bearish >= 2:
+                _mtf_bonus = 18
+                if verbose: print(f"{log_prefix} 📉 [MTF] {_mtf_bearish_count}/3 TF bearish + RSI перегрет {_rsi_bearish}/3 → +18")
+            elif _mtf_bearish_count >= 2 and _rsi_bearish >= 2:
+                _mtf_bonus = 12
+                if verbose: print(f"{log_prefix} 📉 [MTF] {_mtf_bearish_count}/3 TF bearish + RSI {_rsi_bearish}/3 → +12")
+            elif _mtf_bearish_count >= 3:
+                _mtf_bonus = 8
+                if verbose: print(f"{log_prefix} 📉 [MTF] Все 3 TF bearish (RSI нейтрально) → +8")
+            elif _mtf_bullish_count >= 2 and _rsi_bullish >= 1:
+                # Bullish TF + перепроданность = ПРОТИВ SHORT
+                _mtf_bonus = -12
+                if verbose: print(f"{log_prefix} ⚠️ [MTF] {_mtf_bullish_count}/3 TF bullish + RSI перепродан {_rsi_bullish}/3 → -12")
+            elif _mtf_bullish_count >= 2:
+                _mtf_bonus = -6
+                if verbose: print(f"{log_prefix} ⚠️ [MTF] {_mtf_bullish_count}/3 TF bullish → -6")
+            elif rsi_4h and rsi_30m:
+                # Legacy: RSI-only check
                 if rsi_4h > 70 and rsi_1h > 65 and rsi_30m > 65:
-                    _mtf_bonus = 15
-                    if verbose: print(f"{log_prefix} 📈 [MTF] RSI 4H={rsi_4h} 1H={rsi_1h:.0f} 30M={rsi_30m} — всё перегрето +15")
+                    _mtf_bonus = 12
                 elif rsi_4h > 65 and rsi_1h > 60:
-                    _mtf_bonus = 8
-                    if verbose: print(f"{log_prefix} 📈 [MTF] RSI 4H={rsi_4h} 1H={rsi_1h:.0f} — перегрев +8")
+                    _mtf_bonus = 6
                 elif rsi_4h < 40 and rsi_1h < 45 and _is_downtrend:
-                    # MOMENTUM SHORT: RSI низкий, цена падает → trend continuation SHORT
-                    _mtf_bonus = 5
-                    if verbose: print(f"{log_prefix} 📉 [MTF] RSI {rsi_1h:.0f} низкий но DOWNTREND {_p1h:.1f}%/1H — SHORT продолжение +5")
-                elif rsi_4h < 40 and rsi_1h < 45:
-                    _mtf_bonus = -5  # Перепродан без ценового подтверждения — лёгкий штраф
-                    if verbose: print(f"{log_prefix} ⚠️ [MTF] RSI 4H={rsi_4h} перепродан без тренда {_mtf_bonus}")
+                    _mtf_bonus = 4
+                elif rsi_4h < 30 and rsi_1h < 45:
+                    _htf_for_mtf = getattr(getattr(md, 'market_structure', None), 'htf_structure', '') or ''
+                    if "bear" not in _htf_for_mtf.lower():
+                        _mtf_bonus = -5
             elif rsi_4h:
-                if rsi_4h > 70: _mtf_bonus = 8
+                if rsi_4h > 70:   _mtf_bonus = 8
                 elif rsi_4h > 65: _mtf_bonus = 4
+
+            # ── RSI Divergence: 4H vs 1H (слабеющий импульс) ────────────
+            # 4H RSI выше 1H RSI = 4H ещё горячий, но 1H уже охлаждается
+            # Это классический сигнал momentum exhaustion перед разворотом
+            if rsi_4h and rsi_1h:
+                _rsi_div = rsi_4h - rsi_1h
+                if _rsi_div >= 12 and rsi_4h >= 60:
+                    # 4H перегрет, 1H откатывает → импульс слабеет → хорошо для SHORT
+                    _mtf_bonus += 6
+                    if verbose: print(f"{log_prefix} 📉 [MTF RSI DIV] 4H={rsi_4h:.0f} > 1H={rsi_1h:.0f} (∆={_rsi_div:.0f}) — импульс слабеет → +6")
+                elif _rsi_div >= 8 and rsi_4h >= 55:
+                    _mtf_bonus += 3
+                    if verbose: print(f"{log_prefix} 📉 [MTF RSI DIV] 4H={rsi_4h:.0f} > 1H={rsi_1h:.0f} (∆={_rsi_div:.0f}) → +3")
+                elif _rsi_div <= -10 and rsi_1h >= 75:
+                    # HARD BLOCK: сильный локальный памп без поддержки 4H — очень опасно шортить
+                    if verbose: print(f"{log_prefix} 🚫 [MTF RSI DIV BLOCK] 1H={rsi_1h:.0f} >> 4H={rsi_4h:.0f} (∆={_rsi_div:.0f}) — агрессивный памп, SHORT заблокирован")
+                    return None
+                elif _rsi_div <= -15 and rsi_1h >= 65:
+                    # Штраф: 1H спайкует >> 4H = локальный памп без поддержки старшего ТФ
+                    _mtf_bonus -= 10  # усилен с -5 до -10: чаще опускает score ниже порога
+                    if verbose: print(f"{log_prefix} ⚠️ [MTF RSI DIV] 1H={rsi_1h:.0f} >> 4H={rsi_4h:.0f} (∆={_rsi_div:.0f}) — локальный памп → -10")
+
         except Exception as _mtf_e:
             if verbose: print(f"{log_prefix} ⚠️ [MTF] error: {_mtf_e}")
         # ────────────────────────────────────────────────────────────────
 
         # ── Существующий базовый scorer (keep backward compat) ──
-        hourly_deltas = await state.binance.get_hourly_volume_profile(symbol, 7)
+        # ✅ OPT: hourly_deltas уже загружены в get_complete_market_data → md.hourly_deltas
+        hourly_deltas = getattr(md, "hourly_deltas", None) or []
         price_trend   = state.pattern_detector._get_price_trend(ohlcv_15m)
+        state.pump_guard.update_symbol(price_trend or "flat")
+        md.price_trend = price_trend or "flat"   # нужен realtime_scorer Fix C
         patterns      = state.pattern_detector.detect_all(ohlcv_15m, hourly_deltas, md)
+
+        # 🆕 Паттерны на 30M — уже загружены, просто запускаем detect_all
+        # Вес 1.15x (между 15m и 4H) — более структурные чем 15m
+        if ohlcv_30m and len(ohlcv_30m) >= 20:
+            try:
+                _pat_30m = state.pattern_detector.detect_all(ohlcv_30m, None, md)
+                for _p in _pat_30m:
+                    _p.score_bonus = int(_p.score_bonus * 1.15)
+                    _p.name = f"{_p.name}_30M"
+                patterns = patterns + _pat_30m
+            except Exception:
+                pass
 
         # ✅ v18: HTF паттерны на 4H и 1D (более значимые сигналы)
         # Паттерн на 4H весит больше т.к. структурно значим
@@ -672,11 +970,116 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         _seen_base = set()
         _dedup = []
         for _p in sorted(patterns, key=lambda x: x.score_bonus, reverse=True):
-            _base = _p.name.replace("_4H","").replace("_1D","")
+            _base = _p.name.replace("_4H","").replace("_1D","").replace("_30M","")
             if _base not in _seen_base:
                 _seen_base.add(_base)
                 _dedup.append(_p)
         patterns = _dedup[:8]  # топ-8 паттернов
+
+        # ── P2: Flag / Pennant Detector ───────────────────────────────────────
+        _fp_result = None
+        try:
+            if ohlcv_4h and len(ohlcv_4h) >= 12:
+                from core.flag_pennant_detector import detect_flag_pennant
+                from core.pattern_detector import PatternResult as _PR2
+                _fp_result = detect_flag_pennant(ohlcv_4h, md.price, "short")
+                if _fp_result and _fp_result.has_signal:
+                    _fp_bonus = min(_fp_result.score_bonus, 20)
+                    patterns.append(_PR2(
+                        name=_fp_result.pattern_type,
+                        score_bonus=_fp_bonus,
+                        direction="short",
+                        confidence=0.78 if _fp_result.is_breakout else 0.60,
+                        reasons=[_fp_result.description],
+                    ))
+                    if verbose:
+                        print(f"{log_prefix} 🚩 [FLAG/PENNANT] {_fp_result.description}")
+        except Exception as _fp_err:
+            pass  # не критично
+
+        # ── P1: Order Book Score ──────────────────────────────────────────────
+        _ob_score = 0
+        try:
+            if Config.ENABLE_ORDERBOOK and state.auto_trader and hasattr(state.auto_trader, 'bingx') and state.auto_trader.bingx:
+                # Fix: 109429 cooldown — пропускаем depth если BingX в rate limit
+                _depth_cooldown = False
+                if state.redis:
+                    try:
+                        _depth_cooldown = bool(state.redis.client.get('bingx:depth_cooldown'))
+                    except Exception:
+                        pass
+                if not _depth_cooldown:
+                    try:
+                        # ✅ OPT: timeout 5s — BingX иногда висит 30s без ответа
+                        _ob_data = await asyncio.wait_for(
+                            state.auto_trader.bingx.get_order_book(symbol), timeout=5.0
+                        )
+                    except asyncio.TimeoutError:
+                        _ob_data = None
+                    if _ob_data:
+                        from core.orderbook_scorer import calculate_orderbook_score
+                        _ob_score, _ob_desc, _ = calculate_orderbook_score(_ob_data, md.price, "short")
+                        if verbose and _ob_desc:
+                            print(f"{log_prefix} {_ob_desc}")
+                    else:
+                        _bingx_err = getattr(state.auto_trader.bingx, 'last_error_code', None)
+                        if _bingx_err == 109429:
+                            # Rate limit — отключаем depth на 15 мин
+                            if state.redis:
+                                try:
+                                    state.redis.client.setex('bingx:depth_cooldown', 900, '1')
+                                except Exception:
+                                    pass
+                            print(f"⏸ [BingX] 109429 rate limit → depth отключён на 15 мин")
+                        elif _bingx_err in (109418, 109425):
+                            # Fix #1: BingX 109418 (offline) → постоянный блэклист
+                            #         BingX 109425 (not exist) → skip 7 дней
+                            try:
+                                if state.redis:
+                                    if _bingx_err == 109418:
+                                        state.redis.client.set(f"blacklist:{symbol}", f"bingx:offline:{_bingx_err}")
+                                        if hasattr(state, '_blacklist_set') and state._blacklist_set is not None:
+                                            state._blacklist_set.add(symbol)
+                                        print(f"🚫 [{symbol}] BingX 109418 offline → постоянный блэклист")
+                                    else:
+                                        state.redis.client.setex(f"skip:nodata:{symbol}", 86400 * 7, f"bingx:notexist:{_bingx_err}")
+                                        if hasattr(state, '_skip_nodata_set') and state._skip_nodata_set is not None:
+                                            state._skip_nodata_set.add(symbol)
+                                        print(f"⏭ [{symbol}] BingX 109425 not exist → skip 7д")
+                            except Exception:
+                                pass
+        except Exception as _ob_err:
+            pass  # не критично
+
+        # ── P3+P35: OnChain CoinGecko — параллельный запрос (было sequential → +8s/symbol) ──
+        _onchain_bonus = 0
+        _onchain_desc = ""
+        _addr_bonus = 0
+        _addr_desc = ""
+        try:
+            if os.getenv("ENABLE_ONCHAIN", "true").lower() == "true":
+                from core.onchain_client import (get_volume_z_score, onchain_score_bonus,
+                                                  get_active_addr_proxy, addr_proxy_score_bonus)
+                _redis_cli = state.redis.client if state.redis else None
+                # ✅ OPT: обе функции запускаем параллельно (раньше sequential: 2×8s → теперь max(8s))
+                _oc_results = await asyncio.gather(
+                    asyncio.wait_for(get_volume_z_score(symbol, _redis_cli), timeout=8.0),
+                    asyncio.wait_for(get_active_addr_proxy(symbol, _redis_cli), timeout=8.0),
+                    return_exceptions=True,
+                )
+                _oc_z, _oc_addr = _oc_results
+                if not isinstance(_oc_z, Exception):
+                    _z, _zdesc = _oc_z
+                    _onchain_bonus, _onchain_desc = onchain_score_bonus(_z, "short")
+                    if verbose and _zdesc:
+                        print(f"{log_prefix} {_zdesc}")
+                if not isinstance(_oc_addr, Exception):
+                    _addr_pct, _addr_raw_desc = _oc_addr
+                    _addr_bonus, _addr_desc = addr_proxy_score_bonus(_addr_pct, "short")
+                    if verbose and _addr_desc:
+                        print(f"{log_prefix} 📊 [ADDR] {_addr_desc}")
+        except Exception:
+            pass  # не критично
 
         # MS-данные доступны вне блока verbose для сохранения в signal
         _ms_log = getattr(md, "market_structure", None)
@@ -690,7 +1093,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 f"rsi={md.rsi_1h:.1f} | funding={md.funding_rate:.4f}% | "
                 f"acc_funding={md.funding_accumulated:.4f}% | "
                 f"L/S={md.long_short_ratio:.1f}% | "
-                f"OI_4d={md.oi_change_4d:.1f}% | OI_30m={getattr(md,'oi_change_30m',0.0):+.1f}% | OI_1h={getattr(md,'oi_change_1h',0.0):+.1f}% | OI_4h={getattr(md,'oi_change_4h',0.0):+.1f}% | "
+                f"OI_15m={getattr(md,'oi_change_15m',0.0):+.1f}% | OI_30m={getattr(md,'oi_change_30m',0.0):+.1f}% | OI_1h={getattr(md,'oi_change_1h',0.0):+.1f}% | OI_4h={getattr(md,'oi_change_4h',0.0):+.1f}% | "
                 f"vol_spike={getattr(md,'volume_spike_ratio',1.0):.2f}x | "
                 f"atr={getattr(md,'atr_14_pct',0.5):.2f}% | "
                 f"top_trader={'%.2f' % top_trader_val if top_trader_val is not None else '⚠️ None'} | "
@@ -705,40 +1108,65 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 print(f"{log_prefix} 🏗 [MS STRUCTURE] {format_ms_summary(_ms_log)}")
         # ─────────────────────────────────────────────────────────────
 
-        p4d = 0.0
-        try:
-            # ✅ OPT: используем уже загруженные 1D данные из market_structure
-            _ms_1d = getattr(md, "market_structure", None)
-            if _ms_1d and _ms_1d.has_1d and _ms_1d.pdh and _ms_1d.pdc:
-                # 4-day change from market_structure 1D data
-                p4d = md.price_change_24h * 4  # быстрый аппроксим
-            else:
-                klines = await state.binance.get_klines(symbol, "1d", 6)
-                if klines and len(klines) >= 5:
-                    p4d = round((klines[-1].close - klines[-5].close) / klines[-5].close * 100, 2)
-        except Exception:
-            p4d = md.price_change_24h * 4
-
-        # 🆕 OKX Liquidations fallback — ПЕРЕД скорером, чтобы данные попали в md
+        # OKX Liquidations fallback (WebSocket→Redis, реальные данные)
         if md.recent_liquidations_usd is None or md.liq_side is None:
             try:
-                from api.okx_client import get_okx_client
-                okx_liq = await get_okx_client().get_liquidations(symbol)
+                from utils.okx_liquidation_ws import get_okx_liq_from_redis
+                okx_liq = get_okx_liq_from_redis(state.redis, symbol)
                 if okx_liq:
                     md.recent_liquidations_usd = okx_liq["total_usd"]
-                    md.liq_side = okx_liq["dominant_side"]
+                    md.liq_side = okx_liq.get("dominant_side")  # "LONG" | "SHORT" — совместимо со скорером
                     if verbose:
-                        print(f"{log_prefix} 🔄 [OKX_LIQ] fallback: {okx_liq['dominant_side']} ${okx_liq['total_usd']:.0f}")
+                        print(f"{log_prefix} 🔄 [OKX_LIQ] WS cache: {okx_liq.get('dominant_side')} ${okx_liq['total_usd']:.0f}")
+            except Exception:
+                pass
+
+        # OKX OI cross-exchange — заполняет пробелы если Binance/Bybit вернули 0
+        try:
+            from api.okx_client import get_okx_client
+            _okx_oi = await get_okx_client().get_open_interest(symbol)
+            if _okx_oi:
+                if not md.oi_change_1h:
+                    md.oi_change_1h = _okx_oi.oi_change_1h
+                if not getattr(md, 'oi_change_4h', 0.0):
+                    md.oi_change_4h = _okx_oi.oi_change_4h
+                if not md.funding_rate:
+                    md.funding_rate = _okx_oi.funding_rate
+        except Exception:
+            pass
+
+        # Multi-TF RSI и OI для scorer
+        _rsi_15m = _calc_rsi(ohlcv_15m) if ohlcv_15m else None
+        _oi_15m  = getattr(md, 'oi_change_15m', 0.0) or 0.0
+        _oi_30m  = getattr(md, 'oi_change_30m', 0.0) or 0.0
+        _oi_1h   = getattr(md, 'oi_change_1h', 0.0) or 0.0
+        _oi_4h   = getattr(md, 'oi_change_4h', 0.0) or 0.0
+        # HTF structure и zone из market_structure
+        _ms_s    = getattr(md, 'market_structure', None)
+        _htf_str              = getattr(_ms_s, 'htf_structure', '') or ''
+        _htf_is_bullish_short = "bull" in _htf_str.lower()
+        _zone                 = getattr(_ms_s, 'zone_4h', '') or ''
+        # 30M delta — вычисляем из уже загруженных 30m свечей (без доп. API вызова)
+        _delta_30m = []
+        if ohlcv_30m:
+            for _c in ohlcv_30m[-14:]:
+                _pdp = (_c.close - _c.open) / _c.open if _c.open > 0 else 0
+                _delta_30m.append(_c.quote_volume * (1 if _pdp >= 0 else -1))
+
+        # S10: Liquidation Zone магниты (Coinglass)
+        _liq_analysis = None
+        if state.liq_detector:
+            try:
+                _liq_analysis = await state.liq_detector.analyze_symbol(symbol, price)
             except Exception:
                 pass
 
         base_result = state.scorer.calculate_score(
             rsi_1h=md.rsi_1h or 50,
-            funding_current=md.funding_rate,       # ✅ FIX: already in %, no /100
-            funding_accumulated=md.funding_accumulated,  # ✅ FIX: already in %
+            funding_current=md.funding_rate,
+            funding_accumulated=md.funding_accumulated,
             long_ratio=md.long_short_ratio,
-            oi_change_4d=md.oi_change_4d,
-            price_change_4d=p4d,
+            price_change_24h=md.price_change_24h,
             hourly_deltas=hourly_deltas,
             price_trend=price_trend,
             patterns=patterns,
@@ -746,6 +1174,18 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             atr_14_pct=getattr(md, "atr_14_pct", 0.5),
             top_trader_ratio=getattr(md, "top_trader_long_short_ratio", None),
             taker_ratio=getattr(md, "taker_buy_sell_ratio", None),
+            oi_15m=_oi_15m,
+            oi_30m=_oi_30m,
+            oi_1h=_oi_1h,
+            oi_4h=_oi_4h,
+            rsi_15m=_rsi_15m,
+            rsi_30m=rsi_30m,
+            rsi_4h=rsi_4h,
+            htf_structure=_htf_str,
+            zone=_zone,
+            delta_30m=_delta_30m,
+            orderbook_score=_ob_score,
+            liq_analysis=_liq_analysis,
         )
 
         # Fear & Greed макро-модификатор — применяем ДО проверки is_valid
@@ -763,14 +1203,45 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 fg_modifier, fg_reason = -1, f"🧠 [F&G] {fg} Страх → SHORT -1"
 
         raw_score      = base_result.total_score
-        effective_score = max(min(raw_score + fg_modifier + _mtf_bonus, 100), 0)
+        # ✅ FIX P1: CASCADE учитывается ДО gate-проверки (аналог LONG бота)
+        _cas_pre = getattr(md, "cascade_signal", None)
+        _cas_pre_bonus = 0
+        if _cas_pre is not None and _cas_pre.has_signal and _cas_pre.direction == "short":
+            if _cas_pre.score_bonus >= 14:   _cas_pre_bonus = 10
+            elif _cas_pre.score_bonus >= 10: _cas_pre_bonus = 7
+            elif _cas_pre.score_bonus >= 8:  _cas_pre_bonus = 5
+            elif _cas_pre.score_bonus >= 6:  _cas_pre_bonus = 3
+        effective_score = max(min(raw_score + fg_modifier + _mtf_bonus + _cas_pre_bonus + _onchain_bonus + _addr_bonus, 100), 0)
         min_score       = state.scorer.min_score
 
         if verbose:
-            fg_str  = f" F&G={fg_modifier:+d}" if fg_modifier != 0 else ""
-            mtf_str = f" MTF={_mtf_bonus:+d}"  if _mtf_bonus  != 0 else ""
-            print(f"{log_prefix} 📊 [BASE_SCORER] score={raw_score}{fg_str}{mtf_str} → {effective_score} (min={min_score})"
+            fg_str   = f" F&G={fg_modifier:+d}" if fg_modifier != 0 else ""
+            mtf_str  = f" MTF={_mtf_bonus:+d}"  if _mtf_bonus  != 0 else ""
+            cas_str  = f" CASCADE={_cas_pre_bonus:+d}" if _cas_pre_bonus > 0 else ""
+            oc_str   = f" ONCHAIN={_onchain_bonus:+d}" if _onchain_bonus != 0 else ""
+            addr_str = f" ADDR={_addr_bonus:+d}"       if _addr_bonus    != 0 else ""
+            print(f"{log_prefix} 📊 [BASE_SCORER] score={raw_score}{fg_str}{mtf_str}{cas_str}{oc_str}{addr_str} → {effective_score} (min={min_score})"
                   f" | components: {[(c.name, c.score) for c in base_result.components]}")
+            if _cas_pre_bonus > 0:
+                print(f"{log_prefix} 🎯 [CASCADE PRE-GATE] +{_cas_pre_bonus}pts → помогает пройти gate")
+            if _onchain_desc:
+                print(f"{log_prefix} 📊 [ONCHAIN] {_onchain_desc}")
+            if base_result.funding_info:
+                print(f"{log_prefix} 💰 {base_result.funding_info}")
+
+        # ── Token Divergence Scorer: RS vs BTC + Volume + OI + Funding ─────────────
+        try:
+            from core.token_divergence_scorer import score_divergence as _score_div
+            _div_bonus, _div_reasons = _score_div(md, cached_btc_1h or 0.0, cached_btc_24h, "short")
+            if _div_bonus != 0:
+                effective_score = max(0, min(100, effective_score + _div_bonus))
+                if verbose:
+                    _dsign = "+" if _div_bonus >= 0 else ""
+                    _dreason = " | ".join(_div_reasons) if _div_reasons else ""
+                    print(f"{log_prefix} 🧩 [DIVERGENCE] {_dsign}{_div_bonus} → {effective_score}"
+                          + (f" | {_dreason}" if _dreason else ""))
+        except Exception:
+            pass
 
         if effective_score < min_score:
             if verbose:
@@ -782,22 +1253,18 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             print(f"{log_prefix} {fg_reason}")
 
         # ── PARABOLIC MOMENTUM BLOCKER ──────────────────────────────────────
-        # Ракету не шортим: OI_4d > 40% + price_4d > 30% + volume_spike > 3x
-        _oi4d     = getattr(md, "oi_change_4d", 0.0)
+        # Ракету не шортим: OI_4h > 20% + price_24h > 12% + volume_spike > 3x
+        _oi4h     = getattr(md, "oi_change_4h", 0.0)
         _vol_sp   = getattr(md, "volume_spike_ratio", 1.0)
-        _price4d  = 0.0
-        try:
-            _price4d = abs(md.price_change_24h) * 4
-        except Exception:
-            pass
-        if _oi4d > 40.0 and _price4d > 30.0 and _vol_sp > 3.0:
+        _price24h = abs(md.price_change_24h)
+        if _oi4h > 20.0 and _price24h > 12.0 and _vol_sp > 3.0:
             if verbose:
-                print(f"{log_prefix} 🚫 [PARABOLIC BLOCK] OI_4d={_oi4d:.1f}% price_4d≈{_price4d:.1f}% spike={_vol_sp:.1f}x — ракету не шортим")
+                print(f"{log_prefix} 🚫 [PARABOLIC BLOCK] OI_4h={_oi4h:.1f}% price_24h={_price24h:.1f}% spike={_vol_sp:.1f}x — ракету не шортим")
             return None
-        # Более мягкий вариант: OI_4d > 60% или price_4d > 50% в одиночку
-        if _oi4d > 60.0 or _price4d > 50.0:
+        # Более мягкий вариант: price_24h > 20% или OI_4h > 40% в одиночку
+        if _oi4h > 40.0 or _price24h > 20.0:
             if verbose:
-                print(f"{log_prefix} 🚫 [PARABOLIC BLOCK] Экстремальный импульс OI={_oi4d:.1f}% price4d≈{_price4d:.1f}% — блок")
+                print(f"{log_prefix} 🚫 [PARABOLIC BLOCK] Экстремальный импульс OI_4h={_oi4h:.1f}% price24h={_price24h:.1f}% — блок")
             return None
 
         price      = md.price
@@ -810,12 +1277,62 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             try:
                 from utils.market_structure import proximity_bonus
                 _ms_bonus, _ms_reasons = proximity_bonus(price, _ms, "short")
+                # B: при HTF=BULLISH урезаем положительный MS-бонус вдвое — шорт контртрендовый
+                _ms_htf_cut = _htf_is_bullish_short and _ms_bonus > 0
+                if _ms_htf_cut:
+                    _ms_bonus = int(_ms_bonus * 0.5)
                 if _ms_bonus != 0:
                     base_score = max(0, min(100, base_score + _ms_bonus))
                     if verbose and _ms_reasons:
-                        print(f"{log_prefix} 🏗 [MS] {' | '.join(_ms_reasons[:3])}")
+                        _ms_lbl = "[MS×0.5 HTF=BULLISH]" if _ms_htf_cut else "[MS]"
+                        print(f"{log_prefix} 🏗 {_ms_lbl} {' | '.join(_ms_reasons[:3])}")
             except Exception as _ms_e:
                 pass  # MS bonus не критичен
+
+        # ── FTA (First Touch Area) Bonus ─────────────────────────────────────
+        # Усиливает бонус за ПЕРВОЕ касание OB/FVG — первый тест уровня самый сильный.
+        # Штрафует за истощённые (3+ раз протестированные) уровни.
+        if _ms is not None and state.redis:
+            try:
+                from utils.fta_tracker import FTATracker
+                _fta = FTATracker(state.redis.client, "short")
+                _fta_total = 0
+                _fta_parts = []
+
+                # Bearish OB 4H
+                if _ms.has_ob_4h and _ms.ob_bearish_4h:
+                    _lo, _hi = _ms.ob_bearish_4h
+                    if _lo <= price <= _hi * 1.02:
+                        _adj, _rsn = _fta.score_ob(symbol, _ms.ob_bearish_4h, "bearish", 10)
+                        _fta_total += _adj; _fta_parts.append(_rsn)
+
+                # Bearish FVG 4H
+                if _ms.has_fvg_4h and _ms.fvg_bearish_4h:
+                    _lo, _hi = _ms.fvg_bearish_4h
+                    if _lo <= price <= _hi * 1.02:
+                        _adj, _rsn = _fta.score_fvg(symbol, _ms.fvg_bearish_4h, "bearish", 8)
+                        _fta_total += _adj; _fta_parts.append(_rsn)
+
+                # Bearish OB Weekly (самый ценный уровень)
+                if _ms.has_ob_1w and _ms.ob_bearish_1w:
+                    _lo, _hi = _ms.ob_bearish_1w
+                    if _lo <= price <= _hi * 1.05:
+                        _adj, _rsn = _fta.score_ob(symbol, _ms.ob_bearish_1w, "bearish", 15)
+                        _fta_total += _adj; _fta_parts.append(_rsn)
+
+                # Bearish FVG Weekly
+                if _ms.has_fvg_1w and _ms.fvg_bearish_1w:
+                    _lo, _hi = _ms.fvg_bearish_1w
+                    if _lo <= price <= _hi * 1.05:
+                        _adj, _rsn = _fta.score_fvg(symbol, _ms.fvg_bearish_1w, "bearish", 12)
+                        _fta_total += _adj; _fta_parts.append(_rsn)
+
+                if _fta_total != 0:
+                    base_score = max(0, min(100, base_score + _fta_total))
+                    if verbose and _fta_parts:
+                        print(f"{log_prefix} 🎯 [FTA] {_fta_total:+d} | {' | '.join(_fta_parts[:2])}")
+            except Exception as _fta_e:
+                logger.debug(f"[FTA SHORT] {_fta_e}")
 
         # ── CASCADE SIGNAL Bonus (4H Fractal Raid → 1H SNR → 15M FVG) ──────
         _cas = getattr(md, "cascade_signal", None)
@@ -824,27 +1341,150 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             if verbose:
                 print(f"{log_prefix} 🎯 [CASCADE SHORT] +{_cas.score_bonus}: {_cas.description[:80]}")
         # 🆕 Консолидация фильтр — блокировка входов в середине диапазона
-        if state.consolidation_detector and ohlcv_15m:
+        _cons_filter_on = os.getenv("CONSOLIDATION_FILTER_ENABLED", "true").lower() == "true"
+        if _cons_filter_on and state.consolidation_detector and ohlcv_15m:
             cons = state.consolidation_detector.detect(ohlcv_15m, price)
             # ✅ FIX #4: передаём RSI 1H для исключения при экстремальной перегретости
             rsi_1h_val = getattr(md, "rsi_1h", 50.0) or 50.0
-            allow, reason = filter_mid_range(cons, price, "short", verbose=False, rsi_1h=rsi_1h_val)
+            # ✅ FIX #5: HTF bearish → SHORT в lower_half = продолжение тренда, порог RSI снижен до 65
+            _htf_is_bearish = "bear" in _htf_str.lower() or "bearish" in _htf_str.lower()
+            allow, reason = filter_mid_range(cons, price, "short", verbose=False, rsi_1h=rsi_1h_val, htf_bearish=_htf_is_bearish)
             
             if cons.is_consolidating and not allow:
-                if verbose:
-                    print(f"{log_prefix} ❌ [CONSOLIDATION] {reason}")
-                return None
+                # ✅ FIX P4: score≥75 + upthrust/breakout_down → bypass (аналог LONG бота)
+                _cons_bypass = (
+                    base_score >= 75
+                    and (cons.has_upthrust or cons.has_breakout_down)
+                )
+                if _cons_bypass:
+                    if verbose:
+                        print(f"{log_prefix} 🟡 [CONSOLIDATION BYPASS] score={base_score:.0f}≥75 + upthrust/breakout → override {reason}")
+                else:
+                    if verbose:
+                        print(f"{log_prefix} ❌ [CONSOLIDATION] {reason}")
+                    return None
             
             if cons.has_upthrust and cons.is_consolidating:
                 base_score += 12  # Бонус за Upthrust
                 if verbose:
                     print(f"{log_prefix} ✅ [UPTHRUST] +12 — ложный пробой вверх")
-            
+
             if cons.has_breakout_down and cons.is_consolidating:
                 base_score += 8  # Бонус за пробой вниз
                 if verbose:
                     print(f"{log_prefix} ✅ [BREAKOUT] +8 — пробой консолидации")
+
+            # A1: Multi-touch бонус за подтверждённые уровни S/R
+            _touch_bonus = cons.get_touch_bonus("short")
+            if _touch_bonus > 0:
+                base_score += _touch_bonus
+                if verbose:
+                    print(f"{log_prefix} ✅ [MULTI-TOUCH] +{_touch_bonus} — resistance touches={cons.resistance_touches}")
         
+        # ══════════════════════════════════════════════════════════════════════
+        # ANTI-CATASTROPHE HARD BLOCKS — FIX #1 / #2 / #3
+        # Корень убытков SUI/DYM/BLESS/ICNT: шорт у дна после дампа.
+        # Три условия полностью блокируют такие сигналы до ShortFilter/AEGIS.
+        # ══════════════════════════════════════════════════════════════════════
+
+        # FIX #1 — DISCOUNT ZONE: цена ниже POC 4H/Weekly = институционалы покупают здесь
+        # SHORT в DISCOUNT = торговля против умных денег. HARD BLOCK.
+        _short_require_premium = os.getenv("SHORT_REQUIRE_PREMIUM", "true").lower() == "true"
+        _zone_weekly = getattr(_ms_s, 'zone_weekly', '') or ''
+        _zone_monthly = getattr(_ms_s, 'zone_monthly', '') or ''
+        if _short_require_premium:
+            if "discount" in _zone.lower():
+                if verbose:
+                    print(
+                        f"{log_prefix} 🚫 [DISCOUNT BLOCK 4H] zone={_zone!r} — "
+                        f"цена ниже POC 4H, институционалы покупают, SHORT запрещён"
+                    )
+                return None
+            if "discount" in _zone_weekly.lower():
+                if verbose:
+                    print(
+                        f"{log_prefix} 🚫 [DISCOUNT BLOCK WEEKLY] zone_weekly={_zone_weekly!r} — "
+                        f"цена в WEEKLY DISCOUNT, институционалы набирают лонги, SHORT запрещён"
+                    )
+                return None
+
+        # FIX #1b — WEEKLY BULLISH OB: цена внутри недельного бычьего ордер-блока
+        # = институционалы покупают здесь на неделях, SHORT крайне опасен
+        _short_block_weekly_ob = os.getenv("SHORT_BLOCK_WEEKLY_BULL_OB", "true").lower() == "true"
+        if _short_block_weekly_ob and _ms_s:
+            _ob_bull_1w = getattr(_ms_s, 'ob_bullish_1w', None)
+            if _ob_bull_1w:
+                _ob_lo, _ob_hi = _ob_bull_1w
+                if _ob_lo > 0 and _ob_lo <= price <= _ob_hi * 1.01:
+                    if verbose:
+                        print(
+                            f"{log_prefix} 🚫 [WEEKLY BULL OB BLOCK] цена {price:.4f} внутри "
+                            f"Bullish OB Weekly [{_ob_lo:.4f}–{_ob_hi:.4f}] — SHORT запрещён"
+                        )
+                    return None
+
+        # FIX #2 — RSI OVERSOLD: актив перепродан → V-отскок вероятнее продолжения
+        # RSI < порог = КОНЕЦ дампа, не начало. Порог по умолчанию 30.
+        _short_rsi_oversold_block = float(os.getenv("SHORT_RSI_OVERSOLD_BLOCK", "30"))
+        _rsi_now = md.rsi_1h or 50
+        if _rsi_now < _short_rsi_oversold_block:
+            if verbose:
+                print(
+                    f"{log_prefix} 🚫 [RSI OVERSOLD BLOCK] RSI={_rsi_now:.1f} < {_short_rsi_oversold_block} — "
+                    f"перепродан, вероятность V-отскока критически высока, SHORT заблокирован"
+                )
+            return None
+
+        # ── Anti-Chasing Filter — вход на дне после дампа ("поезд ушёл") ──────
+        # Если цена уже выросла X% от локального минимума за последние N свечей 15m
+        # → бот шортит не на вершине, а в середине отскока → HIGH RISK
+        _anti_chase_enabled = os.getenv("ENABLE_ANTI_CHASING", "true").lower() == "true"
+        if _anti_chase_enabled and ohlcv_15m and len(ohlcv_15m) >= 4:
+            try:
+                _ac_candles    = int(os.getenv("ANTI_CHASE_CANDLES",   "4"))   # последние N свечей
+                _ac_threshold  = float(os.getenv("ANTI_CHASE_PCT",     "2.5")) # % роста от low
+                _ac_window = ohlcv_15m[-_ac_candles:]
+                _ac_low    = min(c.low  for c in _ac_window)
+                _ac_cur    = ohlcv_15m[-1].close
+                if _ac_low > 0:
+                    _ac_bounce_pct = (_ac_cur - _ac_low) / _ac_low * 100
+                    if _ac_bounce_pct >= _ac_threshold:
+                        if verbose:
+                            print(
+                                f"{log_prefix} 🚫 [ANTI-CHASING] цена выросла "
+                                f"+{_ac_bounce_pct:.1f}% от low за {_ac_candles}×15m — "
+                                f"вход в SHORT на отскоке запрещён"
+                            )
+                        return None
+            except Exception:
+                pass
+
+        # FIX #3 — POST-DUMP BLOCK: актив уже упал → шортим дно, а не вершину
+        # Сценарий A: 4H падение > порог + RSI < 45 (дамп ещё не переварен)
+        # Сценарий B: шортим отскок — 1H растёт при 24H < -8% (DYM-паттерн)
+        _short_drop_block_pct = float(os.getenv("SHORT_BLOCK_AFTER_DROP_PCT", "4.0"))  # FIX: 7.0→4.0
+        _short_drop_bypass_score = float(os.getenv("SHORT_DROP_BYPASS_MIN_SCORE", "85"))
+        _p4h_now  = getattr(md, "price_change_4h", 0) or 0
+        _p1h_now  = getattr(md, "price_change_1h",  0) or 0
+        _p24h_now = md.price_change_24h or 0
+        if base_score < _short_drop_bypass_score:
+            # Сценарий A: тяжёлый 4H дамп + перепроданность
+            if _p4h_now < -_short_drop_block_pct and _rsi_now < 45:
+                if verbose:
+                    print(
+                        f"{log_prefix} 🚫 [POST-DUMP BLOCK A] 4H={_p4h_now:.1f}% RSI={_rsi_now:.1f} — "
+                        f"шортим дно после дампа, заблокирован"
+                    )
+                return None
+            # Сценарий B: шортим отскок — цена растёт 1H при большом 24H падении
+            if _p1h_now > 1.0 and _p24h_now < -(_short_drop_block_pct * 1.5):
+                if verbose:
+                    print(
+                        f"{log_prefix} 🚫 [POST-DUMP BLOCK B] 1H={_p1h_now:+.1f}% 24H={_p24h_now:.1f}% — "
+                        f"шортим отскок после крупного дампа, заблокирован"
+                    )
+                return None
+
         # ── SHORT-специфичные фильтры (сохраняем) ──
         sf   = get_short_filter()
         filt = sf.check(
@@ -893,9 +1533,92 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             except Exception as _ml_e:
                 pass  # ML scorer не критичен
 
-        # ── SL / TP предварительные ──
-        stop_loss   = price * (1 + Config.SL_BUFFER / 100)
+        # SL порядок приоритетов: BOS/CHoCH → SSL/BSL → Swing → VP POC → ATR → Fixed %
         entry_price = price
+
+        # ── #30 BOS/CHoCH SL (рыночная структура, приоритет 1) ──────────────
+        _swing_sl_used = False
+        try:
+            from core.smc_detector import calculate_bos_choch_sl
+            if ohlcv_4h and len(ohlcv_4h) >= 20:
+                _bos_sl, _bos_desc = calculate_bos_choch_sl(ohlcv_4h, price, "short")
+                if _bos_sl is not None:
+                    stop_loss = _bos_sl
+                    _swing_sl_used = True
+                    if verbose:
+                        print(f"{log_prefix} 🎯 [BOS/CHoCH SL] {_bos_desc}")
+        except Exception as _bos_e:
+            pass
+
+        # ── #32 SSL/BSL Liquidity SL (приоритет 2) ───────────────────────────
+        if not _swing_sl_used:
+            try:
+                from core.smc_detector import calculate_ssl_bsl_sl
+                if ohlcv_4h and len(ohlcv_4h) >= 15:
+                    _ssl_sl, _ssl_desc = calculate_ssl_bsl_sl(ohlcv_4h, price, "short")
+                    if _ssl_sl is not None:
+                        stop_loss = _ssl_sl
+                        _swing_sl_used = True
+                        if verbose:
+                            print(f"{log_prefix} 🎯 [SSL/BSL SL] {_ssl_desc}")
+            except Exception:
+                pass
+
+        # ── #29 Swing High/Low SL (приоритет 3) ──────────────────────────────
+        if not _swing_sl_used:
+            try:
+                from core.swing_sl import calculate_swing_sl
+                if ohlcv_4h and len(ohlcv_4h) >= 10:
+                    _sw_sl, _sw_desc = calculate_swing_sl(ohlcv_4h, price, "short")
+                    if _sw_sl is not None:
+                        stop_loss = _sw_sl
+                        _swing_sl_used = True
+                        if verbose:
+                            print(f"{log_prefix} 🎯 [SWING SL] {_sw_desc}")
+            except Exception:
+                pass
+
+        # ── #31 Volume Profile POC SL (приоритет 4) ──────────────────────────
+        if not _swing_sl_used:
+            try:
+                from core.volume_profile import calculate_poc_sl
+                if ohlcv_4h and len(ohlcv_4h) >= 20:
+                    _vp_sl, _vp_desc = calculate_poc_sl(ohlcv_4h, price, "short")
+                    if _vp_sl is not None:
+                        stop_loss = _vp_sl
+                        _swing_sl_used = True
+                        if verbose:
+                            print(f"{log_prefix} 🎯 {_vp_desc}")
+            except Exception:
+                pass
+
+        # ── ATR-dynamic SL (M1) для SHORT: SL ВЫШЕ входа ──────────────
+        # ✅ v2.1: ATR-based SL вместо фиксированного % (приоритет 2)
+        if not _swing_sl_used and Config.USE_ATR_SL and ohlcv_4h and len(ohlcv_4h) >= 14:
+            try:
+                _highs  = [c.high  for c in ohlcv_4h[-15:]]
+                _lows   = [c.low   for c in ohlcv_4h[-15:]]
+                _closes = [c.close for c in ohlcv_4h[-15:]]
+                _trs = []
+                for _i in range(1, len(_highs)):
+                    _tr = max(_highs[_i] - _lows[_i],
+                              abs(_highs[_i] - _closes[_i-1]),
+                              abs(_lows[_i]  - _closes[_i-1]))
+                    _trs.append(_tr)
+                _atr = sum(_trs[-14:]) / 14 if len(_trs) >= 14 else sum(_trs) / len(_trs)
+                _atr_sl = price + _atr * Config.ATR_SL_MULT   # SHORT: SL выше
+                _atr_sl_pct = (_atr_sl - price) / price * 100
+                if Config.ATR_SL_MIN <= _atr_sl_pct <= Config.ATR_SL_MAX:
+                    stop_loss = _atr_sl
+                    if verbose:
+                        print(f"{log_prefix} 📐 [ATR SL] ATR={_atr:.6f} × {Config.ATR_SL_MULT} → SL={stop_loss:.6f} ({_atr_sl_pct:.2f}%)")
+                else:
+                    stop_loss = price * (1 + Config.SL_BUFFER / 100)
+            except Exception:
+                stop_loss = price * (1 + Config.SL_BUFFER / 100)
+        elif not _swing_sl_used:
+            # Fallback fixed % только если ни Swing, ни ATR SL не сработали
+            stop_loss = price * (1 + Config.SL_BUFFER / 100)
 
         # SMC refinement
         smc_data = {}
@@ -910,7 +1633,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                     base_score += smc.score_bonus
                     if verbose:
                         print(f"{log_prefix} ✅ [SMC] бонус +{smc.score_bonus:.1f} | has_ob={smc.has_ob}, has_fvg={smc.has_fvg}")
-                if smc.refined_sl and smc.refined_sl > price:
+                if smc.has_ob and smc.refined_sl and smc.refined_sl > price:
                     stop_loss = smc.refined_sl
                     if verbose:
                         print(f"{log_prefix} 🎯 [SMC] SL refined: {stop_loss:.4f}")
@@ -926,6 +1649,189 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         if sl_pct < Config.SL_BUFFER:
             stop_loss = price * (1 + Config.SL_BUFFER / 100)
             sl_pct    = Config.SL_BUFFER
+
+        # ── #33/#34 Trend Following detector (bonus + counter-trend penalty) ──
+        _trend_result = None
+        try:
+            from core.trend_detector import detect_trend
+            _trend_result = detect_trend(
+                candles_4h=ohlcv_4h,
+                price_change_1h=getattr(md, "price_change_1h", 0.0) or 0.0,
+                price_change_4h=getattr(md, "price_change_4h", 0.0) or 0.0,
+                price_change_1d=getattr(md, "price_change_24h", 0.0) or 0.0,
+                volume_spike_ratio=getattr(md, "volume_spike_ratio", 1.0) or 1.0,
+                direction="short",
+            )
+            if _trend_result and _trend_result.has_trend:
+                base_score = max(0, min(100, base_score + _trend_result.score_bonus))
+                if verbose:
+                    print(f"{log_prefix} {_trend_result.description}")
+                # A: при HTF=BULLISH порог снижен с 3/4 до 2/4 — рост ещё не остановлен
+                # FIX: убран RSI gate (< 70) — RSI 70-80 в uptrend = ловушка, блок обязателен
+                _ct_threshold = 2 if _htf_is_bullish_short else 3
+                if _trend_result.is_penalty and _trend_result.counter >= _ct_threshold:
+                    if verbose:
+                        print(f"{log_prefix} 🚫 [COUNTER-TREND BLOCK] {_ct_threshold}/4 против (RSI={(md.rsi_1h or 50):.0f}) — блок")
+                    return None
+        except Exception as _tr_e:
+            logger.debug(f"[TrendDetector] short: {_tr_e}")
+            pass
+
+        # ── RS-FILTER: токен намного сильнее BTC → шортить опасно ──────────────────
+        # CFGUSDT-паттерн: монета +16% vs BTC, бот шортит и получает стоп на отскоке.
+        # Если токен демонстрирует выраженный relative strength vs BTC → SHORT запрещён.
+        _rs_filter_enabled = os.getenv("SHORT_RS_FILTER_ENABLED", "true").lower() == "true"
+        if _rs_filter_enabled:
+            try:
+                _rs_1h_thr  = float(os.getenv("SHORT_RS_BLOCK_1H_PCT",  "8.0"))   # избыточный рост 1H vs BTC
+                _rs_24h_thr = float(os.getenv("SHORT_RS_BLOCK_24H_PCT", "15.0"))  # избыточный рост 24H vs BTC
+                _sym_1h     = getattr(md, "price_change_1h",  0.0) or 0.0
+                _sym_24h    = getattr(md, "price_change_24h", 0.0) or 0.0
+                _btc_1h     = cached_btc_1h or 0.0
+                _btc_24h    = cached_btc_24h or 0.0
+                _rs_1h      = _sym_1h  - _btc_1h   # RS vs BTC за 1H
+                _rs_24h     = _sym_24h - _btc_24h  # RS vs BTC за 24H
+                if _rs_1h >= _rs_1h_thr:
+                    if verbose:
+                        print(
+                            f"{log_prefix} 🚫 [RS-FILTER] {symbol} опережает BTC на 1H: "
+                            f"sym={_sym_1h:+.1f}% btc={_btc_1h:+.1f}% RS={_rs_1h:+.1f}% "
+                            f">= {_rs_1h_thr}% — SHORT заблокирован (монета сильнее рынка)"
+                        )
+                    return None
+                if _rs_24h >= _rs_24h_thr:
+                    if verbose:
+                        print(
+                            f"{log_prefix} 🚫 [RS-FILTER] {symbol} опережает BTC на 24H: "
+                            f"sym={_sym_24h:+.1f}% btc={_btc_24h:+.1f}% RS={_rs_24h:+.1f}% "
+                            f">= {_rs_24h_thr}% — SHORT заблокирован (монета сильнее рынка)"
+                        )
+                    return None
+            except Exception as _rs_e:
+                pass  # фильтр не ломает основную логику
+
+        # D: SystemicPumpGuard — BTC +3%/1h + >50% альтов pump → блок SHORT на HTF=BULLISH
+        # Outlier bypass: если токен падает price_24h < -15% И vol_spike > 2x — bearish divergence
+        _pg_price_24h = getattr(md, "price_change_24h", 0.0) or 0.0
+        _pg_vol_spike = getattr(md, "volume_spike_ratio", 1.0) or 1.0
+        if state.pump_guard.is_pump_for_token(_pg_price_24h, _pg_vol_spike) and _htf_is_bullish_short:
+            if verbose:
+                print(f"{log_prefix} 🚫 [SYSTEMIC_PUMP] {state.pump_guard.reason} — SHORT на HTF=BULLISH заблокирован")
+            return None
+
+        # BTC Momentum Guard — V-Shape Recovery / Rapid Bounce блок для SHORT
+        # Если BTC был в дампе и теперь быстро восстанавливается — шортить опасно
+        _btc_mg_mult = state.btc_momentum_guard.get_short_multiplier()
+        if _btc_mg_mult <= 0.0:
+            if verbose:
+                print(f"{log_prefix} 🚫 [BTC_VSHAPE] {state.btc_momentum_guard.reason} — SHORT заблокирован")
+            return None
+        if _btc_mg_mult < 1.0:
+            base_score = max(0, int(base_score * _btc_mg_mult))
+            if verbose:
+                print(f"{log_prefix} ⚠️ [BTC_VSHAPE] ×{_btc_mg_mult} → base_score={base_score:.1f} ({state.btc_momentum_guard.reason})")
+
+        # #19: KillZoneFilter — бонус/штраф по времени сессии
+        _kz_delta, _kz_reason = KillZoneFilter.get_adjustment()
+        if _kz_delta != 0:
+            base_score = max(0, min(100, base_score + _kz_delta))
+            if verbose:
+                print(f"{log_prefix} 🕐 [KILLZONE] {_kz_reason} → base_score={base_score:.1f}")
+
+        # #21: Delta Divergence — медвежья дивергенция = +18 к base_score для SHORT
+        if state.delta_analyzer and ohlcv_15m:
+            try:
+                _div = state.delta_analyzer.detect_divergence(ohlcv_15m, lookback=20)
+                if _div["bearish"] and _div["score_bonus"] > 0:
+                    base_score = max(0, min(100, base_score + _div["score_bonus"]))
+                    if verbose:
+                        print(f"{log_prefix} {_div['reason']}")
+            except Exception as _div_e:
+                logger.debug(f"[DeltaDiv] short: {_div_e}")
+
+        # M2: Volume Profile HVN/LVN scorer
+        _vpa_poc = None
+        if ohlcv_4h and len(ohlcv_4h) >= 20:
+            try:
+                from core.volume_profile import VolumeProfileAnalyzer
+                _vpa = VolumeProfileAnalyzer(ohlcv_4h)
+                _vpa_poc = _vpa.poc
+                _vp_bonus, _vp_reason = _vpa.score_bonus(price, "short")
+                if _vp_bonus > 0:
+                    base_score = max(0, min(100, base_score + _vp_bonus))
+                    if verbose:
+                        print(f"{log_prefix} {_vp_reason}")
+            except Exception as _vpa_e:
+                logger.debug(f"[VPA] short: {_vpa_e}")
+
+        # M4: Confluence Scoring — cross-TF S/R подтверждение
+        try:
+            from core.confluence_scorer import build_confluence_scorer
+            _cs = build_confluence_scorer(
+                price=price,
+                ohlcv_15m=ohlcv_15m,
+                ohlcv_1h=ohlcv_30m,   # 30m как средний ТФ
+                ohlcv_4h=ohlcv_4h,
+                poc_4h=_vpa_poc,
+            )
+            _cf_bonus, _cf_reason = _cs.score_bonus(price, "short")
+            if _cf_bonus > 0:
+                base_score = max(0, min(100, base_score + _cf_bonus))
+                if verbose:
+                    print(f"{log_prefix} {_cf_reason}")
+        except Exception as _cf_e:
+            logger.debug(f"[Confluence] short: {_cf_e}")
+
+        # M1 + M5/M7: S/R кластеризация (общий инстанс для M1, M5, M7)
+        _src_shared = None
+        if ohlcv_4h and len(ohlcv_4h) >= 15:
+            try:
+                from core.sr_cluster import SRCluster
+                _src_shared = SRCluster(ohlcv_4h)
+                _src_bonus, _src_reason = _src_shared.score_bonus(price, "short")
+                if _src_bonus > 0:
+                    base_score = max(0, min(100, base_score + _src_bonus))
+                    if verbose:
+                        print(f"{log_prefix} {_src_reason}")
+            except Exception as _src_e:
+                logger.debug(f"[SRCluster] short: {_src_e}")
+
+        # M3: Weekly/Monthly HTF level scorer
+        _ms_htf = getattr(md, "market_structure", None)
+        if _ms_htf and getattr(_ms_htf, "has_1d", False):
+            try:
+                from core.htf_level_scorer import htf_level_score_bonus
+                _htf_bonus, _htf_reason = htf_level_score_bonus(price, "short", _ms_htf)
+                if _htf_bonus > 0:
+                    base_score = max(0, min(100, base_score + _htf_bonus))
+                    if verbose:
+                        print(f"{log_prefix} {_htf_reason}")
+            except Exception as _htf_e:
+                logger.debug(f"[HTFLevels] short: {_htf_e}")
+
+        # M5/M7: False Breakout + Absorption (переиспользуем _src_shared из M1)
+        if ohlcv_15m and len(ohlcv_15m) >= 3:
+            try:
+                from core.false_breakout_detector import detect_false_breakout_from_sr
+                _fb_bonus, _fb_reason = detect_false_breakout_from_sr(
+                    ohlcv_15m, price, "short", sr_cluster=_src_shared
+                )
+                if _fb_bonus > 0:
+                    base_score = max(0, min(100, base_score + _fb_bonus))
+                    if verbose:
+                        print(f"{log_prefix} {_fb_reason}")
+
+                from core.absorption_detector import detect_absorption_from_sr
+                _ab_bonus, _ab_reason = detect_absorption_from_sr(
+                    ohlcv_15m, price, "short", sr_cluster=_src_shared
+                )
+                if _ab_bonus > 0:
+                    base_score = max(0, min(100, base_score + _ab_bonus))
+                    if verbose:
+                        print(f"{log_prefix} {_ab_reason}")
+
+            except Exception as _m57_e:
+                logger.debug(f"[M5/M7] short: {_m57_e}")
 
         # Dynamic TP
         btc_trend = ("down" if (cached_btc_1h or 0) < -0.5 else
@@ -955,6 +1861,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                     sl_pct=sl_pct,
                     take_profits=take_profits,
                     base_score=base_score,
+                    btc_change_1h=float(cached_btc_1h or 0.0),
                 )
                 if aegis_signal:
                     final_score     = aegis_signal.total_score
@@ -965,7 +1872,10 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 else:
                     # Aegis отклонил — не генерируем
                     if verbose:
-                        print(f"{log_prefix} ❌ [AEGIS] сигнал отклонён движком (base_score={base_score:.1f})")
+                        # ✅ FIX: base_score переименован в pre_aegis_score (до этого момента он уже
+                        # прошёл realtime/killzone/delta-модификации — это не «базовый» скор)
+                        print(f"{log_prefix} ❌ [AEGIS] сигнал отклонён (pre_aegis_score={base_score:.1f})"
+                              f" — z_gate мог быть bypassed, но AEGIS internal score ниже порога")
                     return None
             except Exception as e:
                 print(f"AegisEngine error {symbol}: {e}")
@@ -1010,9 +1920,13 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
         if state.risk_manager:
             try:
                 open_usd = state.risk_manager.capital * 0.2  # Approximation
+                # FIX: real win_rate from performance tracker (was hardcoded 0.62)
+                _perf_stats = state.performance_tracker.get_stats(7) if state.performance_tracker else {}
+                _real_wr    = _perf_stats.get("win_rate", 0.0) if _perf_stats.get("total_trades", 0) >= 10 else 0.55
+                _real_awp   = _perf_stats.get("avg_win_pct", 5.0) or 5.0
                 risk_result = state.risk_manager.calculate_position_size(
-                    win_rate=0.62,
-                    avg_win_pct=5.0,
+                    win_rate=_real_wr,
+                    avg_win_pct=_real_awp,
                     avg_loss_pct=Config.SL_BUFFER,
                     signal_score=final_score,
                     sl_pct=sl_pct,
@@ -1029,13 +1943,28 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             strength_str = aegis_signal.strength.value if aegis_signal else "N/A"
             state.performance_tracker.record_signal(symbol, final_score, strength_str)
 
+        # ── TradeManager: оптимизация SL/TP по liquidation magnets ──
+        _liq_opt_reasons = []
+        if state.trade_manager and _liq_analysis:
+            try:
+                _tp1_price = take_profits[0][0] if take_profits else entry_price * 0.97
+                stop_loss, _tp1_price, _liq_opt_reasons = state.trade_manager.optimize_levels_with_liquidation(
+                    direction="SHORT", entry_price=entry_price,
+                    default_sl=stop_loss, default_tp=_tp1_price, liq_analysis=_liq_analysis,
+                )
+                if _liq_opt_reasons:
+                    print(f"{log_prefix} 🧲 [LIQ-OPT] {' | '.join(_liq_opt_reasons)}")
+            except Exception as _loe:
+                print(f"[TradeManager] liq_opt error {symbol}: {_loe}")
+
         # ── Reasons assembly ──
         reasons = list(base_result.reasons)
         reasons.extend(rt_result.factors)
         if aegis_signal:
             reasons.extend(aegis_signal.reasons[:6])
+        reasons.extend(_liq_opt_reasons)
 
-        return {
+        signal = {
             "symbol":       symbol,
             "direction":    "short",
             "score":        round(final_score, 1),
@@ -1053,10 +1982,10 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
                 "RSI":      f"{md.rsi_1h:.1f}" if md.rsi_1h else "N/A",
                 "Funding":  f"{md.funding_rate:+.3f}%",
                 "L/S":      f"{md.long_short_ratio:.0f}% longs",
-                "OI 4d":    f"{md.oi_change_4d:+.1f}%",
+                "OI 15m":   f"{getattr(md,'oi_change_15m',0.0):+.1f}%",
                 "OI 1h":    f"{getattr(md,'oi_change_1h',0.0):+.1f}%",
                 "OI 4h":    f"{getattr(md,'oi_change_4h',0.0):+.1f}%",
-                "Price 4d": f"{p4d:+.1f}%",
+                "Price 24h": f"{md.price_change_24h:+.1f}%",
             },
             "aegis_components": aegis_components,
             "dca_grid":     dca_grid_info,
@@ -1071,7 +2000,7 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             # Compatibility fields
             "rsi_1h":           round(md.rsi_1h or 0, 1),
             "funding_rate":     round(md.funding_rate, 4),
-            "oi_change":        round(md.oi_change_4d, 2),
+            "oi_change":        round(getattr(md, 'oi_change_1h', 0.0), 2),
             "long_short_ratio": round(md.long_short_ratio, 1),
             "volume_spike_ratio": round(getattr(md, "volume_spike_ratio", 1.0), 2),
             "atr_14_pct":       round(getattr(md, "atr_14_pct", 0.5), 3),
@@ -1092,9 +2021,35 @@ async def scan_symbol(symbol: str, cached_btc_1h: Optional[float] = None, verbos
             "ms_has_cme_gap":   bool(getattr(_ms_log, "has_cme_gap",   False)) if _ms_log else False,
             "ms_zone_4h":       getattr(_ms_log, "zone_4h", "neutral") if _ms_log else "neutral",
             "ms_htf_structure": getattr(_ms_log, "htf_structure", "unknown") if _ms_log else "unknown",
+            # Block 5: risk size multiplier based on BTC market context
+            "pos_multiplier":   state.pump_guard.get_position_multiplier() if hasattr(state, "pump_guard") else 1.0,
         }
         
         print(f"🟢 [SIGNAL] {symbol}: score={final_score:.1f} grade={signal['grade']} — сигнал создан и отправлен в Telegram!")
+
+        # Сохранение сигнала в SQLite для истории P&L
+        if state.signals_db:
+            try:
+                from database.signals_db import SignalRecord
+                from datetime import datetime as _dt
+                _sid = state.signals_db.save_signal(SignalRecord(
+                    id=None, timestamp=_dt.utcnow(), symbol=symbol,
+                    direction="short", timeframe="15m",
+                    score=int(final_score), confidence=final_score / 100,
+                    entry_price=entry_price,
+                    oi_change=float(getattr(md, "oi_change_1h", 0) or 0),
+                    price_change=float(getattr(md, "price_change_1h", 0) or 0),
+                    volume_spike=float(getattr(md, "volume_spike_ratio", 1) or 1),
+                    recommended_sl=round(stop_loss, 8),
+                    recommended_tp=round(take_profits[0][0], 8) if take_profits else 0,
+                    leverage=int(os.getenv("SHORT_LEVERAGE", "10").split("-")[0]),
+                    pattern_name=patterns[0].name if patterns else "",
+                    bot_type="short",
+                ))
+                state._signal_db_map[symbol] = _sid
+            except Exception as _dbe:
+                pass
+
         return signal
 
     except Exception as e:
@@ -1124,7 +2079,13 @@ async def scan_market():
     except Exception as e:
         print(f"⚠️ Redis lock error: {e} — proceeding without distributed lock")
 
-    print(f"\n🔍 {Config.BOT_NAME} scan at {datetime.utcnow().strftime('%H:%M:%S UTC')}")
+    # 🧠 MEM-MONITOR: показываем RAM в начале каждого цикла
+    try:
+        import resource
+        _mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        print(f"\n🔍 {Config.BOT_NAME} scan at {datetime.utcnow().strftime('%H:%M:%S UTC')} | 🧠 RAM: {_mem_mb:.0f}MB")
+    except Exception:
+        print(f"\n🔍 {Config.BOT_NAME} scan at {datetime.utcnow().strftime('%H:%M:%S UTC')}")
     print(f"📊 {len(state.watchlist)} symbols | Score≥{Config.MIN_SCORE}")
 
     # Circuit breaker check
@@ -1144,13 +2105,27 @@ async def scan_market():
             return
 
     # BTC cache
-    _btc_cache_1h: Optional[float] = None
+    _btc_cache_1h:  Optional[float] = None
+    _btc_cache_24h: float           = 0.0
     try:
         _btc_md = await state.binance.get_complete_market_data("BTCUSDT")
         if _btc_md:
-            _btc_cache_1h = _btc_md.price_change_1h
+            _btc_cache_1h  = _btc_md.price_change_1h
+            _btc_cache_24h = getattr(_btc_md, "price_change_24h", 0.0) or 0.0
     except Exception:
         pass
+
+    # ✅ OPT: Batch-загрузка blacklist + skip:nodata в Python sets (2 Redis команды вместо ~1000)
+    # Экономия: 487 символов × 2 EXISTS = 974 команды → 2 keys() вызова на весь скан
+    try:
+        if state.redis:
+            _bl_keys = state.redis.client.keys("blacklist:*")
+            state._blacklist_set = {k.replace("blacklist:", "") for k in _bl_keys}
+            _sk_keys = state.redis.client.keys("skip:nodata:*")
+            state._skip_nodata_set = {k.replace("skip:nodata:", "") for k in _sk_keys}
+    except Exception:
+        state._blacklist_set = None
+        state._skip_nodata_set = None
 
     # ✅ OPT v18: Batch-загрузка ВСЕХ тикеров за 1 запрос (кэш 60s)
     # Без этого: 341 запрос × /v5/market/tickers → +30s на скан
@@ -1168,33 +2143,26 @@ async def scan_market():
         elif _btc_cache_1h > 0.5:  btc_adj = -1
 
     # ── ADAPTIVE MIN_SCORE по Fear & Greed + BTC тренду ─────────────────────
-    # Динамически сдвигает порог Aegis Engine в диапазоне 62-78
-    # SHORT: жадность → лучше шортить (снижаем порог)
-    # LONG:  страх → лучше покупать (снижаем порог)
-    _base_aegis = Config.MIN_SCORE  # default из env (72)
+    # ✅ FIX: Adaptive base = MIN_SHORT_BASE_SCORE (было Config.MIN_SCORE=55 → игнорировало ENV)
+    # ✅ FIX: Убран мёртвый else-код (if "short"=="short" всегда True → else недостижим)
+    # ✅ FIX: Ceiling = base + ADAPTIVE_MAX_BOOST (было хардкод 78)
+    _base_aegis = int(os.getenv("MIN_SHORT_BASE_SCORE", "58"))  # читаем напрямую
     _adaptive_score = _base_aegis
     _fg = state.fear_greed_index
     if _fg is not None:
-        if "short" == "short":
-            if _fg > 75:   _adaptive_score -= 5  # жадность = хорошо для шорта
-            elif _fg > 65: _adaptive_score -= 2
-            elif _fg < 25: _adaptive_score += 5  # страх = плохо для шорта
-            elif _fg < 35: _adaptive_score += 2
-        else:  # long
-            if _fg < 20:   _adaptive_score -= 5  # экстремальный страх = покупаем
-            elif _fg < 35: _adaptive_score -= 2
-            elif _fg > 75: _adaptive_score += 5  # жадность = осторожно с лонгами
-            elif _fg > 65: _adaptive_score += 2
+        # SHORT: жадность → лучше шортить (снижаем порог), страх → плохо для шорта (повышаем)
+        if _fg > 75:   _adaptive_score -= 5
+        elif _fg > 65: _adaptive_score -= 2
+        elif _fg < 25: _adaptive_score += 5
+        elif _fg < 35: _adaptive_score += 2
     if _btc_cache_1h is not None:
-        if "short" == "short":
-            if _btc_cache_1h > 3.0:  _adaptive_score += 3  # BTC растёт = шортить сложнее
-            elif _btc_cache_1h < -2.0: _adaptive_score -= 3  # BTC падает = шорты проще
-        else:  # long
-            if _btc_cache_1h < -3.0:  _adaptive_score += 3  # BTC падает = лонги опаснее
-            elif _btc_cache_1h > 2.0:  _adaptive_score -= 2  # BTC растёт = лонги легче
-    _adaptive_score = max(62, min(78, _adaptive_score))
+        # SHORT: BTC растёт = шортить сложнее (повышаем порог), BTC падает = шорты проще
+        if _btc_cache_1h > 3.0:  _adaptive_score += 3
+        elif _btc_cache_1h < -2.0: _adaptive_score -= 3
+    # Clamp: не выше base+ADAPTIVE_MAX_BOOST, не ниже base-5
+    _adaptive_score = max(_base_aegis - 5, min(_base_aegis + Config.ADAPTIVE_MAX_BOOST, _adaptive_score))
     if _adaptive_score != _base_aegis:
-        print(f"🎯 [ADAPTIVE] Aegis min_score: {_base_aegis} → {_adaptive_score} "
+        print(f"🎯 [ADAPTIVE] SHORT min: {_base_aegis} → {_adaptive_score} "
               f"(F&G={_fg}, BTC_1h={(_btc_cache_1h or 0):.1f}%)")
     state._adaptive_min_score = _adaptive_score
 
@@ -1202,6 +2170,10 @@ async def scan_market():
     exchange_full = active_count >= Config.MAX_POSITIONS
     if exchange_full:
         print(f"📊 Exchange: {active_count}/{Config.MAX_POSITIONS} SHORT slots — TG-only mode")
+
+    # A5: сбрасываем OHLCV кеш перед новым циклом скана
+    if state.ohlcv_cache:
+        state.ohlcv_cache.cycle_reset()
 
     new_signals   = 0
     tg_only_count = 0
@@ -1217,6 +2189,15 @@ async def scan_market():
         "low_score": 0,
     }
 
+    # D: SystemicPumpGuard — сбрасываем счётчики перед сканом, передаём BTC
+    state.pump_guard.reset_cycle()
+    state.pump_guard.update_btc(_btc_cache_1h or 0.0)
+
+    # BTC Momentum Guard — обновляем историю BTC 1h (V-shape detector)
+    state.btc_momentum_guard.update(_btc_cache_1h or 0.0)
+    if state.btc_momentum_guard.is_vshape_active:
+        print(f"⚠️ [BTC_MOMENTUM] V-Shape/Recovery активен: {state.btc_momentum_guard.reason}")
+
     # ✅ FIX БАГ 5: Параллельный pre-fetch — сокращает скан с ~5 мин до ~30с
     # SCAN_CONCURRENCY=8 означает 8 символов одновременно (по умолчанию)
     _SCAN_SEM = asyncio.Semaphore(int(os.getenv("SCAN_CONCURRENCY", "12")))  # ✅ FIX v17: 8→12
@@ -1228,7 +2209,7 @@ async def scan_market():
             try:
                 if _is_fresh(state.redis.get_signals(Config.BOT_TYPE, sym, limit=1)):
                     return sym, _FRESH
-                sig = await scan_symbol(sym, _btc_cache_1h)
+                sig = await scan_symbol(sym, _btc_cache_1h, cached_btc_24h=_btc_cache_24h)
                 return sym, sig
             except Exception as _pfe:
                 print(f"⚠️ Prefetch {sym}: {_pfe}")
@@ -1239,6 +2220,10 @@ async def scan_market():
     _prefetch_results = await asyncio.gather(*_prefetch_tasks)
     _dt = (datetime.utcnow() - _t0).total_seconds()
     print(f"⚡ Parallel fetch: {len(state.watchlist)} symbols in {_dt:.1f}s")
+    # D: SystemicPumpGuard — вычисляем pump-режим после сбора статистики по альтам
+    state.pump_guard.evaluate()
+    if state.pump_guard.is_pump():
+        print(f"🆙 [SYSTEMIC_PUMP] {state.pump_guard.reason} — SHORT на HTF=BULLISH заблокирован")
     _prefetch_map = dict(_prefetch_results)
 
     for symbol in state.watchlist:
@@ -1349,8 +2334,47 @@ async def scan_market():
                         if trade_result:
                             active_count += 1
                             exchange_full = active_count >= Config.MAX_POSITIONS
+                            # signals_db: mark signal as executed
+                            if state.signals_db:
+                                try:
+                                    _sid = state._signal_db_map.get(symbol)
+                                    _ep = float(trade_result.get("entry_price", 0)) if isinstance(trade_result, dict) else 0.0
+                                    if _sid and _ep:
+                                        state.signals_db.mark_executed(_sid, _ep)
+                                except Exception:
+                                    pass
+                            # TradeManager: запись открытой позиции для TP-статистики
+                            if state.trade_manager:
+                                try:
+                                    _lev = int(str(Config.LEVERAGE).split("-")[0])
+                                    _qty = float(trade_result.get("qty", 0)) if isinstance(trade_result, dict) else 0.0
+                                    state.trade_manager.create_position(
+                                        symbol=symbol, direction="SHORT",
+                                        entry_price=signal.get("entry_price", signal.get("price", 0)),
+                                        qty=_qty, stop_loss=signal.get("stop_loss", 0), leverage=_lev,
+                                    )
+                                except Exception as _tme:
+                                    print(f"[TradeManager] create_position {symbol}: {_tme}")
                     except Exception as e:
                         print(f"AutoTrader error {symbol}: {e}")
+                        # SignalQueue: повторная попытка с exponential backoff (max 3)
+                        if state.signal_queue:
+                            try:
+                                _tps = signal.get("take_profits", [])
+                                state.signal_queue.add_from_detection(
+                                    symbol=symbol, direction="SHORT",
+                                    score=int(signal.get("score", 0)),
+                                    price=float(signal.get("price", 0)),
+                                    pattern=signal.get("pattern", ""),
+                                    indicators=signal,
+                                    entry=signal.get("entry_price", 0),
+                                    stop_loss=signal.get("stop_loss", 0),
+                                    take_profits=_tps if isinstance(_tps, list) else [],
+                                    leverage=str(Config.LEVERAGE), risk="Kelly-sized",
+                                )
+                                print(f"[SignalQueue] {symbol} SHORT → очередь retry")
+                            except Exception as _qe:
+                                print(f"[SignalQueue] queue error {symbol}: {_qe}")
                 new_signals += 1
             else:
                 tg_only_count += 1
@@ -1359,7 +2383,11 @@ async def scan_market():
             if signal.get("aegis_components"):
                 demo_flag = " [DEMO]" if Config.BINGX_DEMO else " [REAL]"
                 if exchange_full and not trade_result:
-                    final_status = f"📊 TG-уведомление (биржа заполнена {active_count}/{Config.MAX_POSITIONS})"
+                    final_status = f"📊 Виртуальная (биржа заполнена {active_count}/{Config.MAX_POSITIONS})"
+                    if state.redis:
+                        saved = state.redis.save_virtual_position(Config.BOT_TYPE, symbol, signal)
+                        if saved:
+                            print(f"✅ Virtual position saved (exchange full): {symbol}")
                 elif trade_result:
                     exchange_label = "BingX DEMO" if Config.BINGX_DEMO else "BingX REAL"
                     final_status = f"✅ Открыта на {exchange_label}"
@@ -1403,6 +2431,10 @@ async def scan_market():
         except Exception:
             pass
 
+    # 🧹 MEM-FIX: явный GC после каждого цикла — освобождаем OHLCV/паттерны/asyncio объекты
+    _gc_collected = gc.collect()
+    print(f"🧹 [GC] Собрано {_gc_collected} объектов после скан-цикла")
+
 
 async def background_scanner():
     while state.is_running:
@@ -1412,6 +2444,198 @@ async def background_scanner():
             except Exception as e:
                 print(f"Scanner error: {e}")
         await asyncio.sleep(Config.SCAN_INTERVAL)
+
+
+async def _watchlist_refresh_task():
+    """✅ C3: Обновляем вотчлист каждые WATCHLIST_REFRESH_H часов."""
+    refresh_interval = int(Config.WATCHLIST_REFRESH_H * 3600)
+    print(f"[WATCHLIST] Авто-обновление каждые {Config.WATCHLIST_REFRESH_H:.1f}ч")
+    while state.is_running:
+        await asyncio.sleep(refresh_interval)
+        try:
+            old_count = len(state.watchlist)
+            new_wl = await _build_combined_watchlist(
+                state.binance, Config.MIN_VOLUME_USDT, Config.MAX_WATCHLIST
+            )
+            if new_wl:
+                state.watchlist = new_wl
+                print(f"[WATCHLIST] ✅ Обновлён: {old_count} → {len(new_wl)} монет")
+            else:
+                print("[WATCHLIST] ⚠️ Обновление пустое — оставляем старый")
+        except Exception as e:
+            print(f"[WATCHLIST] ❌ Ошибка: {e}")
+
+
+async def _startup_sl_sync():
+    """
+    🚨 FIX: SL=0.000000 bug — синхронизация при старте.
+
+    SHORT бот обрабатывает ТОЛЬКО SHORT позиции.
+    LONG позиции — ответственность long-bot.
+    Защита от дублирования через Redis-ключ (TTL 10 мин).
+    """
+    await asyncio.sleep(10)  # Ждём инициализации всех компонентов
+
+    if not state.auto_trader or not state.auto_trader.bingx:
+        print("[SL-SYNC] AutoTrader не инициализирован — пропускаем")
+        return
+
+    print("[SL-SYNC] 🔍 Проверка SL на SHORT BingX позициях...")
+    try:
+        positions = await state.auto_trader.bingx.get_positions()
+        if not positions:
+            print("[SL-SYNC] Нет открытых позиций")
+            return
+
+        fixed = 0
+        skipped = 0
+        for p in positions:
+            # ✅ FIX: SHORT бот трогает ТОЛЬКО SHORT позиции
+            if p.position_side != "SHORT":
+                continue
+
+            sym = p.symbol  # уже в формате "BTC-USDT"
+            direction = "short"
+            entry = p.entry_price
+
+            # ✅ Защита от дублирования: проверяем Redis-ключ
+            _dedup_key = f"sl_sync_done:short:{sym}"
+            try:
+                if state.redis.client.exists(_dedup_key):
+                    print(f"[SL-SYNC] {sym} SHORT: уже синкован недавно — пропускаем")
+                    continue
+            except Exception:
+                pass
+
+            if p.stop_loss and p.stop_loss > 0:
+                # SL есть на бирже — только синкуем Redis если пустой
+                _redis_sig = state.redis.get_position(Config.BOT_TYPE, sym.replace("-", ""))
+                if _redis_sig:
+                    _changed = False
+                    if _f(_redis_sig.get("stop_loss", 0)) <= 0:
+                        _redis_sig["stop_loss"] = p.stop_loss
+                        _changed = True
+                        print(f"[SL-SYNC] {sym} SHORT: Redis SL пустой, записан {p.stop_loss:.6f} с биржи")
+                    # ✅ Enrichment: восстанавливаем take_profits из открытых TP ордеров если пусто
+                    _rs_tps = _redis_sig.get("take_profits")
+                    if not _rs_tps:
+                        try:
+                            _tp_result = await state.auto_trader.bingx._make_request(
+                                "GET", "/openApi/swap/v2/trade/openOrders", params={"symbol": sym}
+                            )
+                            if _tp_result and _tp_result.get("code") == 0:
+                                _tp_orders = [
+                                    o for o in (_tp_result.get("data", {}).get("orders", []))
+                                    if o.get("type") in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT", "LIMIT")
+                                    and o.get("positionSide") == "SHORT"
+                                    and o.get("side") == "BUY"
+                                ]
+                                if _tp_orders:
+                                    _tp_prices = sorted(
+                                        float(o.get("stopPrice") or o.get("price", 0))
+                                        for o in _tp_orders if float(o.get("stopPrice") or o.get("price", 0)) > 0
+                                    )
+                                    _w = round(100 / len(_tp_prices)) if _tp_prices else 25
+                                    _redis_sig["take_profits"] = [[_pr, _w] for _pr in _tp_prices]
+                                    _changed = True
+                                    print(f"[SL-SYNC] {sym} SHORT: take_profits восстановлены из {len(_tp_prices)} TP ордеров")
+                        except Exception as _tp_e:
+                            print(f"[SL-SYNC] {sym}: TP enrichment error: {_tp_e}")
+                    if _changed:
+                        state.redis.save_position(Config.BOT_TYPE, sym.replace("-", ""), _redis_sig)
+                continue
+
+            # SL отсутствует на бирже — рассчитываем аварийный
+            if entry <= 0:
+                skipped += 1
+                continue
+
+            # ✅ FIX: BingX может вернуть stop_loss=0 пока реальный STOP_MARKET ордер уже есть.
+            # Проверяем открытые ордера явно, чтобы не создавать дублирующий SL.
+            _existing_sl_orders = []
+            try:
+                _oo_result = await state.auto_trader.bingx._make_request(
+                    "GET", "/openApi/swap/v2/trade/openOrders",
+                    params={"symbol": sym}
+                )
+                if _oo_result and _oo_result.get("code") == 0:
+                    _all_orders = _oo_result.get("data", {}).get("orders", [])
+                    _existing_sl_orders = [
+                        o for o in _all_orders
+                        if o.get("type") in ("STOP_MARKET", "STOP")
+                        and o.get("positionSide") == "SHORT"
+                    ]
+            except Exception as _oe:
+                print(f"[SL-SYNC] ⚠️ {sym}: ошибка запроса ордеров: {_oe}")
+
+            if _existing_sl_orders:
+                _sl_price = float(_existing_sl_orders[0].get("stopPrice", 0))
+                print(f"[SL-SYNC] {sym} SHORT: уже есть SL ордер {_sl_price:.6f} — пропускаем (BingX вернул stop_loss=0)")
+                _redis_sig = state.redis.get_position(Config.BOT_TYPE, sym.replace("-", ""))
+                if _redis_sig and _f(_redis_sig.get("stop_loss", 0)) <= 0 and _sl_price > 0:
+                    _redis_sig["stop_loss"] = _sl_price
+                    state.redis.save_position(Config.BOT_TYPE, sym.replace("-", ""), _redis_sig)
+                continue
+
+            sl_pct = Config.SL_BUFFER
+            sl = entry * (1 + sl_pct / 100)  # SHORT: SL ВЫШЕ entry
+
+            pos_side = "SHORT"
+            # ── RETRY LOOP: до 3 попыток, 15-25с между попытками ──
+            _max_attempts = 3
+            _sl_ok = False
+            for _att in range(_max_attempts):
+                if _att > 0:
+                    _wait = 15 + _att * 5
+                    print(f"[SL-SYNC] ⏳ {sym} SHORT: retry {_att}/{_max_attempts-1} через {_wait}s...")
+                    await asyncio.sleep(_wait)
+                _sl_ok = await state.auto_trader.bingx.update_stop_loss(sym, pos_side, sl, direction)
+                if _sl_ok:
+                    break
+
+            if _sl_ok:
+                fixed += 1
+                print(f"[SL-SYNC] ✅ {sym} SHORT: аварийный SL={sl:.6f} выставлен")
+                _redis_sig = state.redis.get_position(Config.BOT_TYPE, sym.replace("-", ""))
+                if _redis_sig:
+                    _redis_sig["stop_loss"] = sl
+                    state.redis.save_position(Config.BOT_TYPE, sym.replace("-", ""), _redis_sig)
+                try:
+                    state.redis.client.setex(_dedup_key, 600, "1")
+                except Exception:
+                    pass
+                await state.telegram.send_message(
+                    f"🚨 <b>SL SYNC</b> — аварийный стоп выставлен\n\n"
+                    f"🔴 <code>#{sym}</code> SHORT\n"
+                    f"📍 Вход: <b>{entry:.6f}</b>\n"
+                    f"🛑 Новый SL: <b>{sl:.6f}</b> ({sl_pct}%)\n"
+                    f"<i>⚠️ Позиция не имела SL — исправлено при старте</i>"
+                )
+            else:
+                skipped += 1
+                print(f"[SL-SYNC] ❌ {sym} SHORT: SL НЕ ВЫСТАВЛЕН после {_max_attempts} попыток — позиция БЕЗ ЗАЩИТЫ!")
+                try:
+                    await state.telegram.send_message(
+                        f"🚨🚨 <b>КРИТИЧНО: SL НЕ ВЫСТАВЛЕН</b>\n\n"
+                        f"🔴 <code>#{sym}</code> SHORT\n"
+                        f"📍 Вход: <b>{entry:.6f}</b>\n"
+                        f"🛑 Пробовали SL: <b>{sl:.6f}</b>\n"
+                        f"❌ <b>{_max_attempts} попытки провалились — позиция без стоп-лосса!</b>\n"
+                        f"⚠️ Проверь и выставь SL вручную на BingX!"
+                    )
+                except Exception:
+                    pass
+
+        print(f"[SL-SYNC] Итого: {fixed} исправлено, {skipped} пропущено из {len(positions)}")
+
+    except Exception as e:
+        import traceback
+        print(f"[SL-SYNC] ❌ Ошибка: {e}\n{traceback.format_exc()}")
+
+
+def _f(v) -> float:
+    try:   return float(v)
+    except: return 0.0
 
 
 async def _fear_greed_task():
@@ -1446,11 +2670,18 @@ async def _daily_report_task():
                 # ✅ FIX: cmd_daily_report на TelegramCommandHandler, не TelegramBot
                 if hasattr(state.telegram, "cmd_daily_report"):
                     await state.telegram.cmd_daily_report("", state.telegram.chat_id)
-                elif state.telegram_handler and hasattr(state.telegram_handler, "cmd_daily_report"):
-                    await state.telegram_handler.cmd_daily_report("", state.telegram.chat_id)
+                elif hasattr(state, "cmd_handler") and state.cmd_handler and hasattr(state.cmd_handler, "cmd_daily_report"):
+                    await state.cmd_handler.cmd_daily_report("", state.telegram.chat_id)  # ✅ FIX C2
                 else:
                     await state.telegram._send_daily_report() if hasattr(state.telegram, "_send_daily_report") else None
                 print("✅ Daily report sent (Redis-based)")
+                # PerformanceTracker: Sharpe / PF / MaxDD (in-RAM stats)
+                if state.performance_tracker:
+                    try:
+                        pt_msg = state.performance_tracker.daily_report()
+                        await state.telegram.send_message(pt_msg)
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"Daily report error: {e}")
 

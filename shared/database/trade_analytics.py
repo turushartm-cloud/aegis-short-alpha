@@ -32,17 +32,20 @@ class TradeResult:
 class TradeAnalytics:
     """
     🆕 Аналитика сделок с разбивкой по TP уровням.
-    
-    Хранит в Redis:
-    - trade_history:list — история всех сделок
-    - tp_stats:{date}:{level} — статистика по TP уровням за день
-    - daily_tp_report:{date} — готовый отчёт по TP
+
+    Хранит в Redis (с bot_type префиксом — short: или long:):
+    - {bot}:trade_history:list — история всех сделок
+    - {bot}:tp_stats:{date} — статистика по TP уровням за день
+    - {bot}:tp_stats:{date}:by_tf — по таймфреймам
     """
-    
-    def __init__(self, redis_client):
-        self.redis = redis_client
+
+    def __init__(self, redis_client, bot_type: str = "short"):
+        # ✅ B8-FIX #3: Поддерживаем и UpstashRedisClient и raw redis.Redis
+        # UpstashRedisClient.client — это настоящий redis.Redis объект с lpush/hincrby
+        self.redis = getattr(redis_client, "client", redis_client)
+        self.bot_type = bot_type
         self.TP_LEVELS = ["SL", "BE", "TP1", "TP2", "TP3", "TP4", "TP5", "TP6"]
-    
+
     def record_trade(self, trade: TradeResult):
         """Записывает сделку с указанием TP уровня"""
         trade_data = {
@@ -59,24 +62,27 @@ class TradeAnalytics:
             "timeframe": trade.timeframe,
             "closed_at": trade.closed_at.isoformat(),
         }
-        
-        # Сохраняем в историю
-        self.redis.lpush("trade_history", json.dumps(trade_data))
-        self.redis.ltrim("trade_history", 0, 9999)  # Храним последние 10k
-        
+
+        # ✅ B8-FIX #3: Используем {bot_type}: префикс — short/long изолированы
+        hist_key = f"{self.bot_type}:trade_history"
+        self.redis.lpush(hist_key, json.dumps(trade_data))
+        self.redis.ltrim(hist_key, 0, 9999)  # Храним последние 10k
+        self.redis.expire(hist_key, 7776000)  # 90 дней
+
         # Обновляем статистику по TP уровню
         date_key = trade.closed_at.strftime("%Y-%m-%d")
         level_name = self._get_level_name(trade.tp_level)
-        
+        stats_key = f"{self.bot_type}:tp_stats:{date_key}"
+
         # Счётчик
-        self.redis.hincrby(f"tp_stats:{date_key}", f"{level_name}:count", 1)
-        
+        self.redis.hincrby(stats_key, f"{level_name}:count", 1)
+
         # P&L суммарный
-        self.redis.hincrbyfloat(f"tp_stats:{date_key}", f"{level_name}:pnl_pct", trade.pnl_percent)
-        self.redis.hincrbyfloat(f"tp_stats:{date_key}", f"{level_name}:pnl_usd", trade.pnl_usd)
-        
+        self.redis.hincrbyfloat(stats_key, f"{level_name}:pnl_pct", trade.pnl_percent)
+        self.redis.hincrbyfloat(stats_key, f"{level_name}:pnl_usd", trade.pnl_usd)
+
         # По timeframe
-        self.redis.hincrby(f"tp_stats:{date_key}:by_tf", f"{trade.timeframe}:{level_name}", 1)
+        self.redis.hincrby(f"{stats_key}:by_tf", f"{trade.timeframe}:{level_name}", 1)
     
     def _get_level_name(self, level: int) -> str:
         """Конвертирует число в название уровня"""
@@ -90,7 +96,7 @@ class TradeAnalytics:
     
     def get_daily_tp_stats(self, date: str) -> Dict:
         """Получает статистику по TP уровням за день"""
-        stats = self.redis.hgetall(f"tp_stats:{date}")
+        stats = self.redis.hgetall(f"{self.bot_type}:tp_stats:{date}")
         
         result = {}
         for level in self.TP_LEVELS:
@@ -214,18 +220,20 @@ def record_trade_with_tp(
     tp_level: int,  # 1-6 или 0 (SL) или -1 (BE)
     timeframe: str,
     closed_at: datetime = None,
+    bot_type: str = "short",  # ✅ B8-FIX #3: bot_type для изоляции ключей
 ):
     """
     🆕 Упрощённая функция для записи сделки с TP уровнем.
-    
+
     Args:
         tp_level: 1-6 (TP1-6), 0 (SL), -1 (BE)
+        bot_type: "short" или "long" — определяет Redis key prefix
     """
     if closed_at is None:
         closed_at = datetime.utcnow()
-    
-    analytics = TradeAnalytics(redis_client)
-    
+
+    analytics = TradeAnalytics(redis_client, bot_type=bot_type)
+
     trade = TradeResult(
         symbol=symbol,
         direction=direction,

@@ -47,14 +47,6 @@ from datetime import datetime, timedelta
 import aiohttp
 import asyncio
 
-# 🆕 Multi-timeframe support
-from .multi_timeframe_detector import (
-    MultiTimeframeDetector,
-    Timeframe,
-    AggregatedSignal,
-    format_multi_tf_message
-)
-
 # ─────────────────────────────────────────────────────────────────────────────
 # RESULT TYPES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,6 +281,11 @@ class RealtimeScorer:
                     factors.append(f"Объём ×{volume_mult:.1f} — повышенная активность")
                 elif volume_mult >= 1.5:
                     bonus += 1
+
+        # C: price_trend=up при SHORT — цена ещё движется вверх, штраф −3
+        if direction == "short" and getattr(market_data, "price_trend", "flat") == "up":
+            bonus -= 3
+            factors.append("📈 price_trend=up при SHORT −3")
 
         # ── Итог ─────────────────────────────────────────────────────────
         bonus       = max(bonus, -20)          # не уходим в минус больше -20

@@ -144,7 +144,31 @@ class MarketStructureResult:
     has_ob_4h:     bool = False
     has_ob_1d:     bool = False
 
+    # ── Weekly (1W) SNR / OB / FVG / Zone ────────────────────────────────────
+    has_1w:           bool  = False
+    zone_weekly:      str   = "neutral"   # "discount" | "equilibrium" | "premium"
+    equilibrium_1w:   float = 0.0
+    fvg_bearish_1w:   Optional[Tuple[float, float]] = None
+    fvg_bullish_1w:   Optional[Tuple[float, float]] = None
+    has_fvg_1w:       bool  = False
+    ob_bearish_1w:    Optional[Tuple[float, float]] = None
+    ob_bullish_1w:    Optional[Tuple[float, float]] = None
+    has_ob_1w:        bool  = False
+    poc_1w:           float = 0.0
+    fib_1w:           Optional[FibLevels] = None
+    htf_structure_1w: str   = "unknown"
+    htf_bias_1w:      str   = "neutral"
 
+    # ── Monthly (1M) levels ───────────────────────────────────────────────────
+    has_1M:           bool  = False
+    zone_monthly:     str   = "neutral"
+    poc_1M:           float = 0.0
+    month_high:       float = 0.0   # high текущего / последнего месяца
+    month_low:        float = 0.0
+
+    # ── Confluence score ──────────────────────────────────────────────────────
+    confluence_short: int   = 0   # кол-во совпавших медвежьих сигналов (OB+FVG+SNR+zone)
+    confluence_long:  int   = 0   # кол-во совпавших бычьих сигналов
 
     # ── Ключевые уровни (для вывода) ─────────────────────────────────────────
     key_levels: List[Tuple[float, str]] = field(default_factory=list)
@@ -253,9 +277,15 @@ def _detect_htf_structure(candles_4h: list) -> Tuple[str, str, float, float]:
     return "ranging", "neutral", swing_h, swing_l
 
 
-def _detect_fvg(candles: list, price: float, lookback: int = 15) -> Tuple[Optional[Tuple], Optional[Tuple], bool, bool]:
+def _detect_fvg(
+    candles: list,
+    price: float,
+    lookback: int = 15,
+    prox_pct: float = 1.5,
+) -> Tuple[Optional[Tuple], Optional[Tuple], bool, bool]:
     """
     Fair Value Gap на заданном ТФ.
+    prox_pct: % близости цены к gap (4H=1.5, 1W=8.0, 1M=15.0)
     Returns: (bearish_fvg, bullish_fvg, has_bearish, has_bullish)
     """
     bear_fvg = bull_fvg = None
@@ -263,31 +293,38 @@ def _detect_fvg(candles: list, price: float, lookback: int = 15) -> Tuple[Option
         return None, None, False, False
 
     slc = candles[-lookback:]
+    _prox = 1 + prox_pct / 100
+    _prox_inv = 1 - prox_pct / 100
     for i in range(len(slc) - 2):
-        # Медвежий FVG: low[i] > high[i+2]  (разрыв между свечами 0 и 2)
+        # Медвежий FVG: low[i] > high[i+2]
         if slc[i].low > slc[i + 2].high:
             gap_low   = slc[i + 2].high
             gap_high  = slc[i].low
-            # Проверяем что ещё не закрылся
             filled = any(slc[j].high >= gap_high for j in range(i + 1, len(slc)))
-            if not filled and price <= gap_high * 1.01:  # цена рядом
+            if not filled and price <= gap_high * _prox:
                 bear_fvg = (gap_low, gap_high)
-        # Бычий FVG: high[i+2] < low[i]  (разрыв снизу)
+        # Бычий FVG: high[i+2] < low[i]
         if slc[i + 2].low > slc[i].high:
             gap_low  = slc[i].high
             gap_high = slc[i + 2].low
-            filled = any(slc[j].low <= gap_low * 0.99 for j in range(i + 1, len(slc)))
-            if not filled and price >= gap_low * 0.99:
+            filled = any(slc[j].low <= gap_low * _prox_inv for j in range(i + 1, len(slc)))
+            if not filled and price >= gap_low * _prox_inv:
                 bull_fvg = (gap_low, gap_high)
 
     return bear_fvg, bull_fvg, bear_fvg is not None, bull_fvg is not None
 
 
-def _detect_ob(candles: list, price: float, lookback: int = 20) -> Tuple[Optional[Tuple], Optional[Tuple], bool, bool]:
+def _detect_ob(
+    candles: list,
+    price: float,
+    lookback: int = 20,
+    drop_threshold: float = 1.5,
+    prox_pct: float = 1.5,
+) -> Tuple[Optional[Tuple], Optional[Tuple], bool, bool]:
     """
     Order Block на заданном ТФ.
-    Медвежий OB: последняя бычья свеча перед сильным снижением.
-    Бычий OB: последняя медвежья свеча перед сильным ростом.
+    drop_threshold: минимальное движение после OB свечи (4H=1.5%, 1W=4.0%)
+    prox_pct: % близости цены к OB (4H=1.5%, 1W=5.0%)
     Returns: (bearish_ob, bullish_ob, has_bearish, has_bullish)
     """
     bear_ob = bull_ob = None
@@ -295,23 +332,25 @@ def _detect_ob(candles: list, price: float, lookback: int = 20) -> Tuple[Optiona
         return None, None, False, False
 
     slc = candles[-lookback:]
+    _prox_up  = 1 + prox_pct / 100
+    _prox_dn  = 1 - prox_pct / 100
     for i in range(len(slc) - 2):
         c = slc[i]
         # Медвежий OB: бычья свеча → потом падение
-        if c.close > c.open:  # бычья
+        if c.close > c.open:
             drop = (c.high - slc[i + 2].low) / c.high * 100 if c.high > 0 else 0
-            if drop > 1.5:  # падение > 1.5%
+            if drop > drop_threshold:
                 ob_low  = c.open
                 ob_high = c.high
-                if price <= ob_high * 1.01:  # цена рядом
+                if price <= ob_high * _prox_up:
                     bear_ob = (ob_low, ob_high)
         # Бычий OB: медвежья свеча → потом рост
-        if c.close < c.open:  # медвежья
+        if c.close < c.open:
             rise = (slc[i + 2].high - c.low) / c.low * 100 if c.low > 0 else 0
-            if rise > 1.5:
+            if rise > drop_threshold:
                 ob_low  = c.low
                 ob_high = c.open
-                if price >= ob_low * 0.99:
+                if price >= ob_low * _prox_dn:
                     bull_ob = (ob_low, ob_high)
 
     return bear_ob, bull_ob, bear_ob is not None, bull_ob is not None
@@ -327,6 +366,8 @@ def compute_market_structure(
     klines_1h:  list,
     klines_4h:  list,
     klines_1d:  list,
+    klines_1w:  Optional[list] = None,
+    klines_1M:  Optional[list] = None,
 ) -> MarketStructureResult:
     """
     Вычисляет полную рыночную структуру из свечей нескольких ТФ.
@@ -452,6 +493,76 @@ def compute_market_structure(
             _detect_ob(klines_1d, price, 14)
         r.has_ob_1d = bear_ob_d or bull_ob_d
 
+    # ── Weekly (1W) SNR / OB / FVG / Zone ─────────────────────────────────────
+    _kw = klines_1w or []
+    r.has_1w = len(_kw) >= 4
+    if r.has_1w:
+        _w_lookback = min(20, len(_kw))
+        sh_1w, sl_1w = _swing_high_low(_kw, _w_lookback)
+        if sh_1w > sl_1w:
+            r.fib_1w        = _calc_fib(sh_1w, sl_1w, "1w")
+            r.equilibrium_1w = r.fib_1w.r_50
+            r.zone_weekly   = _zone(price, sh_1w, sl_1w)
+        r.poc_1w = _calc_poc(_kw, min(10, len(_kw)))
+        if len(_kw) >= 12:
+            r.htf_structure_1w, r.htf_bias_1w, _, _ = _detect_htf_structure(_kw)
+        if len(_kw) >= 5:
+            # Weekly: broader proximity (8%) and larger move thresholds (4%)
+            r.fvg_bearish_1w, r.fvg_bullish_1w, _bfw, _bulfw = \
+                _detect_fvg(_kw, price, min(10, len(_kw)), prox_pct=8.0)
+            r.has_fvg_1w = _bfw or _bulfw
+            r.ob_bearish_1w, r.ob_bullish_1w, _bow, _bulow = \
+                _detect_ob(_kw, price, min(12, len(_kw)), drop_threshold=4.0, prox_pct=5.0)
+            r.has_ob_1w = _bow or _bulow
+
+    # ── Monthly (1M) levels ────────────────────────────────────────────────────
+    _km = klines_1M or []
+    r.has_1M = len(_km) >= 2
+    if r.has_1M:
+        sh_1M, sl_1M = _swing_high_low(_km, min(6, len(_km)))
+        r.month_high  = sh_1M
+        r.month_low   = sl_1M
+        r.poc_1M      = _calc_poc(_km, min(6, len(_km)))
+        if sh_1M > sl_1M:
+            r.zone_monthly = _zone(price, sh_1M, sl_1M)
+
+    # ── Confluence score ───────────────────────────────────────────────────────
+    _cs = 0  # short
+    _cl = 0  # long
+    # 4H signals
+    if r.has_ob_4h and r.ob_bearish_4h:
+        lo, hi = r.ob_bearish_4h
+        if lo <= price <= hi * 1.02: _cs += 1
+    if r.has_fvg_4h and r.fvg_bearish_4h:
+        lo, hi = r.fvg_bearish_4h
+        if lo <= price <= hi * 1.01: _cs += 1
+    if r.has_ob_4h and r.ob_bullish_4h:
+        lo, hi = r.ob_bullish_4h
+        if lo * 0.98 <= price <= hi: _cl += 1
+    if r.has_fvg_4h and r.fvg_bullish_4h:
+        lo, hi = r.fvg_bullish_4h
+        if lo * 0.99 <= price <= hi: _cl += 1
+    # Weekly signals
+    if r.has_ob_1w and r.ob_bearish_1w:
+        lo, hi = r.ob_bearish_1w
+        if lo <= price <= hi * 1.02: _cs += 1
+    if r.has_fvg_1w and r.fvg_bearish_1w:
+        lo, hi = r.fvg_bearish_1w
+        if lo <= price <= hi * 1.01: _cs += 1
+    if r.has_ob_1w and r.ob_bullish_1w:
+        lo, hi = r.ob_bullish_1w
+        if lo * 0.98 <= price <= hi: _cl += 1
+    if r.has_fvg_1w and r.fvg_bullish_1w:
+        lo, hi = r.fvg_bullish_1w
+        if lo * 0.99 <= price <= hi: _cl += 1
+    # Zone signals
+    if r.zone_4h == "premium":    _cs += 1
+    if r.zone_weekly == "premium": _cs += 1
+    if r.zone_4h == "discount":   _cl += 1
+    if r.zone_weekly == "discount": _cl += 1
+    r.confluence_short = _cs
+    r.confluence_long  = _cl
+
     # ── Ключевые уровни (для логов) ───────────────────────────────────────────
     # ── Pivot Points (Floor Pivots от Previous Day) ────────────────────────────────
     if r.pdh > 0 and r.pdl > 0 and r.pdc > 0:
@@ -516,6 +627,13 @@ def compute_market_structure(
     if r.pwl:  levels.append((r.pwl, "PWL"))
     if r.poc_4h: levels.append((r.poc_4h, "POC 4H"))
     if r.poc_1d: levels.append((r.poc_1d, "POC 1D"))
+    if r.poc_1w: levels.append((r.poc_1w, "POC 1W"))
+    if r.poc_1M: levels.append((r.poc_1M, "POC 1M"))
+    if r.equilibrium_1w: levels.append((r.equilibrium_1w, "EQ Weekly"))
+    if r.ob_bearish_1w:  levels.append((r.ob_bearish_1w[1], "OB Bear 1W"))
+    if r.ob_bullish_1w:  levels.append((r.ob_bullish_1w[0], "OB Bull 1W"))
+    if r.fvg_bearish_1w: levels.append((r.fvg_bearish_1w[0], "FVG Bear 1W"))
+    if r.fvg_bullish_1w: levels.append((r.fvg_bullish_1w[1], "FVG Bull 1W"))
     if r.fib_4h:
         levels += [
             (r.fib_4h.r_618, "Fib 0.618 (4H)"),
@@ -600,9 +718,17 @@ def proximity_bonus(price: float, ms: MarketStructureResult, direction: str) -> 
         if _near(ms.crt_4h_low, 0.7):
             bonus += 5; reasons.append("Near CRT 4H Low +5")
 
-        # POC как магнит снизу
+        # POC 4H как магнит снизу
         if ms.poc_4h > 0 and price < ms.poc_4h and _near(ms.poc_4h, 1.0):
             bonus += 4; reasons.append("Below POC 4H (magnetic) +4")
+        elif ms.poc_4h > 0 and price > ms.poc_4h * 1.005:
+            bonus -= 3; reasons.append("Above POC 4H (extended, bad long entry) -3")
+
+        # POC 1D — дневной уровень справедливой стоимости
+        if ms.poc_1d > 0 and price < ms.poc_1d and _near(ms.poc_1d, 1.5):
+            bonus += 5; reasons.append(f"Below POC 1D (daily value) +5")
+        elif ms.poc_1d > 0 and price > ms.poc_1d * 1.01:
+            bonus -= 2; reasons.append("Above POC 1D (premium, bad long) -2")
 
         # Bullish OB 4H / 1D
         if ms.has_ob_4h and ms.ob_bullish_4h:
@@ -615,6 +741,56 @@ def proximity_bonus(price: float, ms: MarketStructureResult, direction: str) -> 
             low, high = ms.fvg_bullish_4h
             if low <= price <= high:
                 bonus += 8; reasons.append("In Bullish FVG 4H +8")
+
+        # ── Weekly SNR / OB / FVG (КРИТИЧНО для лонга!) ───────────────────────
+        if ms.zone_weekly == "discount":
+            bonus += 12; reasons.append("Weekly DISCOUNT Zone +12 (ideal long zone)")
+        elif ms.zone_weekly == "equilibrium":
+            bonus += 4; reasons.append("Weekly EQ Zone +4")
+        elif ms.zone_weekly == "premium":
+            bonus -= 10; reasons.append("Weekly PREMIUM -10 (bad long entry)")
+
+        if ms.has_ob_1w and ms.ob_bullish_1w:
+            lo, hi = ms.ob_bullish_1w
+            if lo * 0.99 <= price <= hi:
+                bonus += 15; reasons.append(f"In Bullish OB Weekly {lo:.4f}–{hi:.4f} +15 🟢")
+            elif _near(lo, 1.5):
+                bonus += 8; reasons.append(f"Near Bullish OB Weekly {lo:.4f} +8")
+
+        if ms.has_fvg_1w and ms.fvg_bullish_1w:
+            lo, hi = ms.fvg_bullish_1w
+            if lo * 0.99 <= price <= hi:
+                bonus += 12; reasons.append(f"In Bullish FVG Weekly {lo:.4f}–{hi:.4f} +12 🟢")
+
+        if ms.has_ob_1w and ms.ob_bearish_1w:
+            lo, hi = ms.ob_bearish_1w
+            if lo <= price <= hi:
+                bonus -= 15; reasons.append(f"In Bearish OB Weekly {lo:.4f}–{hi:.4f} -15 (sell wall)")
+
+        if ms.poc_1w > 0:
+            if price < ms.poc_1w * 0.99:
+                bonus += 6; reasons.append(f"Below POC 1W={ms.poc_1w:.4f} (weekly discount) +6")
+            elif _near(ms.poc_1w, 0.8):
+                bonus += 2; reasons.append(f"At POC 1W={ms.poc_1w:.4f} +2")
+            elif price > ms.poc_1w * 1.01:
+                bonus -= 5; reasons.append(f"Above POC 1W={ms.poc_1w:.4f} (extended, bad long) -5")
+
+        if ms.htf_structure_1w == "bullish":
+            bonus += 8; reasons.append("Weekly HTF Bullish Structure +8")
+        elif ms.htf_structure_1w == "bearish":
+            bonus -= 10; reasons.append("Weekly HTF Bearish Structure -10")
+
+        if ms.zone_monthly == "discount":
+            bonus += 5; reasons.append("Monthly DISCOUNT +5 (macro buy zone)")
+        elif ms.zone_monthly == "premium":
+            bonus -= 5; reasons.append("Monthly PREMIUM -5 (macro sell zone)")
+
+        if ms.confluence_long >= 4:
+            bonus += 15; reasons.append(f"Confluence LONG x{ms.confluence_long} +15 🎯")
+        elif ms.confluence_long >= 3:
+            bonus += 10; reasons.append(f"Confluence LONG x{ms.confluence_long} +10")
+        elif ms.confluence_long >= 2:
+            bonus += 5; reasons.append(f"Confluence LONG x{ms.confluence_long} +5")
 
         # Gap fill potential (цена ниже дневного гэпа вверх)
         if ms.has_daily_gap and ms.daily_gap_pct > 0:
@@ -669,6 +845,22 @@ def proximity_bonus(price: float, ms: MarketStructureResult, direction: str) -> 
         if _near(ms.crt_4h_high, 0.7):
             bonus += 5; reasons.append("Near CRT 4H High +5")
 
+        # POC 4H — цена выше POC = в зоне перекупленности (шорт из хаёв)
+        if ms.poc_4h > 0 and price > ms.poc_4h * 1.005:
+            bonus += 5; reasons.append(f"Above POC 4H (extended, short zone) +5")
+        elif ms.poc_4h > 0 and _near(ms.poc_4h, 0.5):
+            bonus += 2; reasons.append(f"At POC 4H (fair value) +2")
+        elif ms.poc_4h > 0 and price < ms.poc_4h * 0.995:
+            bonus -= 3; reasons.append("Below POC 4H (discount, risky short) -3")
+
+        # POC 1D — цена выше дневного POC = хорошее место для шорта
+        if ms.poc_1d > 0 and price > ms.poc_1d * 1.01:
+            bonus += 4; reasons.append(f"Above POC 1D (daily premium) +4")
+        elif ms.poc_1d > 0 and _near(ms.poc_1d, 1.0):
+            bonus += 1; reasons.append(f"Near POC 1D +1")
+        elif ms.poc_1d > 0 and price < ms.poc_1d * 0.99:
+            bonus -= 2; reasons.append("Below POC 1D (discount, bad short) -2")
+
         # Bearish OB 4H
         if ms.has_ob_4h and ms.ob_bearish_4h:
             low, high = ms.ob_bearish_4h
@@ -680,6 +872,66 @@ def proximity_bonus(price: float, ms: MarketStructureResult, direction: str) -> 
             low, high = ms.fvg_bearish_4h
             if low <= price <= high:
                 bonus += 8; reasons.append("In Bearish FVG 4H +8")
+
+        # ── Weekly SNR / OB / FVG (КРИТИЧНО для шорта!) ───────────────────────
+        # Weekly zone: PREMIUM = сильная зона для шорта, DISCOUNT = запрет
+        if ms.zone_weekly == "premium":
+            bonus += 12; reasons.append("Weekly PREMIUM Zone +12 (ideal short zone)")
+        elif ms.zone_weekly == "equilibrium":
+            bonus += 4; reasons.append("Weekly EQ Zone +4")
+        elif ms.zone_weekly == "discount":
+            bonus -= 20; reasons.append("Weekly DISCOUNT Zone -20 (institutional BUY zone — SHORT ЗАПРЕЩЁН)")
+
+        # Bearish OB Weekly = сильнейшее сопротивление
+        if ms.has_ob_1w and ms.ob_bearish_1w:
+            lo, hi = ms.ob_bearish_1w
+            if lo <= price <= hi * 1.01:
+                bonus += 15; reasons.append(f"In Bearish OB Weekly {lo:.4f}–{hi:.4f} +15 🔴")
+            elif _near(hi, 1.5):
+                bonus += 8; reasons.append(f"Near Bearish OB Weekly top {hi:.4f} +8")
+
+        # Bearish FVG Weekly = незакрытый медвежий дисбаланс на неделе
+        if ms.has_fvg_1w and ms.fvg_bearish_1w:
+            lo, hi = ms.fvg_bearish_1w
+            if lo <= price <= hi:
+                bonus += 12; reasons.append(f"In Bearish FVG Weekly {lo:.4f}–{hi:.4f} +12 🔴")
+
+        # Bullish OB Weekly под ценой = стена покупок снизу (плохо для шорта)
+        if ms.has_ob_1w and ms.ob_bullish_1w:
+            lo, hi = ms.ob_bullish_1w
+            if price > hi and _near(hi, 2.0):
+                bonus -= 12; reasons.append(f"Bullish OB Weekly at {hi:.4f} below price -12 (buy wall)")
+            elif lo <= price <= hi:
+                bonus -= 20; reasons.append(f"In Bullish OB Weekly {lo:.4f}–{hi:.4f} -20 (институционалы покупают)")
+
+        # POC Weekly — уровень наибольшего объёма за неделю
+        if ms.poc_1w > 0:
+            if price > ms.poc_1w * 1.01:
+                bonus += 6; reasons.append(f"Above POC 1W={ms.poc_1w:.4f} (weekly premium) +6")
+            elif _near(ms.poc_1w, 0.8):
+                bonus += 2; reasons.append(f"At POC 1W={ms.poc_1w:.4f} +2")
+            elif price < ms.poc_1w * 0.99:
+                bonus -= 8; reasons.append(f"Below POC 1W={ms.poc_1w:.4f} (weekly discount, bad short) -8")
+
+        # HTF Weekly bearish structure
+        if ms.htf_structure_1w == "bearish":
+            bonus += 8; reasons.append("Weekly HTF Bearish Structure +8")
+        elif ms.htf_structure_1w == "bullish":
+            bonus -= 10; reasons.append("Weekly HTF Bullish Structure -10 (counter-trend)")
+
+        # Monthly zone penalty (если цена в месячном дискаунте — SHORT под угрозой)
+        if ms.zone_monthly == "discount":
+            bonus -= 8; reasons.append("Monthly DISCOUNT -8 (macro buy zone)")
+        elif ms.zone_monthly == "premium":
+            bonus += 5; reasons.append("Monthly PREMIUM +5")
+
+        # Confluence multiplier: 3+ совпавших сигнала = максимальная уверенность
+        if ms.confluence_short >= 4:
+            bonus += 15; reasons.append(f"Confluence SHORT x{ms.confluence_short} +15 🎯")
+        elif ms.confluence_short >= 3:
+            bonus += 10; reasons.append(f"Confluence SHORT x{ms.confluence_short} +10")
+        elif ms.confluence_short >= 2:
+            bonus += 5; reasons.append(f"Confluence SHORT x{ms.confluence_short} +5")
 
         # Daily gap down → шорт momentum
         if ms.has_daily_gap and ms.daily_gap_pct < 0:
@@ -704,7 +956,11 @@ def format_ms_summary(ms: MarketStructureResult) -> str:
     if ms.htf_structure != "unknown":
         parts.append(f"HTF={ms.htf_structure.upper()} ({ms.htf_bias})")
     if ms.zone_4h != "neutral":
-        parts.append(f"Zone={ms.zone_4h.upper()}")
+        parts.append(f"Zone4H={ms.zone_4h.upper()}")
+    if ms.zone_weekly != "neutral":
+        parts.append(f"ZoneW={ms.zone_weekly.upper()}")
+    if ms.zone_monthly != "neutral":
+        parts.append(f"ZoneM={ms.zone_monthly.upper()}")
     if ms.fib_4h:
         parts.append(f"Fib0.618={ms.fib_4h.r_618:.4f} EQ={ms.fib_4h.r_50:.4f}")
     if ms.has_daily_gap:
@@ -715,6 +971,12 @@ def format_ms_summary(ms: MarketStructureResult) -> str:
         parts.append(f"PP={ms.pivot_pp:.4f} R1={ms.pivot_r1:.4f} S1={ms.pivot_s1:.4f}")
     if ms.poc_4h:
         parts.append(f"POC4H={ms.poc_4h:.4f}")
+    if ms.poc_1w:
+        parts.append(f"POC1W={ms.poc_1w:.4f}")
+    if ms.confluence_short > 1:
+        parts.append(f"ConfShort={ms.confluence_short}")
+    if ms.confluence_long > 1:
+        parts.append(f"ConfLong={ms.confluence_long}")
     return " | ".join(parts) if parts else "no structure data"
 
 

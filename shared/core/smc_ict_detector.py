@@ -11,6 +11,7 @@ Smart Money Concepts: Order Blocks, Fair Value Gaps, уточнённые SL/TP
 
 from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass
+from core.fvg_detector import scan_fvg_zones, FVGZone  # A4: unified FVG
 
 
 @dataclass
@@ -58,8 +59,9 @@ class SMCDetector:
     """
 
     def __init__(self, ohlcv: List[List[float]]):
-        self.ohlcv = ohlcv
-        self.n = len(ohlcv)
+        self.ohlcv     = ohlcv
+        self._candles  = ohlcv  # A4: alias for fvg_detector (supports list-of-lists via _wrap_candles)
+        self.n         = len(ohlcv)
 
     def _o(self, i: int) -> float: return self.ohlcv[i][0]
     def _h(self, i: int) -> float: return self.ohlcv[i][1]
@@ -162,86 +164,24 @@ class SMCDetector:
         return blocks[:3]
 
     # =========================================================================
-    # FAIR VALUE GAPS
+    # FAIR VALUE GAPS  (A4: делегируем в fvg_detector — единая реализация)
     # =========================================================================
 
     def find_bearish_fvg(self, lookback: int = 20) -> List[FairValueGap]:
-        """
-        Медвежий FVG: low свечи i > high свечи i+2.
-        Разрыв между ними — зона несправедливой цены.
-        В SHORT: цена часто возвращается в FVG и отталкивается вниз.
-        """
-        gaps = []
-        start = max(0, self.n - lookback)
-
-        for i in range(start, self.n - 2):
-            # FVG: gap между high[i+2] и low[i]
-            gap_upper = self._l(i)
-            gap_lower = self._h(i + 2)
-
-            if gap_lower >= gap_upper:
-                continue  # Нет разрыва
-
-            gap_size = (gap_upper - gap_lower) / gap_lower * 100
-            if gap_size < 0.1:  # Слишком маленький разрыв
-                continue
-
-            # Проверяем, не закрылся ли уже FVG
-            filled = any(
-                self._h(j) >= gap_upper
-                for j in range(i + 3, self.n)
-            )
-
-            gaps.append(FairValueGap(
-                direction="bearish",
-                upper=gap_upper,
-                lower=gap_lower,
-                index=i + 1,
-                filled=filled
-            ))
-
-        # Только незаполненные, ближайшие к текущей цене
-        gaps = [g for g in gaps if not g.filled]
-        current_price = self._c(-1)
-        gaps.sort(key=lambda g: abs((g.upper + g.lower) / 2 - current_price))
-        return gaps[:2]
+        """Медвежий FVG через unified fvg_detector. Возвращает legacy FairValueGap."""
+        zones = scan_fvg_zones(self._candles, "bearish", lookback=lookback)
+        return [FairValueGap(
+            direction="bearish", upper=z.upper, lower=z.lower,
+            index=z.index, filled=z.filled
+        ) for z in zones]
 
     def find_bullish_fvg(self, lookback: int = 20) -> List[FairValueGap]:
-        """
-        Бычий FVG: high свечи i+2 < low свечи i.
-        В LONG: поддержка, от которой цена отбивается вверх.
-        """
-        gaps = []
-        start = max(0, self.n - lookback)
-
-        for i in range(start, self.n - 2):
-            gap_lower = self._h(i)
-            gap_upper = self._l(i + 2)
-
-            if gap_upper <= gap_lower:
-                continue
-
-            gap_size = (gap_upper - gap_lower) / gap_lower * 100
-            if gap_size < 0.1:
-                continue
-
-            filled = any(
-                self._l(j) <= gap_lower
-                for j in range(i + 3, self.n)
-            )
-
-            gaps.append(FairValueGap(
-                direction="bullish",
-                upper=gap_upper,
-                lower=gap_lower,
-                index=i + 1,
-                filled=filled
-            ))
-
-        gaps = [g for g in gaps if not g.filled]
-        current_price = self._c(-1)
-        gaps.sort(key=lambda g: abs((g.upper + g.lower) / 2 - current_price))
-        return gaps[:2]
+        """Бычий FVG через unified fvg_detector. Возвращает legacy FairValueGap."""
+        zones = scan_fvg_zones(self._candles, "bullish", lookback=lookback)
+        return [FairValueGap(
+            direction="bullish", upper=z.upper, lower=z.lower,
+            index=z.index, filled=z.filled
+        ) for z in zones]
 
     # =========================================================================
     # PRICE NEAR ZONE CHECK

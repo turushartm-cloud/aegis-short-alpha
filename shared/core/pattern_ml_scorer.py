@@ -19,20 +19,22 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("aegis.pattern_ml")
 
 # Минимум сделок по паттерну чтобы доверять статистике
-MIN_TRADES_FOR_CONFIDENCE = 5
+# Управляется через ENV PATTERN_ML_MIN_TRADES (default=3 — бот новый, данных мало)
+MIN_TRADES_FOR_CONFIDENCE = int(os.getenv("PATTERN_ML_MIN_TRADES", "3"))
 # Бонус диапазоны
-MAX_BONUS  = 15
-MAX_PENALTY = -10
-# TTL кэша в секундах (24ч)
-CACHE_TTL = 86400
+MAX_BONUS  = int(os.getenv("PATTERN_ML_MAX_BONUS", "15"))
+MAX_PENALTY = -int(os.getenv("PATTERN_ML_MAX_PENALTY", "15"))
+# TTL кэша в секундах (24ч → ENV PATTERN_ML_CACHE_TTL)
+CACHE_TTL = int(os.getenv("PATTERN_ML_CACHE_TTL", "86400"))
 # Минимальный win-rate считается «хорошим»
-GOOD_WIN_RATE  = 0.60
-BAD_WIN_RATE   = 0.35
+GOOD_WIN_RATE  = float(os.getenv("PATTERN_ML_GOOD_WIN_RATE", "0.60"))
+BAD_WIN_RATE   = float(os.getenv("PATTERN_ML_BAD_WIN_RATE", "0.35"))
 
 
 class PatternMLScorer:

@@ -54,13 +54,14 @@ class PositionTracker:
     BREAKEVEN_BUFFER_TP2 = 0.002  # SL = entry + 0.2% после TP2
 
     def __init__(self, *, bot_type, telegram, redis_client,
-                 binance_client, config, auto_trader=None):
+                 binance_client, config, auto_trader=None, on_trade_closed=None):
         self.bot_type    = bot_type
         self.tg          = telegram
         self.redis       = redis_client
         self.binance     = binance_client
         self.config      = config
         self.auto_trader = auto_trader
+        self.on_trade_closed = on_trade_closed  # Callback: fn(record: dict) → called on TP/SL close
         
         # Trail activation thresholds из config (env vars)
         # LONG: 2.5% по умолчанию, SHORT: 3% по умолчанию
@@ -219,6 +220,23 @@ class PositionTracker:
         if not symbol or not entry:
             return
 
+        # ── B4 FIX: SL ≈ entry при пустом taken_tps → плохая инициализация ──────
+        # BE после TP1 ставит SL=entry намеренно, но только ПОСЛЕ взятия TP1.
+        # Если taken=[] и SL≈entry — значит SL записан неверно при создании позиции.
+        if sl > 0 and not taken:
+            _sl_gap_pct = abs(sl - entry) / entry * 100
+            if _sl_gap_pct < 0.05:  # SL в пределах 0.05% от входа — это не настоящий SL
+                _fallback_sl_pct = 0.025
+                sl = entry * (1 - _fallback_sl_pct) if direction == "long" else entry * (1 + _fallback_sl_pct)
+                signal["stop_loss"] = sl
+                print(f"⚠️ [B4][VT][{symbol}] SL={signal.get('stop_loss', 0):.6f} ≈ entry "
+                      f"(taken=[]) — плохая инициализация, пересчитываем SL → {sl:.6f}")
+                try:
+                    vkey = f"{bot_type}:virtual_positions"
+                    self.redis.client.hset(vkey, field, _json.dumps(signal))
+                except Exception:
+                    pass
+
         # Экспирация 48ч
         opened_at = signal.get("virtual_opened_at", signal.get("timestamp", ""))
         if opened_at:
@@ -341,17 +359,27 @@ class PositionTracker:
                         print(f"[VT] update taken_tps error: {e}")
 
                     remaining = total - len(taken)
-                    be_line = f"\n{be_msg}" if be_msg else ""
                     await self._notify(signal, (
                         f"🎯 <b>[ВИРТУАЛ] {tp_label}/{total} взят!</b>\n\n"
                         f"{d_emoji} <b>#{symbol}</b>  {direction.upper()}\n"
                         f"📍 Вход:        <b>${entry:,.6f}</b>\n"
                         f"🎯 {tp_label}:  <b>${tp_price:,.6f}</b>  ({tp_weight:.0f}% позиции)\n"
                         f"📊 P&L:         <b>+{pnl_pct:.2f}%</b>\n"
-                        f"⏳ Осталось TP: {remaining}"
-                        + be_line +
-                        f"\n<i>📋 Виртуал — не открыта на бирже</i>"
+                        f"⏳ Осталось TP: {remaining}\n"
+                        f"<i>📋 Виртуал — не открыта на бирже</i>"
                     ))
+
+                    # ✅ FIX: Отдельное сообщение о BE (раньше было в конце TP-сообщения — незаметно)
+                    if new_sl_virtual and be_msg:
+                        sl_pnl_vt = _pnl(direction, entry, new_sl_virtual)
+                        await self._notify(signal, (
+                            f"🔒 <b>[ВИРТУАЛ] {be_msg}</b>\n\n"
+                            f"{d_emoji} <b>#{symbol}</b>  {direction.upper()}\n"
+                            f"📍 Вход:      <b>${entry:,.6f}</b>\n"
+                            f"🛑 Было SL:   <b>${old_sl:,.6f}</b>\n"
+                            f"✅ Теперь SL: <b>${new_sl_virtual:,.6f}</b>  ({sl_pnl_vt:+.2f}%)\n"
+                            f"<i>Позиция защищена — стоп передвинут</i>"
+                        ))
                 break
 
     async def _cleanup_zombie_positions(self, signals: list):
@@ -395,12 +423,28 @@ class PositionTracker:
                     continue
 
                 pos_side = 'LONG' if direction == 'long' else 'SHORT'
-                positions = await bingx.get_positions(symbol)
+                # ✅ FIX zombie: raise_on_api_error=True → если API недоступен (429, сеть)
+                # RuntimeError → попадает в except ниже → символ пропускается, позиция НЕ удаляется
+                positions = await bingx.get_positions(symbol, raise_on_api_error=True)
                 has_real_position = any(
                     abs(p.size) > 0 and p.position_side == pos_side
                     for p in positions
                 )
                 if not has_real_position:
+                    # ✅ FIX zombie: не удаляем позиции младше 2ч — API мог ответить
+                    # пустым списком из-за задержки после открытия или временного сбоя.
+                    _ts_raw = sig.get('timestamp', '')
+                    _age_hours = 999.0
+                    if _ts_raw:
+                        try:
+                            _dt = datetime.fromisoformat(_ts_raw.replace('Z', '+00:00'))
+                            _age_hours = (datetime.utcnow() - _dt.replace(tzinfo=None)).total_seconds() / 3600
+                        except Exception:
+                            pass
+                    if _age_hours < 2.0:
+                        print(f"[ZOMBIE-SKIP] {symbol}: не найдена на бирже, но возраст={_age_hours:.1f}ч < 2ч → пропускаем")
+                        continue
+
                     # Позиция есть в Redis, нет на бирже — это zombie
                     entry = sig.get('entry_price', 0)
                     redis_price = sig.get('last_price', entry)
@@ -484,8 +528,69 @@ class PositionTracker:
                         f"{price_diff}"
                         f"<i>⚠️ Позиция не найдена на бирже</i>"
                     ))
+
+                    # ✅ B8-FIX #5: Zombie позиции тоже пишем в all_trades для PatternML
+                    # Без этого PatternML никогда не видит zombie-закрытые сделки
+                    try:
+                        self.redis.remove_position(self.bot_type, symbol)
+                        await self._record_pnl(sig, pnl, "zombie", "ZOMBIE")
+                    except Exception as _rp_err:
+                        print(f"⚠️ [ZOMBIE] _record_pnl failed for {symbol}: {_rp_err}")
             except Exception as e:
                 print(f"⚠️ [ZOMBIE-CLEANUP] {symbol}: {e}")
+
+    async def _recover_sl(self, signal: Dict) -> float:
+        """
+        🚨 Восстанавливает SL=0 позиции:
+          1. Пробуем взять SL из BingX positions API (stopLoss поле)
+          2. Если BingX тоже вернул 0 — вычисляем аварийный SL (SL_BUFFER%)
+          3. Ставим аварийный SL на биржу
+
+        Вызывается когда stop_loss == 0 в Redis-записи.
+        """
+        symbol    = signal.get("symbol", "")
+        direction = signal.get("direction", "long")
+        entry     = _f(signal.get("entry_price", 0))
+        pos_side  = "LONG" if direction == "long" else "SHORT"
+
+        # ── Шаг 1: пробуем BingX positions API ──────────────────────────────
+        if self.auto_trader and self.auto_trader.bingx:
+            try:
+                bingx_sym = symbol + "-USDT" if "-USDT" not in symbol else symbol
+                positions = await self.auto_trader.bingx.get_positions(bingx_sym)
+                for p in positions:
+                    if p.position_side == pos_side and p.stop_loss and p.stop_loss > 0:
+                        print(f"✅ [PT][SL-RECOVER][{symbol}] SL={p.stop_loss:.6f} получен с BingX")
+                        return p.stop_loss
+            except Exception as e:
+                print(f"⚠️ [PT][SL-RECOVER][{symbol}] BingX error: {e}")
+
+        # ── Шаг 2: аварийный SL из конфига ──────────────────────────────────
+        if entry > 0:
+            sl_pct = float(getattr(self.config, 'SL_BUFFER', 2.0))
+            if direction == "short":
+                sl = entry * (1 + sl_pct / 100)
+            else:
+                sl = entry * (1 - sl_pct / 100)
+            print(f"🚨 [PT][SL-RECOVER][{symbol}] Аварийный SL={sl:.6f} ({sl_pct}% от входа)")
+
+            # ── Шаг 3: ставим SL на биржу ────────────────────────────────────
+            if self.auto_trader and self.auto_trader.bingx:
+                try:
+                    bingx_sym = symbol + "-USDT" if "-USDT" not in symbol else symbol
+                    ok = await self.auto_trader.bingx.update_stop_loss(
+                        bingx_sym, pos_side, sl, direction
+                    )
+                    if ok:
+                        print(f"✅ [PT][SL-RECOVER][{symbol}] SL выставлен на бирже: {sl:.6f}")
+                    else:
+                        print(f"⚠️ [PT][SL-RECOVER][{symbol}] Не удалось выставить SL на бирже")
+                except Exception as e:
+                    print(f"⚠️ [PT][SL-RECOVER][{symbol}] place SL error: {e}")
+            return sl
+
+        print(f"❌ [PT][SL-RECOVER][{symbol}] entry=0 — невозможно рассчитать аварийный SL")
+        return 0.0
 
     async def _check_one(self, signal: Dict):
         symbol    = signal.get("symbol", "")
@@ -499,9 +604,34 @@ class PositionTracker:
         if not symbol or not entry:
             return
 
+        # 🚨 FIX: SL=0.000000 bug — восстанавливаем SL если он отсутствует
+        if sl <= 0:
+            print(f"🚨 [PT][{symbol}] SL=0 обнаружен — запускаем восстановление SL...")
+            sl = await self._recover_sl(signal)
+            if sl > 0:
+                signal["stop_loss"] = sl
+                self._save(symbol, signal)
+                print(f"✅ [PT][{symbol}] SL восстановлен: {sl:.6f}")
+            else:
+                print(f"❌ [PT][{symbol}] SL=0 — пропускаем позицию (невозможно отследить)")
+                return
+
+        # ── B4 FIX: SL ≈ entry при пустом taken_tps → плохая инициализация ──────
+        # BE после TP1/TP2 переносит SL к entry намеренно — но только ПОСЛЕ взятия TP.
+        # Если taken=[] и SL≈entry — запись была создана с неверным SL.
+        if not taken:
+            _sl_gap_pct = abs(sl - entry) / entry * 100
+            if _sl_gap_pct < 0.05:
+                _fallback_sl_pct = 0.025
+                sl = entry * (1 - _fallback_sl_pct) if direction == "long" else entry * (1 + _fallback_sl_pct)
+                signal["stop_loss"] = sl
+                self._save(symbol, signal)
+                print(f"⚠️ [B4][PT][{symbol}] SL≈entry (taken=[]) — плохая инициализация, "
+                      f"SL пересчитан → {sl:.6f} ({_fallback_sl_pct*100:.1f}%)")
+
         # 🎢 Phase 2: Инициализация Micro-Step Trailing при первом обнаружении позиции
         trailing_state = self.micro_trailing.get_state(symbol)
-        if trailing_state is None and len(taken) == 0:
+        if trailing_state is None and sl > 0:
             # Новая позиция — инициализируем трейлинг
             self.micro_trailing.initialize(
                 symbol=symbol,
@@ -1117,6 +1247,12 @@ class PositionTracker:
             if self.auto_trader:
                 self.auto_trader.record_trade_result(pnl_pct)
 
+            if self.on_trade_closed:
+                try:
+                    self.on_trade_closed(record)
+                except Exception as _cb_err:
+                    print(f"[PT] on_trade_closed callback error: {_cb_err}")
+
         except Exception as e:
             print(f"[PT] _record_pnl: {e}")
 
@@ -1143,22 +1279,22 @@ class PositionTracker:
                 print(f"[PT][ZOMBIE] ✅ Нет позиций в Redis для проверки")
                 return 0
                 
-            # Получаем позиции с биржи
+            # Получаем позиции с биржи (raise_on_api_error=True — abort если API недоступен)
             try:
-                bingx_positions = await self.bingx.get_positions()
+                bingx_positions = await self.bingx.get_positions(raise_on_api_error=True)
             except Exception as e:
-                print(f"[PT][ZOMBIE] ⚠️ Ошибка получения позиций с биржи: {e}")
+                print(f"[PT][ZOMBIE] ⚠️ Ошибка получения позиций с биржи: {e} → пропускаем cleanup")
                 return 0
-                
+
             # Создаем множество символов с позициями на бирже
+            # BingXPosition — dataclass, используем атрибуты (не .get())
             bingx_symbols = set()
             if isinstance(bingx_positions, list):
                 for pos in bingx_positions:
-                    symbol = pos.get("symbol", "")
-                    if symbol:
-                        # Нормализуем символ (убираем - если есть)
-                        bingx_symbols.add(symbol.replace("-", ""))
-                        bingx_symbols.add(symbol)  # И с дефисом тоже
+                    sym = getattr(pos, "symbol", "") or ""
+                    if sym:
+                        bingx_symbols.add(sym.replace("-", ""))
+                        bingx_symbols.add(sym)
                         
             print(f"[PT][ZOMBIE] 🔍 Проверяем {len(redis_positions)} позиций в Redis vs {len(bingx_symbols)} на бирже")
             
@@ -1175,23 +1311,39 @@ class PositionTracker:
                         break
                         
                 if not on_exchange:
-                    # Проверяем можно ли получить цену (символ существует)
+                    # ✅ FIX zombie: проверяем возраст позиции перед удалением
+                    sig_data = redis_positions.get(symbol, {})
+                    if isinstance(sig_data, str):
+                        try:
+                            import json as _j; sig_data = _j.loads(sig_data)
+                        except Exception:
+                            sig_data = {}
+                    _ts_raw = sig_data.get("timestamp", "") if isinstance(sig_data, dict) else ""
+                    _age_hours = 999.0
+                    if _ts_raw:
+                        try:
+                            _dt = datetime.fromisoformat(_ts_raw.replace('Z', '+00:00'))
+                            _age_hours = (datetime.utcnow() - _dt.replace(tzinfo=None)).total_seconds() / 3600
+                        except Exception:
+                            pass
+                    if _age_hours < 2.0:
+                        print(f"[PT][ZOMBIE] ⏳ Пропускаем {symbol}: возраст={_age_hours:.1f}ч < 2ч")
+                        continue
+
+                    # Проверяем можно ли получить цену (символ существует).
+                    # Ticker ТОЛЬКО определяет делист/не делист — НЕ является основанием для удаления.
+                    # get_positions() уже вернул пустой список успешно → это реальный zombie.
                     try:
                         ticker = await self.bingx.get_ticker(symbol)
                         if ticker and ticker.get("price", 0) > 0:
-                            # Символ существует, но позиции нет - это zombie
                             print(f"[PT][ZOMBIE] 🗑️ Удаляем {symbol} (нет на бирже, цена доступна)")
-                            self.redis.remove_position(self.bot_type, symbol)
-                            removed_count += 1
                         else:
-                            # Не можем получить цену - возможно символ делистед
-                            print(f"[PT][ZOMBIE] 🗑️ Удаляем {symbol} (нет на бирже, цена недоступна - делист)")
-                            self.redis.remove_position(self.bot_type, symbol)
-                            removed_count += 1
-                    except Exception as e:
-                        print(f"[PT][ZOMBIE] 🗑️ Удаляем {symbol} (ошибка проверки: {e})")
+                            print(f"[PT][ZOMBIE] 🗑️ Удаляем {symbol} (нет на бирже, делист/нет цены)")
                         self.redis.remove_position(self.bot_type, symbol)
                         removed_count += 1
+                    except Exception as e:
+                        # Ticker тоже не ответил — не удаляем, возможно API временно недоступен
+                        print(f"[PT][ZOMBIE] ⚠️ Пропускаем {symbol}: ticker ошибка {e}")
                         
             if removed_count > 0:
                 print(f"[PT][ZOMBIE] ✅ Очищено {removed_count} zombie позиций")

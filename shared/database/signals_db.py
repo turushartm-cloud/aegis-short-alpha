@@ -188,11 +188,11 @@ class SignalsDatabase:
             return cursor.lastrowid
     
     def mark_executed(self, signal_id: int, execution_price: float):
-        """Отмечает сигнал как исполненный"""
+        """Отмечает сигнал как исполненный (вызывается после открытия позиции на бирже)"""
         with self._get_connection() as conn:
             conn.execute("""
-                UPDATE signals 
-                SET executed = 1, 
+                UPDATE signals
+                SET executed = 1,
                     execution_price = ?,
                     execution_time = ?,
                     status = 'active',
@@ -200,7 +200,7 @@ class SignalsDatabase:
                 WHERE id = ?
             """, (execution_price, datetime.utcnow().isoformat(), signal_id))
             conn.commit()
-    
+
     def close_signal(self, signal_id: int, close_price: float, 
                      pnl_percent: float, pnl_usd: float = None):
         """Закрывает сигнал и сохраняет P&L"""

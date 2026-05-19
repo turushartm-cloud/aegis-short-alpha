@@ -51,7 +51,20 @@ class ConsolidationResult:
     # Метаданные
     lookback_candles: int
     volatility_compression: bool  # ATR сжался = готовность к импульсу
-    
+
+    # A1: Multi-touch подтверждение уровней
+    support_touches:    int = 0   # Сколько раз цена касалась нижней границы
+    resistance_touches: int = 0   # Сколько раз цена касалась верхней границы
+
+    def get_touch_bonus(self, direction: str) -> int:
+        """Бонус за многократное касание уровня S/R. direction='long'|'short'"""
+        touches = self.support_touches if direction == "long" else self.resistance_touches
+        if touches >= 3:
+            return 15
+        if touches >= 2:
+            return 8
+        return 0
+
     def is_mid_range(self, price: float, buffer: float = 0.15) -> bool:
         """
         Проверяет, находится ли цена в середине диапазона (40-60% = mid).
@@ -165,6 +178,10 @@ class ConsolidationDetector:
         has_breakout_up = current_price > range_high * 1.005  # 0.5% пробой
         has_breakout_down = current_price < range_low * 0.995
         
+        # A1: подсчёт касаний уровней поддержки/сопротивления
+        support_touches    = self.count_level_touches(recent, range_low)
+        resistance_touches = self.count_level_touches(recent, range_high)
+
         return ConsolidationResult(
             is_consolidating=is_consolidating,
             range_high=range_high,
@@ -177,8 +194,29 @@ class ConsolidationDetector:
             has_breakout_down=has_breakout_down,
             lookback_candles=lookback,
             volatility_compression=volatility_compression,
+            support_touches=support_touches,
+            resistance_touches=resistance_touches,
         )
     
+    def count_level_touches(self, candles: List, level_price: float,
+                             tolerance_pct: float = 0.3) -> int:
+        """Считает уникальные касания уровня (cooldown 2 свечи после касания)."""
+        if not candles or level_price <= 0:
+            return 0
+        tol = level_price * tolerance_pct / 100
+        touches = 0
+        cooldown = 0
+        for c in candles:
+            if cooldown > 0:
+                cooldown -= 1
+                continue
+            lo = getattr(c, "low", 0)
+            hi = getattr(c, "high", 0)
+            if abs(lo - level_price) <= tol or abs(hi - level_price) <= tol:
+                touches += 1
+                cooldown = 2
+        return touches
+
     def _check_atr_compression(self, candles: List) -> bool:
         """Проверяет сжатие ATR (подготовка к импульсу)."""
         if len(candles) < 30:
@@ -268,12 +306,17 @@ def filter_mid_range(
     direction: str,
     verbose: bool = False,
     rsi_1h: float = 50.0,
+    htf_bearish: bool = False,
+    htf_bullish: bool = False,
 ) -> Tuple[bool, str]:
     """
     Фильтр: блокировать входы в середине диапазона.
     ✅ FIX #4: Исключение для экстремальной перепроданности/перегретости:
        LONG: RSI 1H < 25 → пропускаем upper_half блокировку
        SHORT: RSI 1H > 75 → пропускаем lower_half блокировку
+    ✅ FIX #5 (HTF): Когда HTF структура медвежья, SHORT в lower_half
+       допускается при RSI > 65 (вместо 75) — продолжение тренда, а не разворот.
+       Аналогично LONG: HTF бычий + upper_half допускается при RSI < 40.
 
     Returns:
         (allow_signal: bool, reason: str)
@@ -287,20 +330,29 @@ def filter_mid_range(
     if status == "mid_range":
         return False, f"MID_RANGE: цена в {consolidation.position_in_range:.0%} диапазона {consolidation.range_pct:.1f}%"
 
-    # Для LONG — только нижняя половина или Spring
+    # Для LONG — только нижняя половина или Spring/Breakout
     if direction == "long":
         if consolidation.has_spring:
             return True, "SPRING detected — ложный пробой вниз"
         if consolidation.has_breakout_up:
-            return True, "BREAKOUT UP — пробой консолидации"
-        if status == "near_support":
-            return True, "near support"
+            return True, "BREAKOUT UP — пробой консолидации вверх ✅ Momentum"
+        if status in ("lower_half", "near_support"):
+            # FIX: HTF медвежий → lower_half это зона ПРОДОЛЖЕНИЯ падения, не разворота.
+            # Блокируем LONG кроме экстремальной перепроданности (RSI < 20) или Spring.
+            if htf_bearish:
+                if rsi_1h < 20:
+                    return True, f"LONG в {status} РАЗРЕШЁН — HTF BEARISH но RSI={rsi_1h:.1f} ЭКСТРЕМАЛЬНО перепродан"
+                return False, f"LONG в {status} ЗАБЛОКИРОВАН — HTF BEARISH + RSI={rsi_1h:.1f} (зона слабости)"
+            return True, "lower half"
         if status in ("upper_half", "near_resistance"):
-            # ✅ FIX #4: Экстремальная перепроданность важнее позиции в диапазоне
-            if rsi_1h < 25:
-                return True, f"LONG в {status} РАЗРЕШЁН — RSI 1H={rsi_1h:.1f} экстремально перепродан"
+            if rsi_1h < 35:
+                return True, f"LONG в {status} РАЗРЕШЁН — RSI 1H={rsi_1h:.1f} перепродан"
+            if status == "near_resistance" and rsi_1h > 60:
+                return True, f"LONG в {status} РАЗРЕШЁН — Momentum RSI 1H={rsi_1h:.1f}"
+            if htf_bullish and rsi_1h < 40:
+                return True, f"LONG в {status} РАЗРЕШЁН — HTF BULLISH + RSI 1H={rsi_1h:.1f}"
             return False, f"LONG в {status} — плохая зона для входа"
-        return True, "lower half"
+        return True, "ok"
 
     # Для SHORT — только верхняя половина или Upthrust
     if direction == "short":
@@ -314,6 +366,11 @@ def filter_mid_range(
             # ✅ FIX #4: Экстремальная перегретость важнее позиции в диапазоне
             if rsi_1h > 75:
                 return True, f"SHORT в {status} РАЗРЕШЁН — RSI 1H={rsi_1h:.1f} экстремально перегрет"
+            # ✅ FIX C5: HTF медвежий → SHORT в нижней половине ВСЕГДА разрешён при RSI < 70
+            # Логика: в медвежьем тренде lower_half — это зона слабости, идеально для шорта.
+            # Старый порог rsi_1h > 65 блокировал шорты при RSI 16-60 в медвежьем тренде (OKBUSDT, BNBUSDT, CETUS).
+            if htf_bearish and rsi_1h < 70:
+                return True, f"SHORT в {status} РАЗРЕШЁН — HTF BEARISH + RSI {rsi_1h:.1f} (не перекуплен)"
             return False, f"SHORT в {status} — плохая зона для входа"
         return True, "upper half"
 

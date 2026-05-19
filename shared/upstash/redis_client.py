@@ -243,17 +243,35 @@ class UpstashRedisClient:
             if data:
                 position = json.loads(data)
                 position["status"] = "closed"
-                position["close_price"] = close_price
-                position["pnl"] = pnl
                 position["tp_level"] = tp_level  # ✅ FIX: Сохраняем tp_level
                 position["closed_at"] = datetime.utcnow().isoformat()
+
+                # ✅ B8-FIX #2: Восстанавливаем реальный close_price и pnl
+                # auto_trader.close_position() передаёт 0.0 — используем last_price из позиции
+                _entry = float(position.get("entry_price", 0) or 0)
+                _direction = position.get("direction", "long")
+                _actual_close = close_price if close_price > 0 else float(
+                    position.get("last_price", 0) or position.get("entry_price", 0) or 0
+                )
+                position["close_price"] = _actual_close
+
+                if pnl == 0.0 and _entry > 0 and _actual_close > 0:
+                    if _direction == "short":
+                        pnl = round((_entry - _actual_close) / _entry * 100, 4)
+                    else:
+                        pnl = round((_actual_close - _entry) / _entry * 100, 4)
+
+                position["pnl"]     = pnl
+                position["pnl_pct"] = pnl  # PatternML читает оба поля
+
                 history_key = f"{bot_type}:history:{symbol}"
                 self.client.lpush(history_key, json.dumps(position))
                 self.client.ltrim(history_key, 0, 99)
-                # 🆕 Также пишем в all_trades для статистики
+                # 🆕 Также пишем в all_trades для PatternML статистики
                 all_key = f"{bot_type}:all_trades"
                 self.client.lpush(all_key, json.dumps(position))
                 self.client.ltrim(all_key, 0, 9999)
+                self.client.expire(all_key, 7776000)  # 90 дней
                 self.client.delete(key)
                 return True
             return False
@@ -341,18 +359,61 @@ class UpstashRedisClient:
             return None
     
     # =========================================================================
-    # CROSS-BOT SYNC
+    # INFO & METRICS
     # =========================================================================
-    
-    def check_opposite_signal(self, symbol: str, bot_type: str) -> Optional[Dict]:
+
+    def get_info(self) -> Dict:
+        """Информация о Redis (статистика сервера)."""
         try:
-            opposite = "long" if bot_type == "short" else "short"
-            return self.get_active_signals(opposite)
+            info = self.client.info()
+            return {
+                "connected_clients": info.get("connected_clients", 0),
+                "used_memory_human": info.get("used_memory_human", "N/A"),
+                "total_commands_processed": info.get("total_commands_processed", 0),
+                "uptime_in_seconds": info.get("uptime_in_seconds", 0),
+            }
+        except Exception as e:
+            print(f"Error getting Redis info: {e}")
+            return {}
+
+    def get_memory_usage(self) -> Dict:
+        """Использование памяти Redis."""
+        try:
+            info = self.client.info("memory")
+            return {
+                "used_memory": info.get("used_memory", 0),
+                "used_memory_human": info.get("used_memory_human", "N/A"),
+                "used_memory_peak_human": info.get("used_memory_peak_human", "N/A"),
+                "maxmemory_human": info.get("maxmemory_human", "N/A"),
+            }
+        except Exception as e:
+            print(f"Error getting memory usage: {e}")
+            return {}
+
+    def check_rate_limit(self, key: str, max_calls: int, window_seconds: int) -> bool:
+        """Rate limiting через Redis INCR+EXPIRE. True = разрешено, False = превышен лимит."""
+        try:
+            rl_key = f"rl:{key}"
+            current = self.client.incr(rl_key)
+            if current == 1:
+                self.client.expire(rl_key, window_seconds)
+            return current <= max_calls
+        except Exception as e:
+            print(f"Error checking rate limit: {e}")
+            return True
+
+    def check_opposite_signal(self, bot_type: str, symbol: str) -> bool:
+        """Проверяет наличие активной позиции от противоположного бота (long↔short)."""
+        try:
+            other = "long" if bot_type == "short" else "short"
+            key = f"{other}:positions:{symbol}"
+            return bool(self.client.exists(key))
         except Exception as e:
             print(f"Error checking opposite signal: {e}")
-            return None
-    
+            return False
+
     def get_shared_market_data(self, symbol: str) -> Optional[Dict]:
+        """Получение общих рыночных данных — кэш между ботами (TTL 5 мин)."""
         try:
             key = f"shared:market:{symbol}"
             data = self.client.get(key)
@@ -360,49 +421,27 @@ class UpstashRedisClient:
         except Exception as e:
             print(f"Error getting shared market data: {e}")
             return None
-    
-    def set_shared_market_data(self, symbol: str, data: Dict) -> bool:
+
+    def set_shared_market_data(self, symbol: str, data: Dict, ttl: int = 300) -> bool:
+        """Сохранение общих рыночных данных — кэш между ботами (TTL 5 мин)."""
         try:
             key = f"shared:market:{symbol}"
-            self.client.setex(key, 60, json.dumps(data))
+            self.client.setex(key, ttl, json.dumps(data))
             return True
         except Exception as e:
             print(f"Error setting shared market data: {e}")
             return False
-    
-    # =========================================================================
-    # RATE LIMITING
-    # =========================================================================
-    
-    def check_rate_limit(self, action: str, max_requests: int = 10,
-                         window: int = 60) -> bool:
+
+    def get_signal_log(self, bot_type: str, limit: int = 100) -> List[Dict]:
+        """Получение лога всех сигналов (выполненных + пропущенных)."""
         try:
-            key = f"ratelimit:{action}:{datetime.utcnow().strftime('%Y%m%d%H%M')}"
-            current = self.client.incr(key)
-            if current == 1:
-                self.client.expire(key, window)
-            return current <= max_requests
+            key = f"{bot_type}:signal_log"
+            items = self.client.lrange(key, 0, limit - 1)
+            return [json.loads(i) for i in items]
         except Exception as e:
-            print(f"Error checking rate limit: {e}")
-            return True
-    
-    # =========================================================================
-    # INFO & METRICS
-    # =========================================================================
-    
-    def get_info(self) -> Dict:
-        try:
-            info = self.client.info()
-            return {
-                "used_memory": info.get("used_memory_human", "unknown"),
-                "connected_clients": info.get("connected_clients", 0),
-                "uptime": info.get("uptime_in_seconds", 0),
-                "version": info.get("redis_version", "unknown")
-            }
-        except Exception as e:
-            print(f"Error getting Redis info: {e}")
-            return {}
-    
+            print(f"Error getting signal log: {e}")
+            return []
+
     # =========================================================================
     # SIGNAL LOG — постоянный лог ВСЕХ сигналов (исполненных + пропущенных)
     # =========================================================================
@@ -423,16 +462,6 @@ class UpstashRedisClient:
         except Exception as e:
             print(f"Error saving signal log: {e}")
             return False
-
-    def get_signal_log(self, bot_type: str, limit: int = 100, offset: int = 0) -> List[Dict]:
-        """Получение лога сигналов для дашборда"""
-        try:
-            key = f"{bot_type}:signal_log"
-            items = self.client.lrange(key, offset, offset + limit - 1)
-            return [json.loads(i) for i in items]
-        except Exception as e:
-            print(f"Error getting signal log: {e}")
-            return []
 
     # =========================================================================
     # VIRTUAL POSITIONS — мониторинг TP/SL для TG-only сигналов
@@ -532,23 +561,6 @@ class UpstashRedisClient:
             print(f"Error getting virtual trades: {e}")
             return []
 
-    def get_memory_usage(self) -> Dict:
-        try:
-            info = self.client.info("memory")
-            used = info.get("used_memory", 0)
-            peak = info.get("used_memory_peak", 0)
-            limit = 256 * 1024 * 1024
-            return {
-                "used_bytes": used,
-                "used_mb": round(used / 1024 / 1024, 2),
-                "peak_bytes": peak,
-                "peak_mb": round(peak / 1024 / 1024, 2),
-                "limit_mb": 256,
-                "usage_percent": round(used / limit * 100, 2)
-            }
-        except Exception as e:
-            print(f"Error getting memory usage: {e}")
-            return {}
 
 
 # ============================================================================

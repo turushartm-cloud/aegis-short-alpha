@@ -1108,11 +1108,11 @@ class TelegramCommandHandler:
 
     async def cmd_close_zombies(self, args, reply_chat_id: str):
         """
-        /close_zombies — Закрыть позиции без SL/TP (зомби).
-        Зомби = позиция в Redis с stop_loss == 0 или отсутствует.
-        Закрывает на бирже через AutoTrader + удаляет из Redis.
+        /close_zombies — Очистить Redis от позиций которых НЕТ на бирже.
+        Зомби = есть в Redis, но отсутствует в открытых позициях BingX.
+        Позиции которые ЕСТЬ на бирже — НЕ трогаем (SL-Sync их исправит).
         """
-        await self._reply(reply_chat_id, "🧟 Ищу зомби-позиции (без SL)...")
+        await self._reply(reply_chat_id, "🧟 Проверяю позиции (Redis vs BingX)...")
         try:
             if not self.redis:
                 await self._reply(reply_chat_id, "❌ Redis недоступен")
@@ -1123,53 +1123,53 @@ class TelegramCommandHandler:
                 await self._reply(reply_chat_id, "✅ Нет позиций в Redis")
                 return
 
-            zombies = []
-            for pos in positions:
-                sl = pos.get("stop_loss") or pos.get("sl") or 0
+            # Получаем реальные открытые позиции с биржи
+            bingx_symbols: set = set()
+            if self.state and self.state.auto_trader:
                 try:
-                    sl_f = float(sl)
-                except Exception:
-                    sl_f = 0.0
-                if sl_f == 0.0:
+                    real_pos = await self.state.auto_trader.bingx.get_positions()
+                    for p in real_pos:
+                        sym = getattr(p, "symbol", "") or ""
+                        if sym:
+                            # BingX возвращает BTC-USDT, Redis хранит BTCUSDT — нормализуем оба
+                            bingx_symbols.add(sym)
+                            bingx_symbols.add(sym.replace("-", ""))
+                except Exception as e:
+                    await self._reply(reply_chat_id,
+                        f"⚠️ Не удалось получить позиции с BingX: {e}\n"
+                        f"Отмена для безопасности — не удаляем ничего из Redis.")
+                    return
+
+            # Зомби = есть в Redis, но нет на бирже
+            zombies = []
+            real_on_exchange = []
+            for pos in positions:
+                sym = pos.get("symbol", "")
+                sym_norm = sym.replace("-", "")
+                if sym in bingx_symbols or sym_norm in bingx_symbols:
+                    real_on_exchange.append(sym)
+                else:
                     zombies.append(pos)
 
             if not zombies:
                 await self._reply(reply_chat_id,
-                    f"✅ Зомби не найдено. Всего позиций в Redis: {len(positions)}")
+                    f"✅ Зомби не найдено.\n"
+                    f"Redis: {len(positions)} позиций\n"
+                    f"BingX: {len(bingx_symbols)//2} позиций (все совпадают)")
                 return
 
             symbols_list = ", ".join(p.get("symbol", "?") for p in zombies)
             await self._reply(reply_chat_id,
-                f"🧟 Найдено зомби: {len(zombies)}\n"
+                f"🧟 Зомби (есть в Redis, нет на BingX): {len(zombies)}\n"
                 f"<code>{symbols_list}</code>\n\n"
-                f"⏳ Закрываю на бирже...")
+                f"✅ На бирже (не трогаем): {len(real_on_exchange)}\n"
+                f"⏳ Удаляю зомби из Redis...")
 
-            closed_exchange = 0
-            closed_redis    = 0
-            failed          = []
-
+            cleaned = 0
             for pos in zombies:
-                symbol    = pos.get("symbol", "")
-                direction = pos.get("direction", "long")
-                pos_side  = "LONG" if direction == "long" else "SHORT"
-
-                # 1) Закрыть на бирже (если AutoTrader доступен)
-                exchange_ok = False
-                if self.state and self.state.auto_trader:
-                    try:
-                        exchange_ok = await self.state.auto_trader.close_position(
-                            symbol, pos_side
-                        )
-                        if exchange_ok:
-                            closed_exchange += 1
-                    except Exception as e:
-                        print(f"[close_zombies] exchange close {symbol}: {e}")
-                        failed.append(f"{symbol}(ex:{e})")
-
-                # 2) Удалить из Redis в любом случае (zombie cleanup)
+                symbol = pos.get("symbol", "")
                 try:
                     self.redis.remove_position(self.bot_type, symbol)
-                    # Также помечаем active signal как closed
                     import json as _json
                     keys = self.redis.client.keys(f"{self.bot_type}:signals:{symbol}:*")
                     keys += self.redis.client.keys(f"{self.bot_type}:active:{symbol}")
@@ -1178,31 +1178,21 @@ class TelegramCommandHandler:
                             raw = self.redis.client.get(k)
                             if raw:
                                 sig = _json.loads(raw)
-                                sig["status"] = "closed"
+                                sig["status"] = "closed_zombie"
                                 sig["close_reason"] = "zombie_cleanup"
                                 sig["closed_at"] = datetime.utcnow().isoformat()
                                 self.redis.client.set(k, _json.dumps(sig), ex=86400)
                         except Exception:
                             pass
-                    closed_redis += 1
+                    cleaned += 1
                 except Exception as e:
                     print(f"[close_zombies] redis remove {symbol}: {e}")
 
-            report_lines = [
-                "🧹 <b>Zombie Cleanup завершён</b>",
-                "",
-                f"🧟 Найдено зомби:       {len(zombies)}",
-                f"✅ Закрыто на бирже:    {closed_exchange}",
-                f"🗑 Удалено из Redis:    {closed_redis}",
-            ]
-            if failed:
-                report_lines.append(f"❌ Ошибки: {', '.join(failed[:5])}")
-            if closed_exchange < len(zombies):
-                report_lines.append(
-                    "\n⚠️ Не все позиции удалось закрыть на бирже.\n"
-                    "Используй /closeall для принудительного закрытия всего."
-                )
-            await self._reply(reply_chat_id, "\n".join(report_lines))
+            await self._reply(reply_chat_id,
+                f"🧹 <b>Zombie Cleanup завершён</b>\n\n"
+                f"🗑 Удалено из Redis:          {cleaned}\n"
+                f"✅ Реальных позиций на BingX: {len(real_on_exchange)}\n\n"
+                f"ℹ️ Биржа не затронута. Позиции с SL=0 исправит SL-Sync.")
 
         except Exception as e:
             await self._reply(reply_chat_id, f"❌ Ошибка: {e}")

@@ -130,17 +130,28 @@ class AutoTrader:
         symbol = signal.get("symbol", "?")
         score  = signal.get("score", 0)
         print(f"\n🚀 [AutoTrader] {symbol} | score={score:.1f}")
+        # FIX: extract max leverage from signal (e.g. "5-30".split("-")[1]=30 or int "20")
+        _sig_lev_raw = signal.get("leverage", "")
+        try:
+            if isinstance(_sig_lev_raw, str) and "-" in str(_sig_lev_raw):
+                _sig_lev = int(str(_sig_lev_raw).split("-")[1])
+            else:
+                _sig_lev = int(_sig_lev_raw) if _sig_lev_raw else 0
+        except (ValueError, IndexError):
+            _sig_lev = 0
         try:
             return await self.open_position(
-                symbol       = symbol,
-                direction    = signal["direction"],
-                entry_price  = signal["entry_price"],
-                stop_loss    = signal["stop_loss"],
-                take_profits = signal["take_profits"],
-                signal_score = signal["score"],
-                smc_data     = signal.get("smc"),
-                tg_msg_id    = signal.get("tg_msg_id"),
-                ms_context   = {k: signal[k] for k in signal if k.startswith("ms_")},
+                symbol           = symbol,
+                direction        = signal["direction"],
+                entry_price      = signal["entry_price"],
+                stop_loss        = signal["stop_loss"],
+                take_profits     = signal["take_profits"],
+                signal_score     = signal["score"],
+                signal_leverage  = _sig_lev,
+                smc_data         = signal.get("smc"),
+                tg_msg_id        = signal.get("tg_msg_id"),
+                ms_context       = {k: signal[k] for k in signal if k.startswith("ms_")},
+                pos_multiplier   = float(signal.get("pos_multiplier", 1.0)),
             )
         except KeyError as e:
             print(f"❌ [AutoTrader] {symbol}: missing field {e}")
@@ -151,8 +162,9 @@ class AutoTrader:
             return None
 
     async def open_position(self, symbol, direction, entry_price, stop_loss,
-                            take_profits, signal_score, smc_data=None,
-                            tg_msg_id=None, ms_context=None) -> Optional[Dict]:
+                            take_profits, signal_score, signal_leverage=0,
+                            smc_data=None, tg_msg_id=None, ms_context=None,
+                            pos_multiplier: float = 1.0) -> Optional[Dict]:
         mode = "DEMO" if self.config.demo_mode else "REAL"
         pfx  = f"[AT][{symbol}][{direction.upper()}]"
 
@@ -228,17 +240,30 @@ class AutoTrader:
             print(f"{pfx} ❌ get_positions failed: {e}")
             return None
 
-        n_pos    = len(current_positions)
+        # Считаем только позиции ЭТОГО направления (LONG-бот → только LONG, SHORT-бот → только SHORT)
+        _dir_side = "LONG" if direction == "long" else "SHORT"
+        dir_positions = [
+            p for p in current_positions
+            if (
+                getattr(p, "position_side", "").upper() == _dir_side
+                or getattr(p, "positionSide", "").upper() == _dir_side
+                or getattr(p, "side", "").upper() == _dir_side
+                or (direction == "long"  and getattr(p, "direction", "").upper() == "BUY")
+                or (direction == "short" and getattr(p, "direction", "").upper() == "SELL")
+            ) and abs(getattr(p, "size", 0) or 0) > 0
+        ]
+        n_pos    = len(dir_positions)
+        n_total  = len(current_positions)
         pos_list = " | ".join(f"{p.symbol}({p.side})" for p in current_positions)
-        print(f"{pfx} 📊 Open: {n_pos}/{self.config.max_positions}")
+        print(f"{pfx} 📊 Open: {n_pos}/{self.config.max_positions} {_dir_side} ({n_total} total)")
         if pos_list:
             print(f"{pfx} 📋 {pos_list}")
 
         if n_pos >= self.config.max_positions:
-            print(f"{pfx} ⏸ SKIP — max positions")
+            print(f"{pfx} ⏸ SKIP — max {_dir_side} positions")
             safe_symbol = _escape_value(symbol)
             await self._tg_reply(
-                f"⏸ <b>Биржа заполнена</b> ({n_pos}/{self.config.max_positions})\n"
+                f"⏸ <b>Лимит {_dir_side} позиций достигнут</b> ({n_pos}/{self.config.max_positions})\n"
                 f"<b>#{safe_symbol}</b> — сигнал пропущен", tg_msg_id
             )
             return None
@@ -271,9 +296,14 @@ class AutoTrader:
             print(f"{pfx} ❌ SKIP — no margin")
             return None
 
-        # ── 6. Sizing — FLAT risk, no multiplier ─────────────────────────────
-        # ✅ v3.0: risk_mult убран — фиксированный риск 0.04% на каждую сделку
+        # ── 6. Sizing — FLAT risk × context multiplier ───────────────────────
         actual_risk = self.config.risk_per_trade
+        if pos_multiplier <= 0.0:
+            print(f"{pfx} 🛑 SKIP — pos_multiplier=0.0 (hard block by context)")
+            return None
+        if pos_multiplier < 1.0:
+            actual_risk *= pos_multiplier
+            print(f"{pfx} ⚠️ Risk reduced ×{pos_multiplier} → {actual_risk:.6f} (market context)")
         risk_amount = available * actual_risk
         sl_distance = abs(entry_price - stop_loss) / entry_price
 
@@ -283,8 +313,13 @@ class AutoTrader:
             print(f"{pfx} ❌ SKIP — SL too small ({sl_distance:.4%})")
             return None
 
+        # 🚨 FIX: Никогда не открываем позицию без валидного SL
+        if not stop_loss or stop_loss <= 0:
+            print(f"{pfx} ❌ SKIP — stop_loss=0 (critical: no SL defined)")
+            return None
+
         position_value = risk_amount / sl_distance
-        leverage       = self._calc_leverage(signal_score)
+        leverage       = self._calc_leverage(signal_score, signal_leverage)
         size           = position_value / entry_price
 
         # ── 7. Max notional cap ───────────────────────────────────────────────
@@ -362,6 +397,11 @@ class AutoTrader:
                 )
             )
 
+        # ── 10.5. LOG-1: Проверяем что SL выставлен на бирже ────────────────
+        asyncio.create_task(
+            self._ensure_sl(bingx_symbol, position_side, stop_loss, direction, order.size, tg_msg_id)
+        )
+
         # ── 11. Save ──────────────────────────────────────────────────────────
         position_data = {
             "symbol":       symbol,
@@ -411,6 +451,10 @@ class AutoTrader:
                                       total_size, take_profits, direction,
                                       start_num: int = 1):
         await asyncio.sleep(1.5)
+
+        # B2 FIX (Variant A): чистим осиротевшие TP ордера перед выставлением новых
+        await self._cancel_orphaned_tp_orders()
+
         close_side = "SELL" if direction == "long" else "BUY"
         success = 0
         fails   = 0
@@ -458,9 +502,29 @@ class AutoTrader:
                     print(f"✅ TP{tp_num}: {bingx_symbol} id={order_id}")
                     success += 1
                 else:
-                    err = (result or {}).get("msg") or self.bingx.last_error or "unknown"
-                    print(f"⚠️ TP{tp_num} failed: {bingx_symbol} | {err}")
-                    fails += 1
+                    err_code = (result or {}).get("code")
+                    err      = (result or {}).get("msg") or self.bingx.last_error or "unknown"
+                    if err_code == 110206:
+                        # B2 FIX (Variant B): Too many orders — пауза 2s и 1 retry
+                        print(f"[B2 RETRY] TP{tp_num} {bingx_symbol}: 110206 too many orders — retry через 2s")
+                        await asyncio.sleep(2.0)
+                        retry_result = await self.bingx._make_request(
+                            "POST", "/openApi/swap/v2/trade/order", body=body
+                        )
+                        if retry_result and retry_result.get("code") == 0:
+                            rd       = retry_result.get("data", {})
+                            ord_rd   = rd.get("order", rd)
+                            order_id = ord_rd.get("orderId", "?")
+                            print(f"✅ TP{tp_num} (retry OK): {bingx_symbol} id={order_id}")
+                            success += 1
+                        else:
+                            retry_err = (retry_result or {}).get("msg") or "unknown"
+                            print(f"⚠️ TP{tp_num} retry failed: {bingx_symbol} | {retry_err} — прерываем")
+                            fails += 1
+                            break  # лимит не освободился — дальше ставить бессмысленно
+                    else:
+                        print(f"⚠️ TP{tp_num} failed: {bingx_symbol} | {err}")
+                        fails += 1
 
                 await asyncio.sleep(0.4)
             except Exception as e:
@@ -469,6 +533,107 @@ class AutoTrader:
 
         status = "✅" if success > 0 else "⚠️"
         print(f"{status} TP orders {bingx_symbol}: {success} placed, {fails} failed")
+
+    async def _cancel_orphaned_tp_orders(self) -> int:
+        """
+        B2 FIX (Variant A): Отменяем осиротевшие TAKE_PROFIT_MARKET ордера
+        (от уже закрытых позиций) перед выставлением новых TP.
+        Освобождает лимит ордеров на аккаунте BingX (~20-50 слотов).
+        """
+        try:
+            # 1. Все открытые ордера по аккаунту (без фильтра по символу)
+            all_result = await self.bingx._make_request(
+                "GET", "/openApi/swap/v2/trade/openOrders"
+            )
+            if not all_result or all_result.get("code") != 0:
+                print("[B2 ORPHAN] Не удалось получить все открытые ордера")
+                return 0
+
+            all_orders = all_result.get("data", {}).get("orders", [])
+            tp_orders = [o for o in all_orders if o.get("type") == "TAKE_PROFIT_MARKET"]
+            if not tp_orders:
+                return 0
+
+            # 2. Активные позиции — символы с ненулевым qty
+            active_positions = await self.bingx.get_positions()
+            active_symbols = {
+                p.symbol.replace("-", "")
+                for p in active_positions
+                if abs(getattr(p, "size", 0) or 0) > 0
+            }
+
+            # 3. Отменяем TP ордера без соответствующей позиции
+            cancelled = 0
+            for order in tp_orders:
+                o_symbol = order.get("symbol", "").replace("-", "")
+                o_id     = order.get("orderId", "")
+                if o_symbol and o_id and o_symbol not in active_symbols:
+                    cancel_res = await self.bingx._make_request(
+                        "DELETE", "/openApi/swap/v2/trade/order",
+                        body={"symbol": o_symbol, "orderId": str(o_id)}
+                    )
+                    if cancel_res and cancel_res.get("code") == 0:
+                        cancelled += 1
+                        print(f"[B2 ORPHAN] Отменён осиротевший TP id={o_id} ({o_symbol})")
+                    else:
+                        print(f"[B2 ORPHAN] Не удалось отменить TP id={o_id} ({o_symbol}): "
+                              f"{(cancel_res or {}).get('msg', self.bingx.last_error)}")
+                    await asyncio.sleep(0.2)  # rate limit
+
+            if cancelled:
+                print(f"[B2 ORPHAN] Итого отменено осиротевших TP: {cancelled}/{len(tp_orders)}")
+            return cancelled
+        except Exception as e:
+            print(f"[B2 ORPHAN] Exception: {e}")
+            return 0
+
+    async def _ensure_sl(self, bingx_symbol: str, position_side: str,
+                          stop_loss: float, direction: str,
+                          qty: float, tg_msg_id: Optional[int]):
+        """LOG-1: После открытия позиции проверяем что SL выставлен на бирже.
+        3 попытки: 5s → 15s → 30s. При неудаче — критический алерт в Telegram."""
+        delays = [5, 15, 30]
+        for attempt, delay in enumerate(delays, 1):
+            await asyncio.sleep(delay)
+            try:
+                orders_result = await self.bingx._make_request(
+                    "GET", "/openApi/swap/v2/trade/openOrders",
+                    params={"symbol": bingx_symbol}
+                )
+                open_orders = []
+                if orders_result and orders_result.get("code") == 0:
+                    open_orders = orders_result.get("data", {}).get("orders", [])
+
+                sl_exists = any(
+                    o.get("type") in ("STOP_MARKET", "STOP")
+                    and o.get("positionSide") == position_side
+                    for o in open_orders
+                )
+
+                if sl_exists:
+                    print(f"✅ [SL_CHECK] {bingx_symbol}/{position_side}: SL подтверждён (попытка {attempt})")
+                    return
+
+                print(f"⚠️ [SL_CHECK] {bingx_symbol}/{position_side}: SL не найден (попытка {attempt}), выставляем...")
+                ok = await self.bingx.update_stop_loss(bingx_symbol, position_side, stop_loss, direction)
+                if ok:
+                    print(f"✅ [SL_CHECK] {bingx_symbol}/{position_side}: SL выставлен (попытка {attempt})")
+                    return
+
+                code = getattr(self.bingx, 'last_error_code', None)
+                print(f"⚠️ [SL_CHECK] {bingx_symbol}/{position_side}: SL отклонён (попытка {attempt}), code={code}")
+
+            except Exception as e:
+                print(f"⚠️ [SL_CHECK] {bingx_symbol}/{position_side}: Exception (попытка {attempt}): {e}")
+
+        safe_sym = _escape_value(bingx_symbol)
+        await self._tg_reply(
+            f"🚨 <b>КРИТИЧНО: SL не выставлен!</b>\n"
+            f"<code>{safe_sym}</code> {position_side} qty={qty}\n"
+            f"SL={stop_loss} — все {len(delays)} попытки провалились\n"
+            f"⚠️ Проверьте и выставьте SL вручную!",
+            tg_msg_id
+        )
 
     async def close_position(self, symbol: str, position_side: str) -> bool:
         bingx_symbol = self._to_bingx_symbol(symbol)
@@ -517,9 +682,16 @@ class AutoTrader:
             return symbol[:-4] + "-USDT"
         return symbol
 
-    def _calc_leverage(self, score: float) -> int:
-        # ✅ v3.0: нет бонуса за высокий score — стабильный леверидж
-        return self.config.default_leverage
+    def _calc_leverage(self, score: float, signal_leverage: int = 0) -> int:
+        # FIX: score-based dynamic leverage within configured min/max range
+        # signal_leverage > 0 → use as ceiling (from signal config e.g. "5-30")
+        max_lev = signal_leverage if signal_leverage > 0 else self.config.max_leverage
+        max_lev = min(max_lev, self.config.max_leverage)
+        min_lev = self.config.min_leverage
+        # Score 65→min_lev, Score 100→max_lev, linear interpolation
+        normalized = max(0.0, min(1.0, (score - 65.0) / 35.0))
+        lev = int(min_lev + normalized * (max_lev - min_lev))
+        return max(min_lev, min(max_lev, lev))
 
     def _check_daily_reset(self):
         today = datetime.utcnow().date()

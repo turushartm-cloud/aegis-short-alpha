@@ -92,23 +92,24 @@ class OIAnalyzer:
         price_4d  = getattr(market_data, "price_change_4d", 0) or 0
 
         # ── Funding Rate анализ ──────────────────────────────────────
-        if funding >= self.cfg.funding_extreme:
-            # Экстремальный funding = позиции уже перенасыщены шортами
-            # Будем осторожны — возможен short squeeze
-            score += 20
-            reasons.append(f"⚠️ Funding EXTREME {funding:+.3f}% — риск squeeze")
-        elif funding >= self.cfg.funding_spike:
+        # ✅ FIX S1: был инвертирован — extreme давал +20, spike давал +40.
+        # Логика: высокий ПОЛОЖИТЕЛЬНЫЙ funding = лонги платят шортам = лонги перегреты.
+        # Чем выше funding → тем сильнее SHORT сигнал (максимум = extreme).
+        if funding >= self.cfg.funding_extreme:      # >= 0.20%: экстремальный перекос лонгов
+            score += 55
+            reasons.append(f"🔥 Funding EXTREME {funding:+.3f}% — лонги сгорают, SHORT максимальный")
+        elif funding >= self.cfg.funding_spike:      # >= 0.10%: сильный перегрев
             score += 40
-            reasons.append(f"🔴 Funding SPIKE {funding:+.3f}% — лонги перегреты")
-        elif funding >= self.cfg.funding_threshold:
+            reasons.append(f"🔴 Funding SPIKE {funding:+.3f}% — лонги сильно перегреты")
+        elif funding >= self.cfg.funding_threshold:  # >= 0.03%: повышенный
             score += 25
             reasons.append(f"Funding повышен {funding:+.3f}%")
-        elif funding >= 0.01:
+        elif funding >= 0.01:                        # слабый сигнал
             score += 12
             reasons.append(f"Funding умеренный {funding:+.3f}%")
-        elif funding < -0.05:
+        elif funding < -0.05:                        # отрицательный = против SHORT
             score -= 15
-            reasons.append(f"Funding отрицательный {funding:+.3f}% — лонги дешевеют, короткий не торопиться")
+            reasons.append(f"Funding отрицательный {funding:+.3f}% — шорты платят лонгам, не шортим")
 
         # ── OI Dynamic Analysis ──────────────────────────────────────
         oi_history = await self._get_oi_history(symbol)
